@@ -35,7 +35,13 @@ fn cycle_focus_backward(app: &mut App) {
 }
 
 fn handle_browse_keys(app: &mut App, key: KeyEvent) {
-    // Global settings toggle (works from any panel except Help)
+    // If settings are open, handle settings navigation (including editing)
+    if app.settings_open {
+        handle_settings_keys(app, key);
+        return;
+    }
+
+    // Global settings toggle (works from any panel except Help, but not while editing)
     if app.input_mode != InputMode::Help {
         match key.code {
             KeyCode::Char('s') | KeyCode::Char('S') if app.focused_panel != FocusedPanel::SearchBar => {
@@ -48,12 +54,6 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         }
-    }
-
-    // If settings are open, handle settings navigation
-    if app.settings_open {
-        handle_settings_keys(app, key);
-        return;
     }
 
     // Global quit keys work from any panel
@@ -772,5 +772,66 @@ mod tests {
         handle_browse_keys(&mut app, key);
 
         assert!(!app.settings_open);
+    }
+
+    #[test]
+    fn test_settings_end_to_end_workflow() {
+        // Create app with default settings
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::Results;
+
+        // Open settings with 's' key
+        let key = KeyEvent::from(KeyCode::Char('s'));
+        handle_browse_keys(&mut app, key);
+        assert!(app.settings_open);
+
+        // Navigate down to bandwidth limit (index 3)
+        let key = KeyEvent::from(KeyCode::Down);
+        handle_browse_keys(&mut app, key);
+        assert_eq!(app.settings_selected_index, 3);
+
+        // Toggle bandwidth limit
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_browse_keys(&mut app, key);
+        assert!(app.config.bandwidth_limit);
+
+        // Navigate to download dir (index 10)
+        // From index 3, need to go: 4, 5, 9, 10 (4 down presses)
+        for _ in 0..4 {
+            let key = KeyEvent::from(KeyCode::Down);
+            handle_browse_keys(&mut app, key);
+        }
+        assert_eq!(app.settings_selected_index, 10);
+
+        // Enter edit mode
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_browse_keys(&mut app, key);
+        assert_eq!(app.settings_editing, Some(SettingsField::DownloadDir));
+
+        // Store initial directory to verify text was appended
+        let initial_dir = app.config.download_dir.clone();
+
+        // Type some text
+        for c in "test".chars() {
+            let key = KeyEvent::from(KeyCode::Char(c));
+            handle_browse_keys(&mut app, key);
+        }
+
+        // Verify text was appended
+        assert_eq!(app.config.download_dir, format!("{}test", initial_dir));
+
+        // Exit edit mode
+        let key = KeyEvent::from(KeyCode::Esc);
+        handle_browse_keys(&mut app, key);
+        assert_eq!(app.settings_editing, None);
+
+        // Close settings
+        let key = KeyEvent::from(KeyCode::Esc);
+        handle_browse_keys(&mut app, key);
+        assert!(!app.settings_open);
+
+        // Verify changes persisted
+        assert!(app.config.bandwidth_limit);
+        assert!(app.config.download_dir.ends_with("test"));
     }
 }
