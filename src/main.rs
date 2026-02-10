@@ -4,6 +4,7 @@ mod config;
 mod display;
 mod player;
 mod search;
+mod ui;
 
 use anyhow::Result;
 use clap::Parser;
