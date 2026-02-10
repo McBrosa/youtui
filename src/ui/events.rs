@@ -35,6 +35,21 @@ fn cycle_focus_backward(app: &mut App) {
 }
 
 fn handle_browse_keys(app: &mut App, key: KeyEvent) {
+    // Global settings toggle (works from any panel except Help)
+    if app.input_mode != InputMode::Help {
+        match key.code {
+            KeyCode::Char('s') | KeyCode::Char('S') if app.focused_panel != FocusedPanel::SearchBar => {
+                app.settings_open = !app.settings_open;
+                return;
+            }
+            KeyCode::F(2) => {
+                app.settings_open = !app.settings_open;
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Global quit keys work from any panel
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) => {
