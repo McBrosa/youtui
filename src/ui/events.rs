@@ -292,6 +292,78 @@ fn handle_help_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_settings_keys(app: &mut App, key: KeyEvent) {
+    // If editing a text field, handle text input
+    if let Some(field) = app.settings_editing {
+        match key.code {
+            KeyCode::Char(c) => {
+                // Append character to appropriate field
+                match field {
+                    SettingsField::DownloadDir => {
+                        app.config.download_dir.push(c);
+                        let _ = app.config.save();
+                    }
+                    SettingsField::ResultsPerPage => {
+                        // Only accept digits
+                        if c.is_ascii_digit() {
+                            let current = app.config.results_per_page;
+                            // Try to append digit and parse
+                            let new_str = format!("{}{}", current, c);
+                            if let Ok(new_val) = new_str.parse::<usize>() {
+                                // Allow temporary values outside range while typing
+                                if new_val <= 999 {  // Reasonable upper bound while typing
+                                    app.config.results_per_page = new_val;
+                                    let _ = app.config.save();
+                                }
+                            }
+                        }
+                    }
+                    SettingsField::CustomFormat => {
+                        app.config.custom_format.push(c);
+                        let _ = app.config.save();
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                // Remove last character
+                match field {
+                    SettingsField::DownloadDir => {
+                        app.config.download_dir.pop();
+                        let _ = app.config.save();
+                    }
+                    SettingsField::ResultsPerPage => {
+                        // Convert to string, remove last char, parse back
+                        let mut s = app.config.results_per_page.to_string();
+                        s.pop();
+                        if !s.is_empty() {
+                            if let Ok(new_val) = s.parse::<usize>() {
+                                app.config.results_per_page = new_val;
+                            }
+                        } else {
+                            // If empty, set to minimum value
+                            app.config.results_per_page = 1;
+                        }
+                        let _ = app.config.save();
+                    }
+                    SettingsField::CustomFormat => {
+                        app.config.custom_format.pop();
+                        let _ = app.config.save();
+                    }
+                }
+            }
+            KeyCode::Enter | KeyCode::Esc => {
+                // Exit edit mode and clamp ResultsPerPage to valid range
+                if field == SettingsField::ResultsPerPage {
+                    // Clamp to 1-100 range
+                    app.config.results_per_page = app.config.results_per_page.clamp(1, 100);
+                    let _ = app.config.save();
+                }
+                app.settings_editing = None;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     // Define selectable indices (skip section headers)
     const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 9, 10, 14, 18];
 
