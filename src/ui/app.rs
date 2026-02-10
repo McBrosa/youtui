@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::player_manager::PlayerManager;
 use crate::queue::Queue;
 use crate::search::SearchResult;
@@ -13,6 +14,13 @@ pub enum FocusedPanel {
     SearchBar,
     Results,
     Queue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SettingsField {
+    DownloadDir,
+    ResultsPerPage,
+    CustomFormat,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,10 +49,14 @@ pub struct App {
     pub queue_selected_index: usize,
     pub focused_panel: FocusedPanel,
     pub loading: bool,
+    pub settings_open: bool,
+    pub settings_selected_index: usize,
+    pub settings_editing: Option<SettingsField>,
+    pub config: Config,
 }
 
 impl App {
-    pub fn new(query: String, page_size: usize) -> Self {
+    pub fn new(query: String, page_size: usize, config: Config) -> Self {
         Self {
             results: Vec::new(),
             selected_index: 0,
@@ -63,6 +75,10 @@ impl App {
             queue_selected_index: 0,
             focused_panel: FocusedPanel::Results,
             loading: false,
+            settings_open: false,
+            settings_selected_index: 2,
+            settings_editing: None,
+            config,
         }
     }
 
