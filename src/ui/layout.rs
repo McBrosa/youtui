@@ -5,20 +5,20 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
-use crate::ui::app::{App, InputMode, PlaybackState};
+use crate::ui::app::{App, FocusedPanel, InputMode};
 
 pub fn render_ui(f: &mut Frame, app: &App) {
     let mut constraints = vec![
-        Constraint::Length(1),  // Header
-        Constraint::Min(0),     // Results
+        Constraint::Length(3),  // Search bar (with border)
+        Constraint::Min(0),     // Main content (results + queue)
     ];
 
     // Add status bar if playing
-    if !matches!(app.playback_state, PlaybackState::Idle) {
-        constraints.push(Constraint::Length(1));
+    if app.player_manager.is_some() {
+        constraints.push(Constraint::Length(3)); // Status bar + controls
+    } else {
+        constraints.push(Constraint::Length(2)); // Just controls
     }
-
-    constraints.push(Constraint::Length(2)); // Footer
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -26,16 +26,11 @@ pub fn render_ui(f: &mut Frame, app: &App) {
         .split(f.size());
 
     let mut chunk_idx = 0;
-    render_header(f, app, chunks[chunk_idx]);
+    render_search_bar(f, app, chunks[chunk_idx]);
     chunk_idx += 1;
 
-    render_results(f, app, chunks[chunk_idx]);
+    render_main_content(f, app, chunks[chunk_idx]);
     chunk_idx += 1;
-
-    if !matches!(app.playback_state, PlaybackState::Idle) {
-        render_status_bar(f, app, chunks[chunk_idx]);
-        chunk_idx += 1;
-    }
 
     render_footer(f, app, chunks[chunk_idx]);
 
@@ -45,21 +40,57 @@ pub fn render_ui(f: &mut Frame, app: &App) {
     }
 }
 
-fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let header_text = format!("yt-search-play │ Query: \"{}\"", app.query);
-    let header = Paragraph::new(header_text)
-        .style(
-            Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        );
-    f.render_widget(header, area);
+fn render_search_bar(f: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.focused_panel == FocusedPanel::SearchBar;
+
+    let border_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let display_text = if is_focused {
+        format!("{}█", app.search_input)
+    } else {
+        app.query.clone()
+    };
+
+    let search_bar = Paragraph::new(display_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Search ")
+                .border_style(border_style)
+        )
+        .style(Style::default().fg(Color::White));
+
+    f.render_widget(search_bar, area);
+}
+
+fn render_main_content(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(70),
+            Constraint::Percentage(30),
+        ])
+        .split(area);
+
+    render_results(f, app, chunks[0]);
+    render_queue_panel(f, app, chunks[1]);
 }
 
 fn render_results(f: &mut Frame, app: &App, area: Rect) {
     let results = app.current_page_results();
     let start_idx = app.page * app.page_size;
+
+    let is_focused = app.focused_panel == FocusedPanel::Results;
+
+    let border_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
 
     let items: Vec<ListItem> = results
         .iter()
@@ -72,11 +103,11 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
             ]);
 
             let meta_line = Line::from(format!(
-                "     ⏱ {} │ 📺 {} │ 👁 {}",
+                "     {} | {} | {}",
                 result.duration, result.channel, result.views
             ));
 
-            let style = if i == app.selected_index {
+            let style = if i == app.selected_index && is_focused {
                 Style::default().bg(Color::Yellow).fg(Color::Black)
             } else {
                 Style::default().fg(Color::White)
@@ -88,15 +119,15 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
 
     let page_info = if app.exhausted {
         let total_pages = (app.total_results + app.page_size - 1) / app.page_size;
-        format!("Page {}/{} • {} total", app.page + 1, total_pages, app.total_results)
+        format!("Page {}/{} | {} total", app.page + 1, total_pages, app.total_results)
     } else {
-        format!("Page {} • {}+ loaded", app.page + 1, app.total_results)
+        format!("Page {} | {}+ loaded", app.page + 1, app.total_results)
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" Search Results ({}) ", page_info))
-        .border_style(Style::default().fg(Color::DarkGray));
+        .title(format!(" Results ({}) ", page_info))
+        .border_style(border_style);
 
     let list = List::new(items)
         .block(block)
@@ -108,68 +139,165 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let text = match &app.playback_state {
-        PlaybackState::Idle => String::new(),
-        PlaybackState::Playing { title, elapsed, duration } => {
-            let progress = if *duration > 0 {
-                (*elapsed as f64 / *duration as f64 * 100.0) as u64
-            } else {
-                0
-            };
-            let elapsed_str = format_duration(*elapsed);
-            let duration_str = format_duration(*duration);
-            format!(
-                " ▶ Playing: \"{}\" [{}/{}] {}%",
-                title, elapsed_str, duration_str, progress
-            )
-        }
+fn render_queue_panel(f: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.focused_panel == FocusedPanel::Queue;
+
+    let border_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
     };
 
-    let status = Paragraph::new(text).style(Style::default().bg(Color::Green).fg(Color::Black));
-    f.render_widget(status, area);
+    let items: Vec<ListItem> = if app.queue.is_empty() {
+        vec![
+            ListItem::new("Queue is empty").style(Style::default().fg(Color::DarkGray)),
+            ListItem::new(""),
+            ListItem::new("Press Enter on results").style(Style::default().fg(Color::DarkGray)),
+            ListItem::new("to add tracks").style(Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        app.queue.iter().enumerate().map(|(i, track)| {
+            let prefix = if i == 0 && app.player_manager.is_some() {
+                "▶ "
+            } else {
+                "  "
+            };
+            let line = Line::from(format!("{}{}", prefix, track.title));
+
+            let style = if i == app.queue_selected_index && is_focused {
+                Style::default().bg(Color::Yellow).fg(Color::Black)
+            } else if i == 0 && app.player_manager.is_some() {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            ListItem::new(line).style(style)
+        }).collect()
+    };
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Queue ")
+                .border_style(border_style)
+        );
+
+    f.render_widget(list, area);
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let text = match app.input_mode {
-        InputMode::Browse => {
+    let has_playback = app.player_manager.is_some();
+
+    if has_playback {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),  // Status bar
+                Constraint::Length(2),  // Controls
+            ])
+            .split(area);
+
+        render_status_line(f, app, chunks[0]);
+        render_controls_line(f, app, chunks[1]);
+    } else {
+        render_controls_line(f, app, area);
+    }
+}
+
+fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(ref player) = app.player_manager {
+        let status = &player.status;
+        let progress_width = area.width.saturating_sub(60) as usize;
+        let progress = if status.duration > 0.0 {
+            (status.time_pos / status.duration * progress_width as f64) as usize
+        } else {
+            0
+        };
+
+        let filled = "=".repeat(progress.min(progress_width));
+        let empty = "-".repeat(progress_width.saturating_sub(progress));
+
+        let icon = if status.paused { "||" } else { ">>" };
+        let elapsed = format_duration(status.time_pos as u64);
+        let duration = format_duration(status.duration as u64);
+
+        let text = format!(
+            " {} {} [{}{}] {}/{} Vol:{}",
+            icon, status.title, filled, empty, elapsed, duration, status.volume
+        );
+
+        let status_bar = Paragraph::new(text)
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+
+        f.render_widget(status_bar, area);
+    }
+}
+
+fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
+    let text = match app.focused_panel {
+        FocusedPanel::SearchBar => {
+            "Enter: Search | Esc: Cancel | Tab: Switch Panel".to_string()
+        }
+        FocusedPanel::Results => {
             if !app.number_input.is_empty() {
-                format!("Select video: {}_", app.number_input)
+                format!("Select: {}_ | Enter: Confirm | Bksp: Clear", app.number_input)
             } else {
-                "↑/↓: Navigate • Enter: Play • 1-9: Quick pick • s: Search • n/p: Next/Prev • h: Help • q: Quit".to_string()
+                "Up/Dn: Navigate | Enter: Queue | Space: Pause | Tab: Switch | n/p: Page | q: Quit".to_string()
             }
         }
-        InputMode::Search => {
-            format!("Search: {}_ (Enter: Submit • Esc: Cancel)", app.search_input)
+        FocusedPanel::Queue => {
+            "Up/Dn: Navigate | Enter: Jump | Del: Remove | c: Clear | Tab: Switch".to_string()
         }
-        InputMode::Help => "Press h or Esc to close help".to_string(),
     };
 
-    let footer = Paragraph::new(text).style(Style::default().fg(Color::Cyan));
+    let footer = Paragraph::new(text)
+        .style(Style::default().fg(Color::Cyan))
+        .block(Block::default().borders(Borders::TOP));
+
     f.render_widget(footer, area);
 }
 
 fn render_help_overlay(f: &mut Frame, _app: &App) {
-    let area = centered_rect(60, 50, f.size());
+    let area = centered_rect(60, 70, f.size());
 
     let help_text = vec![
         Line::from(Span::styled("Keyboard Controls", Style::default().add_modifier(Modifier::BOLD))),
         Line::from(""),
-        Line::from("Navigation:"),
-        Line::from("  ↑/↓         - Move selection up/down"),
-        Line::from("  Enter       - Play selected video"),
-        Line::from("  n/p         - Next/Previous page"),
+        Line::from("Focus Navigation:"),
+        Line::from("  Tab         - Cycle focus (Search > Results > Queue)"),
+        Line::from("  Shift+Tab   - Reverse cycle"),
         Line::from(""),
-        Line::from("Commands:"),
-        Line::from("  s           - New search"),
+        Line::from("Search Bar (when focused):"),
+        Line::from("  Type        - Enter query"),
+        Line::from("  Enter       - Submit search"),
+        Line::from("  Esc         - Clear and return to Results"),
+        Line::from(""),
+        Line::from("Results (when focused):"),
+        Line::from("  Up/Dn       - Move selection"),
+        Line::from("  Enter       - Add to queue and play"),
+        Line::from("  1-9         - Quick-pick by number"),
+        Line::from("  n/p         - Next/Previous page"),
+        Line::from("  s           - Focus search bar"),
+        Line::from(""),
+        Line::from("Queue (when focused):"),
+        Line::from("  Up/Dn       - Navigate queue"),
+        Line::from("  Enter       - Jump to track"),
+        Line::from("  Del/Bksp    - Remove track"),
+        Line::from("  c           - Clear queue"),
+        Line::from(""),
+        Line::from("Playback (global):"),
+        Line::from("  Space       - Play/Pause"),
+        Line::from("  n           - Next track"),
+        Line::from("  </>         - Seek -/+ 10 seconds"),
+        Line::from("  +/-         - Volume up/down"),
+        Line::from("  m           - Mute toggle"),
+        Line::from(""),
+        Line::from("Other:"),
         Line::from("  h           - Toggle this help"),
         Line::from("  q/Esc       - Quit"),
         Line::from("  Ctrl+C      - Force quit"),
-        Line::from(""),
-        Line::from("During Playback:"),
-        Line::from("  Space       - Play/Pause (in player)"),
-        Line::from("  q           - Quit playback (in player)"),
-        Line::from("  m           - Mute (in player)"),
     ];
 
     let block = Block::default()
