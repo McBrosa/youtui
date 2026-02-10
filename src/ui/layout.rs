@@ -131,19 +131,20 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let hints = match app.input_mode {
-        InputMode::Browse => vec![
-            "↑/↓: Navigate",
-            "Enter: Play",
-            "n/p: Next/Prev",
-            "h: Help",
-            "q: Quit",
-        ],
-        InputMode::Search => vec!["Type to search", "Enter: Submit", "Esc: Cancel"],
-        InputMode::Help => vec!["Press h or Esc to close help"],
+    let text = match app.input_mode {
+        InputMode::Browse => {
+            if !app.number_input.is_empty() {
+                format!("Select video: {}_", app.number_input)
+            } else {
+                "↑/↓: Navigate • Enter: Play • 1-9: Quick pick • s: Search • n/p: Next/Prev • h: Help • q: Quit".to_string()
+            }
+        }
+        InputMode::Search => {
+            format!("Search: {}_ (Enter: Submit • Esc: Cancel)", app.search_input)
+        }
+        InputMode::Help => "Press h or Esc to close help".to_string(),
     };
 
-    let text = hints.join(" • ");
     let footer = Paragraph::new(text).style(Style::default().fg(Color::Cyan));
     f.render_widget(footer, area);
 }

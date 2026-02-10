@@ -45,6 +45,32 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('h'), _) => {
             app.input_mode = InputMode::Help;
         }
+        (KeyCode::Char('s'), _) => {
+            app.input_mode = InputMode::Search;
+            app.search_input.clear();
+        }
+        (KeyCode::Char(c), _) if c.is_ascii_digit() => {
+            // Number quick-pick
+            app.number_input.push(c);
+        }
+        (KeyCode::Enter, _) => {
+            // Handle enter for number input or arrow selection
+            if !app.number_input.is_empty() {
+                if let Ok(num) = app.number_input.parse::<usize>() {
+                    if num > 0 && num <= app.results.len() {
+                        // TODO: Trigger play action
+                        app.number_input.clear();
+                    }
+                }
+                app.number_input.clear();
+            } else {
+                // Play selected item
+                // TODO: Trigger play action for selected_index
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            app.number_input.pop();
+        }
         _ => {}
     }
 }

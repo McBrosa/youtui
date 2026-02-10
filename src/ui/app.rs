@@ -23,6 +23,7 @@ pub struct App {
     pub query: String,
     pub input_mode: InputMode,
     pub search_input: String,
+    pub number_input: String,
     pub playback_state: PlaybackState,
     pub should_quit: bool,
 }
@@ -39,6 +40,7 @@ impl App {
             query,
             input_mode: InputMode::Browse,
             search_input: String::new(),
+            number_input: String::new(),
             playback_state: PlaybackState::Idle,
             should_quit: false,
         }
