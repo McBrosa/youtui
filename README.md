@@ -21,11 +21,29 @@ cargo install --path .
 
 ## Usage
 
+Launch with no arguments:
+
 ```bash
-yt-search-play "search query"
+yt-search-play
 ```
 
-### Keyboard Controls
+The app will open with an empty search bar. Type your search query and press Enter to search.
+
+## Settings
+
+Press `S` or `F2` to open the settings modal. All settings are saved immediately to `~/.config/yt-search-play/config.toml` and persist across sessions.
+
+Available settings:
+- **Audio Only**: Play audio only (no video)
+- **Bandwidth Limit**: Limit video quality to 360p and audio to 128kbps
+- **Keep Temporary Files**: Don't delete downloaded files after playback
+- **Include YouTube Shorts**: Include Shorts in search results
+- **Download Mode**: Save files permanently instead of streaming
+- **Download Directory**: Where to save downloaded files
+- **Results Per Page**: Number of results to show per page (default: 10)
+- **Custom Format**: Override auto-detected format string (for advanced users)
+
+## Controls
 
 **Navigation:**
 - `↑/↓` - Move selection
@@ -35,18 +53,9 @@ yt-search-play "search query"
 
 **Commands:**
 - `s` - New search
+- `S` / `F2` - Open settings
 - `h` - Toggle help
 - `q` - Quit
-
-### Options
-
-- `-n, --num <NUM>` - Number of results per page (default: 10)
-- `-a, --audio-only` - Audio only mode
-- `-f, --format <FMT>` - Video format (default: best)
-- `-d, --download` - Download permanently
-- `--download-dir <DIR>` - Download directory
-- `-i, --include-shorts` - Include YouTube Shorts
-- `-k, --keep` - Keep temp files
 
 ## License
 
