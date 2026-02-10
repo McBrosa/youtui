@@ -37,6 +37,12 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('n'), _) if app.has_next_page() => {
             app.page += 1;
             app.selected_index = 0;
+
+            // Trigger fetch if needed
+            let end = (app.page + 1) * app.page_size;
+            if end > app.results.len() && !app.exhausted {
+                app.pending_action = AppAction::FetchNextPage;
+            }
         }
         (KeyCode::Char('p'), _) if app.has_prev_page() => {
             app.page -= 1;
