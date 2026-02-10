@@ -16,12 +16,6 @@ pub struct Config {
     pub download_dir: String,
     pub results_per_page: usize,
     pub custom_format: String,
-
-    // Temporary fields for backwards compatibility - will be removed in Task #19
-    #[serde(skip)]
-    pub query: String,
-    #[serde(skip)]
-    pub num_results: usize,
 }
 
 impl Config {
@@ -88,24 +82,6 @@ impl Config {
             resolve_format(self.audio_only, self.bandwidth_limit)
         }
     }
-
-    // Temporary backwards compatibility shim - will be removed in Task #19
-    pub fn from_cli(cli: &crate::cli::Cli, player: PlayerType) -> Self {
-        let mut config = Self::default();
-        config.player = player;
-        config.results_per_page = cli.num;
-        config.num_results = cli.num;
-        config.audio_only = cli.audio_only;
-        config.bandwidth_limit = cli.limit;
-        config.download_mode = cli.download;
-        config.keep_temp = cli.keep;
-        config.include_shorts = cli.include_shorts;
-        config.query = cli.query.join(" ");
-        if let Some(ref format) = cli.format {
-            config.custom_format = format.clone();
-        }
-        config
-    }
 }
 
 impl Default for Config {
@@ -124,8 +100,6 @@ impl Default for Config {
                 .to_string(),
             results_per_page: 20,
             custom_format: String::new(),
-            query: String::new(),
-            num_results: 20,
         }
     }
 }
