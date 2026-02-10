@@ -31,6 +31,10 @@ pub enum PlaybackResult {
     Error(String),
 }
 
+pub fn supports_background_playback(player: PlayerType) -> bool {
+    matches!(player, PlayerType::Mpv)
+}
+
 pub fn detect_player() -> Result<PlayerType> {
     if which::which("mpv").is_ok() {
         Ok(PlayerType::Mpv)

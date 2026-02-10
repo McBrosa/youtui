@@ -6,6 +6,7 @@ use colored::Colorize;
 use crate::ui::{App, handle_key_event, layout::render_ui, terminal::Tui};
 use crate::ui::app::AppAction;
 use crate::config::Config;
+use crate::player_manager::PlayerManager;
 use crate::search::PaginatedSearch;
 
 const TICK_RATE: Duration = Duration::from_millis(250);
@@ -26,25 +27,46 @@ pub fn run_app(
         match std::mem::replace(&mut app.pending_action, AppAction::None) {
             AppAction::Play(idx) => {
                 if idx < app.results.len() {
-                    let result = &app.results[idx];
-                    // Exit TUI temporarily for playback
-                    crate::ui::terminal::restore_terminal(terminal)?;
+                    let result = app.results[idx].clone();
 
-                    println!("{} {}", "Playing:".green(), result.title);
-                    crate::display::show_controls(config.player);
+                    // Add to queue
+                    app.queue.push_back(result.clone());
 
-                    let _ = crate::player::play_video(
-                        config,
-                        &result.id,
-                        &result.title,
-                        &result.safe_title(),
-                        temp_dir,
-                    );
+                    if crate::player::supports_background_playback(config.player) {
+                        // Background playback with mpv
+                        if app.player_manager.is_none() {
+                            match PlayerManager::new() {
+                                Ok(mut pm) => {
+                                    let url = format!("https://www.youtube.com/watch?v={}", result.id);
+                                    if pm.play(&url, &result.title).is_ok() {
+                                        app.player_manager = Some(pm);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to create player: {}", e);
+                                }
+                            }
+                        }
+                    } else {
+                        // Legacy: exit TUI, play externally, return
+                        crate::ui::terminal::restore_terminal(terminal)?;
 
-                    // Re-enter TUI
-                    *terminal = crate::ui::terminal::init_terminal()?;
-                    println!("\nReturning to search results...");
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                        println!("{} {}", "Playing:".green(), result.title);
+                        crate::display::show_controls(config.player);
+
+                        let _ = crate::player::play_video(
+                            config,
+                            &result.id,
+                            &result.title,
+                            &result.safe_title(),
+                            temp_dir,
+                        );
+
+                        *terminal = crate::ui::terminal::init_terminal()?;
+
+                        // Remove from queue since it was played inline
+                        app.queue.pop_front();
+                    }
                 }
             }
             AppAction::NewSearch(query) => {
@@ -64,6 +86,37 @@ pub fn run_app(
                 app.exhausted = search.exhausted;
             }
             AppAction::None => {}
+        }
+
+        // Poll player status and check for EOF
+        let mut player_finished = false;
+        if let Some(ref mut player) = app.player_manager {
+            let _ = player.update_status();
+
+            if player.is_eof() {
+                player_finished = true;
+            }
+        }
+
+        if player_finished {
+            // Remove the finished track from queue front
+            app.queue.pop_front();
+
+            if !app.queue.is_empty() {
+                // Play next track
+                if let Some(track) = app.queue.get(0) {
+                    let url = format!("https://www.youtube.com/watch?v={}", track.id);
+                    let title = track.title.clone();
+                    if let Some(ref mut player) = app.player_manager {
+                        if player.play(&url, &title).is_err() {
+                            app.player_manager = None;
+                        }
+                    }
+                }
+            } else {
+                // Queue empty, stop player
+                app.player_manager = None;
+            }
         }
 
         let timeout = TICK_RATE
