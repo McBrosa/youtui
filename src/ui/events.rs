@@ -677,4 +677,100 @@ mod tests {
         assert_eq!(app.focused_panel, FocusedPanel::Results);
         assert!(app.search_input.is_empty());
     }
+
+    #[test]
+    fn test_settings_open_with_s_key() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.settings_open = false;
+        app.focused_panel = FocusedPanel::Results;
+
+        let key = KeyEvent::from(KeyCode::Char('s'));
+        handle_browse_keys(&mut app, key);
+
+        assert!(app.settings_open);
+    }
+
+    #[test]
+    fn test_settings_open_with_f2() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.settings_open = false;
+
+        let key = KeyEvent::from(KeyCode::F(2));
+        handle_browse_keys(&mut app, key);
+
+        assert!(app.settings_open);
+    }
+
+    #[test]
+    fn test_settings_s_key_blocked_in_search_bar() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::SearchBar;
+        app.settings_open = false;
+
+        let key = KeyEvent::from(KeyCode::Char('s'));
+        handle_browse_keys(&mut app, key);
+
+        assert!(!app.settings_open);
+        assert_eq!(app.search_input, "s");
+    }
+
+    #[test]
+    fn test_settings_navigation_down() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.settings_open = true;
+        app.settings_selected_index = 2;
+
+        let key = KeyEvent::from(KeyCode::Down);
+        handle_browse_keys(&mut app, key);
+
+        assert_eq!(app.settings_selected_index, 3);
+    }
+
+    #[test]
+    fn test_settings_navigation_up() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.settings_open = true;
+        app.settings_selected_index = 3;
+
+        let key = KeyEvent::from(KeyCode::Up);
+        handle_browse_keys(&mut app, key);
+
+        assert_eq!(app.settings_selected_index, 2);
+    }
+
+    #[test]
+    fn test_settings_toggle_checkbox() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.settings_open = true;
+        app.settings_selected_index = 2; // Audio Only
+        app.config.audio_only = false;
+
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_browse_keys(&mut app, key);
+
+        assert!(app.config.audio_only);
+    }
+
+    #[test]
+    fn test_settings_enter_edit_mode() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.settings_open = true;
+        app.settings_selected_index = 10; // Download Dir
+
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_browse_keys(&mut app, key);
+
+        assert_eq!(app.settings_editing, Some(SettingsField::DownloadDir));
+    }
+
+    #[test]
+    fn test_settings_esc_closes_modal() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.settings_open = true;
+
+        let key = KeyEvent::from(KeyCode::Esc);
+        handle_browse_keys(&mut app, key);
+
+        assert!(!app.settings_open);
+    }
 }
