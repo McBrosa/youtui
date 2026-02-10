@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::ui::app::{App, InputMode};
+use crate::ui::app::{App, AppAction, InputMode};
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -58,14 +58,14 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
             if !app.number_input.is_empty() {
                 if let Ok(num) = app.number_input.parse::<usize>() {
                     if num > 0 && num <= app.results.len() {
-                        // TODO: Trigger play action
-                        app.number_input.clear();
+                        app.pending_action = AppAction::Play(num - 1);
                     }
                 }
                 app.number_input.clear();
             } else {
                 // Play selected item
-                // TODO: Trigger play action for selected_index
+                let global_idx = app.page * app.page_size + app.selected_index;
+                app.pending_action = AppAction::Play(global_idx);
             }
         }
         (KeyCode::Backspace, _) => {

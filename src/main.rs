@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     app.exhausted = search.exhausted;
 
     // Run TUI
-    let result = ui::run_app(terminal_guard.get_mut(), app);
+    let result = ui::run_app(terminal_guard.get_mut(), app, &config, &mut search, temp_dir.path());
 
     // Terminal cleanup happens via Drop guard
     drop(terminal_guard);

@@ -13,6 +13,14 @@ pub enum PlaybackState {
     Playing { title: String, elapsed: u64, duration: u64 },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppAction {
+    None,
+    Play(usize),
+    NewSearch(String),
+    FetchNextPage,
+}
+
 pub struct App {
     pub results: Vec<SearchResult>,
     pub selected_index: usize,
@@ -25,6 +33,7 @@ pub struct App {
     pub search_input: String,
     pub number_input: String,
     pub playback_state: PlaybackState,
+    pub pending_action: AppAction,
     pub should_quit: bool,
 }
 
@@ -42,6 +51,7 @@ impl App {
             search_input: String::new(),
             number_input: String::new(),
             playback_state: PlaybackState::Idle,
+            pending_action: AppAction::None,
             should_quit: false,
         }
     }
