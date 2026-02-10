@@ -2,6 +2,7 @@ mod cli;
 mod cleanup;
 mod config;
 mod display;
+mod ipc;
 mod player;
 mod search;
 mod ui;
