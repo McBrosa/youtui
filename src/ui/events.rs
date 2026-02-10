@@ -75,8 +75,27 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_search_keys(_app: &mut App, _key: KeyEvent) {
-    // TODO: Implement search input handling
+fn handle_search_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) => {
+            app.search_input.push(c);
+        }
+        KeyCode::Backspace => {
+            app.search_input.pop();
+        }
+        KeyCode::Enter => {
+            if !app.search_input.is_empty() {
+                app.query = app.search_input.clone();
+                // TODO: Trigger new search
+                app.input_mode = InputMode::Browse;
+            }
+        }
+        KeyCode::Esc => {
+            app.input_mode = InputMode::Browse;
+            app.search_input.clear();
+        }
+        _ => {}
+    }
 }
 
 fn handle_help_keys(app: &mut App, key: KeyEvent) {
