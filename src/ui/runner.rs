@@ -70,14 +70,21 @@ pub fn run_app(
                 }
             }
             AppAction::NewSearch(query) => {
-                app.query = query;
-                search.reset(&app.query);
+                // Clear old results immediately
+                app.results.clear();
+                app.total_results = 0;
+                app.page = 0;
+                app.selected_index = 0;
+
+                // Perform search
+                search.reset(&query);
                 search.ensure_page(0)?;
+
+                // Update with new results
                 app.results = search.results.clone();
                 app.total_results = search.results.len();
                 app.exhausted = search.exhausted;
-                app.page = 0;
-                app.selected_index = 0;
+                app.loading = false;
             }
             AppAction::FetchNextPage => {
                 search.ensure_page(app.page)?;

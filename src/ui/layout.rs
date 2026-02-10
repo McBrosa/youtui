@@ -85,9 +85,6 @@ fn render_main_content(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_results(f: &mut Frame, app: &App, area: Rect) {
-    let results = app.current_page_results();
-    let start_idx = app.page * app.page_size;
-
     let is_focused = app.focused_panel == FocusedPanel::Results;
 
     let border_style = if is_focused {
@@ -95,6 +92,34 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
+
+    // Show loading indicator if searching
+    if app.loading {
+        let loading_items = vec![
+            ListItem::new(""),
+            ListItem::new(""),
+            ListItem::new(Line::from(vec![
+                Span::styled("  Searching for: ", Style::default().fg(Color::Cyan)),
+                Span::styled(&app.query, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ])),
+            ListItem::new(""),
+            ListItem::new(Line::from(
+                Span::styled("  Loading results...", Style::default().fg(Color::DarkGray))
+            )),
+        ];
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Search Results ")
+            .border_style(border_style);
+
+        let list = List::new(loading_items).block(block);
+        f.render_widget(list, area);
+        return;
+    }
+
+    let results = app.current_page_results();
+    let start_idx = app.page * app.page_size;
 
     let items: Vec<ListItem> = results
         .iter()

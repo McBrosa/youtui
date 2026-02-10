@@ -187,6 +187,9 @@ fn handle_search_bar_keys(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             if !app.search_input.is_empty() {
+                // Update query immediately so search bar shows new query
+                app.query = app.search_input.clone();
+                app.loading = true;
                 app.pending_action = AppAction::NewSearch(app.search_input.clone());
                 app.search_input.clear();
                 app.focused_panel = FocusedPanel::Results;

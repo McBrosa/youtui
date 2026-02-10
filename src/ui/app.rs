@@ -40,6 +40,7 @@ pub struct App {
     pub queue: Queue,
     pub queue_selected_index: usize,
     pub focused_panel: FocusedPanel,
+    pub loading: bool,
 }
 
 impl App {
@@ -61,6 +62,7 @@ impl App {
             queue: Queue::new(),
             queue_selected_index: 0,
             focused_panel: FocusedPanel::Results,
+            loading: false,
         }
     }
 
