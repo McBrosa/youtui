@@ -440,6 +440,7 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
 mod tests {
     use super::*;
     use crate::search::SearchResult;
+    use crate::config::Config;
 
     fn create_test_results(count: usize) -> Vec<SearchResult> {
         (0..count)
@@ -455,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_arrow_up_navigation() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.results = create_test_results(5);
         app.total_results = 5;
         app.selected_index = 2;
@@ -469,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_arrow_up_at_top() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.results = create_test_results(5);
         app.total_results = 5;
         app.selected_index = 0;
@@ -483,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_arrow_down_navigation() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.results = create_test_results(5);
         app.total_results = 5;
         app.selected_index = 2;
@@ -497,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_arrow_down_at_bottom() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.results = create_test_results(5);
         app.total_results = 5;
         app.selected_index = 4;
@@ -511,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_next_page_navigation() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.results = create_test_results(25);
         app.total_results = 25;
         app.page = 0;
@@ -527,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_next_page_when_not_available() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.results = create_test_results(10);
         app.total_results = 10;
         app.exhausted = true;
@@ -542,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_prev_page_navigation() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.results = create_test_results(25);
         app.total_results = 25;
         app.page = 2;
@@ -558,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_prev_page_at_first_page() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.results = create_test_results(25);
         app.total_results = 25;
         app.page = 0;
@@ -572,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_help_key_switches_mode() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.input_mode = InputMode::Browse;
         app.focused_panel = FocusedPanel::Results;
 
@@ -584,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_quit_key() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.should_quit = false;
         app.focused_panel = FocusedPanel::Results;
 
@@ -596,7 +597,7 @@ mod tests {
 
     #[test]
     fn test_esc_key_quits_from_results() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.should_quit = false;
         app.focused_panel = FocusedPanel::Results;
 
@@ -608,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_ctrl_c_quits() {
-        let mut app = App::new("test query".to_string(), 10);
+        let mut app = App::new("test query".to_string(), 10, Config::default());
         app.should_quit = false;
         app.focused_panel = FocusedPanel::Results;
 
@@ -620,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_tab_cycles_focus_forward() {
-        let mut app = App::new("test".to_string(), 10);
+        let mut app = App::new("test".to_string(), 10, Config::default());
         app.focused_panel = FocusedPanel::SearchBar;
 
         cycle_focus_forward(&mut app);
@@ -635,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_shift_tab_cycles_focus_backward() {
-        let mut app = App::new("test".to_string(), 10);
+        let mut app = App::new("test".to_string(), 10, Config::default());
         app.focused_panel = FocusedPanel::SearchBar;
 
         cycle_focus_backward(&mut app);
@@ -650,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_esc_in_search_bar_returns_to_results() {
-        let mut app = App::new("test".to_string(), 10);
+        let mut app = App::new("test".to_string(), 10, Config::default());
         app.focused_panel = FocusedPanel::SearchBar;
         app.search_input = "some text".to_string();
         app.should_quit = false;
@@ -665,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_search_bar_enter_triggers_new_search() {
-        let mut app = App::new("old query".to_string(), 10);
+        let mut app = App::new("old query".to_string(), 10, Config::default());
         app.focused_panel = FocusedPanel::SearchBar;
         app.search_input = "new query".to_string();
 
