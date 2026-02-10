@@ -1,7 +1,7 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use crate::ui::app::App;
@@ -31,15 +31,23 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
     let results = app.current_page_results();
     let start_idx = app.page * app.page_size;
 
-    let items: Vec<String> = results
+    let items: Vec<ListItem> = results
         .iter()
         .enumerate()
         .map(|(i, result)| {
             let num = start_idx + i + 1;
-            format!(
-                "{:>3}. {}\n     Duration: {} | Channel: {} | Views: {} | ID: {}",
-                num, result.title, result.duration, result.channel, result.views, result.id
-            )
+            let content = format!(
+                "{:>3}. {}\n     Duration: {} | Channel: {} | Views: {}",
+                num, result.title, result.duration, result.channel, result.views
+            );
+
+            let style = if i == app.selected_index {
+                Style::default().bg(Color::Yellow).fg(Color::Black)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            ListItem::new(content).style(style)
         })
         .collect();
 
@@ -54,12 +62,14 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
         .title(format!("Search Results ({})", page_info))
         .border_style(Style::default().fg(Color::DarkGray));
 
-    let text = items.join("\n\n");
-    let paragraph = Paragraph::new(text)
+    let list = List::new(items)
         .block(block)
-        .style(Style::default().fg(Color::White));
+        .highlight_style(Style::default().bg(Color::Yellow).fg(Color::Black));
 
-    f.render_widget(paragraph, area);
+    let mut state = ListState::default();
+    state.select(Some(app.selected_index));
+
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_footer(f: &mut Frame, _app: &App, area: Rect) {
@@ -106,8 +116,8 @@ mod tests {
             .map(|(i, result)| {
                 let num = start_idx + i + 1;
                 format!(
-                    "{:>3}. {}\n     Duration: {} | Channel: {} | Views: {} | ID: {}",
-                    num, result.title, result.duration, result.channel, result.views, result.id
+                    "{:>3}. {}\n     Duration: {} | Channel: {} | Views: {}",
+                    num, result.title, result.duration, result.channel, result.views
                 )
             })
             .collect();
@@ -115,18 +125,17 @@ mod tests {
         // Verify first item formatting
         assert_eq!(
             items[0],
-            "  1. Test Video 1\n     Duration: 10:30 | Channel: Test Channel | Views: 1.2M | ID: abc123"
+            "  1. Test Video 1\n     Duration: 10:30 | Channel: Test Channel | Views: 1.2M"
         );
 
         // Verify second item formatting
         assert_eq!(
             items[1],
-            "  2. Test Video 2\n     Duration: 5:45 | Channel: Another Channel | Views: 500K | ID: def456"
+            "  2. Test Video 2\n     Duration: 5:45 | Channel: Another Channel | Views: 500K"
         );
 
-        // Verify items joined with blank lines
-        let text = items.join("\n\n");
-        assert!(text.contains("\n\n"));
+        // Verify items structure (no longer joined with blank lines in List widget)
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
@@ -180,13 +189,12 @@ mod tests {
 
         // First result on page 2 should be numbered 11
         let item = format!(
-            "{:>3}. {}\n     Duration: {} | Channel: {} | Views: {} | ID: {}",
+            "{:>3}. {}\n     Duration: {} | Channel: {} | Views: {}",
             start_idx + 1,
             results[0].title,
             results[0].duration,
             results[0].channel,
-            results[0].views,
-            results[0].id
+            results[0].views
         );
 
         assert!(item.starts_with(" 11. Video 11"));
