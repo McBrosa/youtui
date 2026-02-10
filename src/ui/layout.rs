@@ -50,7 +50,11 @@ fn render_search_bar(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let display_text = if is_focused {
-        format!("{}█", app.search_input)
+        if app.search_input.is_empty() {
+            "█".to_string()
+        } else {
+            format!("{}█", app.search_input)
+        }
     } else {
         app.query.clone()
     };

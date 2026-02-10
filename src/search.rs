@@ -116,11 +116,8 @@ impl PaginatedSearch {
         let search_id = format!("ytsearch{}:{}", SEARCH_CEILING, self.query);
         let range = format!("{}:{}", start, end);
 
-        if self.results.is_empty() {
-            println!("{}", "Searching...".yellow());
-        } else {
-            println!("{}", "Fetching more results...".yellow());
-        }
+        // Note: Removed println statements here as they corrupt the TUI when called
+        // during background searches. The TUI status should show search progress instead.
 
         let mut cmd = Command::new("yt-dlp");
         cmd.arg("--flat-playlist")
@@ -181,10 +178,7 @@ impl PaginatedSearch {
             self.exhausted = true;
         }
 
-        println!(
-            "{}",
-            format!("Found {} videos so far.", self.results.len()).green()
-        );
+        // Note: Status updates should be shown in the TUI, not via println
 
         Ok(())
     }
