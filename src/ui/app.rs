@@ -5,7 +5,6 @@ use crate::search::SearchResult;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputMode {
     Browse,
-    Search,
     Help,
 }
 
@@ -14,12 +13,6 @@ pub enum FocusedPanel {
     SearchBar,
     Results,
     Queue,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum PlaybackState {
-    Idle,
-    Playing { title: String, elapsed: u64, duration: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,7 +34,6 @@ pub struct App {
     pub input_mode: InputMode,
     pub search_input: String,
     pub number_input: String,
-    pub playback_state: PlaybackState,
     pub pending_action: AppAction,
     pub should_quit: bool,
     pub player_manager: Option<PlayerManager>,
@@ -63,7 +55,6 @@ impl App {
             input_mode: InputMode::Browse,
             search_input: String::new(),
             number_input: String::new(),
-            playback_state: PlaybackState::Idle,
             pending_action: AppAction::None,
             should_quit: false,
             player_manager: None,

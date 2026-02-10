@@ -1,12 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::ui::app::{App, AppAction, FocusedPanel, InputMode};
 
-#[derive(Debug, Clone)]
-pub enum AppEvent {
-    Key(KeyEvent),
-    Tick,
-}
-
 pub fn handle_key_event(app: &mut App, key: KeyEvent) {
     // Global Tab key for focus cycling (works in any mode except Help)
     if app.input_mode != InputMode::Help && key.code == KeyCode::Tab {
@@ -20,10 +14,6 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
 
     match app.input_mode {
         InputMode::Browse => handle_browse_keys(app, key),
-        InputMode::Search => {
-            // Legacy: redirect to search bar behavior
-            handle_search_bar_keys(app, key);
-        }
         InputMode::Help => handle_help_keys(app, key),
     }
 }
