@@ -3,7 +3,7 @@ use std::path::Path;
 use crossterm::event::{self, Event};
 use anyhow::Result;
 use colored::Colorize;
-use crate::ui::{App, AppEvent, handle_key_event, layout::render_ui, terminal::Tui};
+use crate::ui::{App, handle_key_event, layout::render_ui, terminal::Tui};
 use crate::ui::app::AppAction;
 use crate::config::Config;
 use crate::search::PaginatedSearch;

@@ -5,7 +5,6 @@ pub mod runner;
 pub mod terminal;
 
 pub use app::App;
-pub use events::{AppEvent, handle_key_event};
-pub use layout::render_ui;
+pub use events::handle_key_event;
 pub use runner::run_app;
-pub use terminal::{init_terminal, restore_terminal, TerminalGuard};
+pub use terminal::{init_terminal, TerminalGuard};
