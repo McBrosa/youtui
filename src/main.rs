@@ -4,6 +4,7 @@ mod config;
 mod display;
 mod ipc;
 mod player;
+mod queue;
 mod search;
 mod ui;
 
