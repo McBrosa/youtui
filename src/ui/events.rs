@@ -91,8 +91,8 @@ fn handle_search_keys(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             if !app.search_input.is_empty() {
-                app.query = app.search_input.clone();
-                // TODO: Trigger new search
+                app.pending_action = AppAction::NewSearch(app.search_input.clone());
+                app.search_input.clear();
                 app.input_mode = InputMode::Browse;
             }
         }
