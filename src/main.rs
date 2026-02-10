@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     let mut terminal_guard = ui::TerminalGuard::new(terminal);
 
     // App starts with empty search, focus on search bar
-    let mut app = ui::App::new(String::new(), config.results_per_page);
+    let mut app = ui::App::new(String::new(), config.results_per_page, config.clone());
     app.focused_panel = FocusedPanel::SearchBar;
 
     // Search manager with no initial query

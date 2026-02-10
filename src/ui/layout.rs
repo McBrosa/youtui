@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
-use crate::ui::app::{App, FocusedPanel, InputMode};
+use crate::ui::app::{App, FocusedPanel, InputMode, SettingsField};
 
 pub fn render_ui(f: &mut Frame, app: &App) {
     let mut constraints = vec![
@@ -37,6 +37,11 @@ pub fn render_ui(f: &mut Frame, app: &App) {
     // Overlay help if in help mode
     if app.input_mode == InputMode::Help {
         render_help_overlay(f, app);
+    }
+
+    // Overlay settings if in settings mode
+    if app.settings_open {
+        render_settings_modal(f, app);
     }
 }
 
@@ -368,4 +373,96 @@ fn format_duration(seconds: u64) -> String {
     } else {
         format!("{}:{:02}", mins, secs)
     }
+}
+
+fn render_settings_modal(f: &mut Frame, app: &App) {
+    let area = centered_rect(60, 70, f.size());
+
+    let items = settings_items(app);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Settings ")
+        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+
+    let list = List::new(items).block(block);
+
+    f.render_widget(list, area);
+}
+
+fn settings_items(app: &App) -> Vec<ListItem<'static>> {
+    let selected = app.settings_selected_index;
+    let editing = &app.settings_editing;
+
+    vec![
+        // Playback section header
+        ListItem::new(Line::from(
+            Span::styled("Playback", Style::default().add_modifier(Modifier::BOLD))
+        )),
+        ListItem::new("────────"),
+        checkbox_item(2, "Audio Only", app.config.audio_only, selected),
+        checkbox_item(3, "Bandwidth Limit (360p video, 128k audio)", app.config.bandwidth_limit, selected),
+        checkbox_item(4, "Keep Temporary Files", app.config.keep_temp, selected),
+        checkbox_item(5, "Include YouTube Shorts", app.config.include_shorts, selected),
+        ListItem::new(""),
+
+        // Downloads section header
+        ListItem::new(Line::from(
+            Span::styled("Downloads", Style::default().add_modifier(Modifier::BOLD))
+        )),
+        ListItem::new("─────────"),
+        checkbox_item(9, "Download Mode (save permanently)", app.config.download_mode, selected),
+        text_field_item(10, "Download Directory", &app.config.download_dir, selected, editing, SettingsField::DownloadDir),
+        ListItem::new(""),
+
+        // Display section header
+        ListItem::new(Line::from(
+            Span::styled("Display", Style::default().add_modifier(Modifier::BOLD))
+        )),
+        ListItem::new("───────"),
+        text_field_item(14, "Results Per Page", &app.config.results_per_page.to_string(), selected, editing, SettingsField::ResultsPerPage),
+        ListItem::new(""),
+
+        // Advanced section header
+        ListItem::new(Line::from(
+            Span::styled("Advanced", Style::default().add_modifier(Modifier::BOLD))
+        )),
+        ListItem::new("────────"),
+        text_field_item(18, "Custom Format", &app.config.custom_format, selected, editing, SettingsField::CustomFormat),
+        ListItem::new(Line::from(
+            Span::styled("(leave empty for auto)", Style::default().fg(Color::DarkGray))
+        )),
+        ListItem::new(""),
+        ListItem::new(Line::from(
+            Span::styled("Press S/F2/Esc to close", Style::default().fg(Color::DarkGray))
+        )),
+    ]
+}
+
+fn checkbox_item(idx: usize, label: &str, checked: bool, selected: usize) -> ListItem<'static> {
+    let checkbox = if checked { "[✓]" } else { "[ ]" };
+    let text = format!("  {} {}", checkbox, label);
+    let style = if idx == selected {
+        Style::default().bg(Color::Yellow).fg(Color::Black)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    ListItem::new(text).style(style)
+}
+
+fn text_field_item(idx: usize, label: &str, value: &str, selected: usize,
+                   editing: &Option<SettingsField>, field: SettingsField) -> ListItem<'static> {
+    let is_editing = if let Some(edit_field) = editing {
+        *edit_field == field && idx == selected
+    } else {
+        false
+    };
+    let cursor = if is_editing { "█" } else { "" };
+    let text = format!("  {}: [{}{}]", label, value, cursor);
+    let style = if idx == selected {
+        Style::default().bg(Color::Yellow).fg(Color::Black)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    ListItem::new(text).style(style)
 }
