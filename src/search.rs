@@ -54,8 +54,8 @@ pub fn check_ytdlp() -> Result<()> {
 /// and caches everything already fetched.
 pub struct PaginatedSearch {
     query: String,
-    page_size: usize,
-    filter_shorts: bool,
+    pub page_size: usize,
+    pub filter_shorts: bool,
     /// All results that have passed filtering so far.
     pub results: Vec<SearchResult>,
     /// How many raw yt-dlp playlist items we have consumed (1-indexed high-water mark).

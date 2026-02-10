@@ -132,8 +132,8 @@ pub fn run_app(
             search.page_size = app.config.results_per_page;
         }
 
-        if search.exclude_shorts != !app.config.include_shorts {
-            search.exclude_shorts = !app.config.include_shorts;
+        if search.filter_shorts != !app.config.include_shorts {
+            search.filter_shorts = !app.config.include_shorts;
         }
 
         let timeout = TICK_RATE
