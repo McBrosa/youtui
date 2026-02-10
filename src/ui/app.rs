@@ -52,6 +52,7 @@ pub struct App {
     pub settings_open: bool,
     pub settings_selected_index: usize,
     pub settings_editing: Option<SettingsField>,
+    pub results_per_page_input: Option<String>,
     pub config: Config,
 }
 
@@ -78,6 +79,7 @@ impl App {
             settings_open: false,
             settings_selected_index: 2,
             settings_editing: None,
+            results_per_page_input: None,
             config,
         }
     }

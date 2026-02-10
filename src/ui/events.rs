@@ -305,14 +305,14 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
                     SettingsField::ResultsPerPage => {
                         // Only accept digits
                         if c.is_ascii_digit() {
-                            let current = app.config.results_per_page;
-                            // Try to append digit and parse
-                            let new_str = format!("{}{}", current, c);
-                            if let Ok(new_val) = new_str.parse::<usize>() {
-                                // Allow temporary values outside range while typing
-                                if new_val <= 999 {  // Reasonable upper bound while typing
-                                    app.config.results_per_page = new_val;
-                                    let _ = app.config.save();
+                            if let Some(ref mut input) = app.results_per_page_input {
+                                input.push(c);
+                                // Try to parse and save (if valid)
+                                if let Ok(new_val) = input.parse::<usize>() {
+                                    if new_val <= 999 {  // Reasonable upper bound
+                                        app.config.results_per_page = new_val;
+                                        let _ = app.config.save();
+                                    }
                                 }
                             }
                         }
@@ -331,18 +331,17 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
                         let _ = app.config.save();
                     }
                     SettingsField::ResultsPerPage => {
-                        // Convert to string, remove last char, parse back
-                        let mut s = app.config.results_per_page.to_string();
-                        s.pop();
-                        if !s.is_empty() {
-                            if let Ok(new_val) = s.parse::<usize>() {
-                                app.config.results_per_page = new_val;
+                        if let Some(ref mut input) = app.results_per_page_input {
+                            input.pop();
+                            // If not empty, try to parse and save
+                            if !input.is_empty() {
+                                if let Ok(new_val) = input.parse::<usize>() {
+                                    app.config.results_per_page = new_val;
+                                    let _ = app.config.save();
+                                }
                             }
-                        } else {
-                            // If empty, set to minimum value
-                            app.config.results_per_page = 1;
+                            // If empty string, don't update config yet (wait for exit)
                         }
-                        let _ = app.config.save();
                     }
                     SettingsField::CustomFormat => {
                         app.config.custom_format.pop();
@@ -351,11 +350,16 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
                 }
             }
             KeyCode::Enter | KeyCode::Esc => {
-                // Exit edit mode and clamp ResultsPerPage to valid range
+                // Exit edit mode and finalize ResultsPerPage
                 if field == SettingsField::ResultsPerPage {
-                    // Clamp to 1-100 range
-                    app.config.results_per_page = app.config.results_per_page.clamp(1, 100);
-                    let _ = app.config.save();
+                    if let Some(ref input) = app.results_per_page_input {
+                        // Parse the input string, default to 20 if empty or invalid
+                        let value = input.parse::<usize>().unwrap_or(20);
+                        // Clamp to 1-100 range
+                        app.config.results_per_page = value.clamp(1, 100);
+                        let _ = app.config.save();
+                    }
+                    app.results_per_page_input = None;
                 }
                 app.settings_editing = None;
             }
@@ -371,6 +375,7 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.settings_open = false;
             app.settings_editing = None;
+            app.results_per_page_input = None;
         }
         KeyCode::Up => {
             // Find the previous selectable index
@@ -424,6 +429,7 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
                 14 => {
                     // Results Per Page text field - enter edit mode
                     app.settings_editing = Some(SettingsField::ResultsPerPage);
+                    app.results_per_page_input = Some(app.config.results_per_page.to_string());
                 }
                 18 => {
                     // Custom Format text field - enter edit mode

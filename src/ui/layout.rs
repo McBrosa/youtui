@@ -423,7 +423,10 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
             Span::styled("Display", Style::default().add_modifier(Modifier::BOLD))
         )),
         ListItem::new("───────"),
-        text_field_item(14, "Results Per Page", &app.config.results_per_page.to_string(), selected, editing, SettingsField::ResultsPerPage),
+        text_field_item(14, "Results Per Page",
+            &app.results_per_page_input.as_ref()
+                .unwrap_or(&app.config.results_per_page.to_string()),
+            selected, editing, SettingsField::ResultsPerPage),
         ListItem::new(""),
 
         // Advanced section header
