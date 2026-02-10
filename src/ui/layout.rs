@@ -278,7 +278,7 @@ fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
             if !app.number_input.is_empty() {
                 format!("Select: {}_ | Enter: Confirm | Bksp: Clear", app.number_input)
             } else {
-                "Up/Dn: Navigate | Enter: Queue | Space: Pause | Tab: Switch | n/p: Page | q: Quit".to_string()
+                "Up/Dn: Navigate | Enter: Queue | Space: Pause | Tab: Switch | n/p: Page | s/F2: Settings | q: Quit".to_string()
             }
         }
         FocusedPanel::Queue => {
@@ -327,6 +327,9 @@ fn render_help_overlay(f: &mut Frame, _app: &App) {
         Line::from("  </>         - Seek -/+ 10 seconds"),
         Line::from("  +/-         - Volume up/down"),
         Line::from("  m           - Mute toggle"),
+        Line::from(""),
+        Line::from("Settings:"),
+        Line::from("  s/F2        - Open settings"),
         Line::from(""),
         Line::from("Other:"),
         Line::from("  h           - Toggle this help"),
