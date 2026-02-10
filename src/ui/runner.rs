@@ -126,6 +126,16 @@ pub fn run_app(
             }
         }
 
+        // Sync config changes to search and app state
+        if app.page_size != app.config.results_per_page {
+            app.page_size = app.config.results_per_page;
+            search.page_size = app.config.results_per_page;
+        }
+
+        if search.exclude_shorts != !app.config.include_shorts {
+            search.exclude_shorts = !app.config.include_shorts;
+        }
+
         let timeout = TICK_RATE
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
