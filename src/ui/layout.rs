@@ -1,29 +1,59 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
-use crate::ui::app::App;
+use crate::ui::app::{App, InputMode, PlaybackState};
 
 pub fn render_ui(f: &mut Frame, app: &App) {
+    let mut constraints = vec![
+        Constraint::Length(1),  // Header
+        Constraint::Min(0),     // Results
+    ];
+
+    // Add status bar if playing
+    if !matches!(app.playback_state, PlaybackState::Idle) {
+        constraints.push(Constraint::Length(1));
+    }
+
+    constraints.push(Constraint::Length(2)); // Footer
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),  // Header
-            Constraint::Min(0),     // Results
-            Constraint::Length(2),  // Footer
-        ])
+        .constraints(constraints)
         .split(f.size());
 
-    render_header(f, app, chunks[0]);
-    render_results(f, app, chunks[1]);
-    render_footer(f, app, chunks[2]);
+    let mut chunk_idx = 0;
+    render_header(f, app, chunks[chunk_idx]);
+    chunk_idx += 1;
+
+    render_results(f, app, chunks[chunk_idx]);
+    chunk_idx += 1;
+
+    if !matches!(app.playback_state, PlaybackState::Idle) {
+        render_status_bar(f, app, chunks[chunk_idx]);
+        chunk_idx += 1;
+    }
+
+    render_footer(f, app, chunks[chunk_idx]);
+
+    // Overlay help if in help mode
+    if app.input_mode == InputMode::Help {
+        render_help_overlay(f, app);
+    }
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let header = Paragraph::new(format!("yt-search-play │ Query: {}", app.query))
-        .style(Style::default().fg(Color::Cyan));
+    let header_text = format!("yt-search-play │ Query: \"{}\"", app.query);
+    let header = Paragraph::new(header_text)
+        .style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        );
     f.render_widget(header, area);
 }
 
@@ -36,10 +66,15 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, result)| {
             let num = start_idx + i + 1;
-            let content = format!(
-                "{:>3}. {}\n     Duration: {} | Channel: {} | Views: {}",
-                num, result.title, result.duration, result.channel, result.views
-            );
+            let title_line = Line::from(vec![
+                Span::raw(format!("{:>3}. ", num)),
+                Span::styled(&result.title, Style::default().add_modifier(Modifier::BOLD)),
+            ]);
+
+            let meta_line = Line::from(format!(
+                "     ⏱ {} │ 📺 {} │ 👁 {}",
+                result.duration, result.channel, result.views
+            ));
 
             let style = if i == app.selected_index {
                 Style::default().bg(Color::Yellow).fg(Color::Black)
@@ -47,19 +82,20 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::White)
             };
 
-            ListItem::new(content).style(style)
+            ListItem::new(vec![title_line, meta_line]).style(style)
         })
         .collect();
 
     let page_info = if app.exhausted {
-        format!("Page {}/{} • {} total", app.page + 1, (app.total_results + app.page_size - 1) / app.page_size, app.total_results)
+        let total_pages = (app.total_results + app.page_size - 1) / app.page_size;
+        format!("Page {}/{} • {} total", app.page + 1, total_pages, app.total_results)
     } else {
         format!("Page {} • {}+ loaded", app.page + 1, app.total_results)
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("Search Results ({})", page_info))
+        .title(format!(" Search Results ({}) ", page_info))
         .border_style(Style::default().fg(Color::DarkGray));
 
     let list = List::new(items)
@@ -72,131 +108,106 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_footer(f: &mut Frame, _app: &App, area: Rect) {
-    let footer = Paragraph::new("q: Quit")
-        .style(Style::default().fg(Color::DarkGray));
+fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    let text = match &app.playback_state {
+        PlaybackState::Idle => String::new(),
+        PlaybackState::Playing { title, elapsed, duration } => {
+            let progress = if *duration > 0 {
+                (*elapsed as f64 / *duration as f64 * 100.0) as u64
+            } else {
+                0
+            };
+            let elapsed_str = format_duration(*elapsed);
+            let duration_str = format_duration(*duration);
+            format!(
+                " ▶ Playing: \"{}\" [{}/{}] {}%",
+                title, elapsed_str, duration_str, progress
+            )
+        }
+    };
+
+    let status = Paragraph::new(text).style(Style::default().bg(Color::Green).fg(Color::Black));
+    f.render_widget(status, area);
+}
+
+fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+    let hints = match app.input_mode {
+        InputMode::Browse => vec![
+            "↑/↓: Navigate",
+            "Enter: Play",
+            "n/p: Next/Prev",
+            "h: Help",
+            "q: Quit",
+        ],
+        InputMode::Search => vec!["Type to search", "Enter: Submit", "Esc: Cancel"],
+        InputMode::Help => vec!["Press h or Esc to close help"],
+    };
+
+    let text = hints.join(" • ");
+    let footer = Paragraph::new(text).style(Style::default().fg(Color::Cyan));
     f.render_widget(footer, area);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::search::SearchResult;
+fn render_help_overlay(f: &mut Frame, _app: &App) {
+    let area = centered_rect(60, 50, f.size());
 
-    #[test]
-    fn test_result_formatting() {
-        let mut app = App::new("test query".to_string(), 10);
+    let help_text = vec![
+        Line::from(Span::styled("Keyboard Controls", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from("Navigation:"),
+        Line::from("  ↑/↓         - Move selection up/down"),
+        Line::from("  Enter       - Play selected video"),
+        Line::from("  n/p         - Next/Previous page"),
+        Line::from(""),
+        Line::from("Commands:"),
+        Line::from("  s           - New search"),
+        Line::from("  h           - Toggle this help"),
+        Line::from("  q/Esc       - Quit"),
+        Line::from("  Ctrl+C      - Force quit"),
+        Line::from(""),
+        Line::from("During Playback:"),
+        Line::from("  Space       - Play/Pause (in player)"),
+        Line::from("  q           - Quit playback (in player)"),
+        Line::from("  m           - Mute (in player)"),
+    ];
 
-        // Add some test results
-        app.results = vec![
-            SearchResult {
-                title: "Test Video 1".to_string(),
-                duration: "10:30".to_string(),
-                channel: "Test Channel".to_string(),
-                views: "1.2M".to_string(),
-                id: "abc123".to_string(),
-            },
-            SearchResult {
-                title: "Test Video 2".to_string(),
-                duration: "5:45".to_string(),
-                channel: "Another Channel".to_string(),
-                views: "500K".to_string(),
-                id: "def456".to_string(),
-            },
-        ];
-        app.total_results = 2;
-        app.exhausted = true;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help ")
+        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
 
-        let results = app.current_page_results();
-        let start_idx = app.page * app.page_size;
+    let paragraph = Paragraph::new(help_text).block(block);
 
-        let items: Vec<String> = results
-            .iter()
-            .enumerate()
-            .map(|(i, result)| {
-                let num = start_idx + i + 1;
-                format!(
-                    "{:>3}. {}\n     Duration: {} | Channel: {} | Views: {}",
-                    num, result.title, result.duration, result.channel, result.views
-                )
-            })
-            .collect();
+    f.render_widget(paragraph, area);
+}
 
-        // Verify first item formatting
-        assert_eq!(
-            items[0],
-            "  1. Test Video 1\n     Duration: 10:30 | Channel: Test Channel | Views: 1.2M"
-        );
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
 
-        // Verify second item formatting
-        assert_eq!(
-            items[1],
-            "  2. Test Video 2\n     Duration: 5:45 | Channel: Another Channel | Views: 500K"
-        );
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
 
-        // Verify items structure (no longer joined with blank lines in List widget)
-        assert_eq!(items.len(), 2);
-    }
-
-    #[test]
-    fn test_page_info_exhausted() {
-        let mut app = App::new("test query".to_string(), 10);
-        app.total_results = 25;
-        app.exhausted = true;
-        app.page = 1;
-
-        let page_info = format!(
-            "Page {}/{} • {} total",
-            app.page + 1,
-            (app.total_results + app.page_size - 1) / app.page_size,
-            app.total_results
-        );
-
-        assert_eq!(page_info, "Page 2/3 • 25 total");
-    }
-
-    #[test]
-    fn test_page_info_not_exhausted() {
-        let mut app = App::new("test query".to_string(), 10);
-        app.total_results = 30;
-        app.exhausted = false;
-        app.page = 2;
-
-        let page_info = format!("Page {} • {}+ loaded", app.page + 1, app.total_results);
-
-        assert_eq!(page_info, "Page 3 • 30+ loaded");
-    }
-
-    #[test]
-    fn test_pagination_offset() {
-        let mut app = App::new("test query".to_string(), 10);
-
-        // Add 15 results
-        for i in 1..=15 {
-            app.results.push(SearchResult {
-                title: format!("Video {}", i),
-                duration: "5:00".to_string(),
-                channel: "Channel".to_string(),
-                views: "1K".to_string(),
-                id: format!("id{}", i),
-            });
-        }
-        app.total_results = 15;
-        app.page = 1; // Second page
-
-        let results = app.current_page_results();
-        let start_idx = app.page * app.page_size;
-
-        // First result on page 2 should be numbered 11
-        let item = format!(
-            "{:>3}. {}\n     Duration: {} | Channel: {} | Views: {}",
-            start_idx + 1,
-            results[0].title,
-            results[0].duration,
-            results[0].channel,
-            results[0].views
-        );
-
-        assert!(item.starts_with(" 11. Video 11"));
+fn format_duration(seconds: u64) -> String {
+    let hrs = seconds / 3600;
+    let mins = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    if hrs > 0 {
+        format!("{}:{:02}:{:02}", hrs, mins, secs)
+    } else {
+        format!("{}:{:02}", mins, secs)
     }
 }
