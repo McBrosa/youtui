@@ -1,3 +1,5 @@
+use crate::player_manager::PlayerManager;
+use crate::queue::Queue;
 use crate::search::SearchResult;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5,6 +7,13 @@ pub enum InputMode {
     Browse,
     Search,
     Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FocusedPanel {
+    SearchBar,
+    Results,
+    Queue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +44,10 @@ pub struct App {
     pub playback_state: PlaybackState,
     pub pending_action: AppAction,
     pub should_quit: bool,
+    pub player_manager: Option<PlayerManager>,
+    pub queue: Queue,
+    pub queue_selected_index: usize,
+    pub focused_panel: FocusedPanel,
 }
 
 impl App {
@@ -53,6 +66,10 @@ impl App {
             playback_state: PlaybackState::Idle,
             pending_action: AppAction::None,
             should_quit: false,
+            player_manager: None,
+            queue: Queue::new(),
+            queue_selected_index: 0,
+            focused_panel: FocusedPanel::Results,
         }
     }
 
