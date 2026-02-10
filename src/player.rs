@@ -14,6 +14,12 @@ pub enum PlayerType {
     Mplayer,
 }
 
+impl Default for PlayerType {
+    fn default() -> Self {
+        PlayerType::Mpv
+    }
+}
+
 impl std::fmt::Display for PlayerType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -73,7 +79,7 @@ fn download_permanently(config: &Config, video_title: &str, url: &str) -> Result
     let output_template = format!("{}/%(title)s.%(ext)s", config.download_dir);
 
     let mut cmd = Command::new("yt-dlp");
-    cmd.arg("-f").arg(&config.format);
+    cmd.arg("-f").arg(&config.format());
 
     if config.audio_only {
         cmd.arg("-x")
@@ -106,7 +112,7 @@ fn play_with_mpv(config: &Config, url: &str, temp_dir: &Path) -> Result<Playback
         cmd.arg("--no-video");
     }
 
-    cmd.arg(format!("--ytdl-format={}", config.format))
+    cmd.arg(format!("--ytdl-format={}", config.format()))
         .arg(format!("--input-conf={}", input_conf.display()))
         .arg(url);
 
@@ -143,7 +149,7 @@ fn play_with_download(
     let output_path = temp_dir.join(format!("{}.{}", safe_title, ext));
 
     let mut cmd = Command::new("yt-dlp");
-    cmd.arg("-f").arg(&config.format);
+    cmd.arg("-f").arg(&config.format());
 
     if config.audio_only {
         cmd.arg("-x")
