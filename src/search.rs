@@ -6,6 +6,7 @@ use colored::Colorize;
 const MIN_DURATION: u32 = 180;
 const SEARCH_CEILING: usize = 500;
 
+#[derive(Clone)]
 pub struct SearchResult {
     pub title: String,
     pub duration: String,
