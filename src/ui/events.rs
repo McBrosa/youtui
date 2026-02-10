@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::ui::app::{App, AppAction, FocusedPanel, InputMode};
+use crate::ui::app::{App, AppAction, FocusedPanel, InputMode, SettingsField};
 
 pub fn handle_key_event(app: &mut App, key: KeyEvent) {
     // Global Tab key for focus cycling (works in any mode except Help)
@@ -48,6 +48,12 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         }
+    }
+
+    // If settings are open, handle settings navigation
+    if app.settings_open {
+        handle_settings_keys(app, key);
+        return;
     }
 
     // Global quit keys work from any panel
@@ -280,6 +286,79 @@ fn handle_help_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q') => {
             app.input_mode = InputMode::Browse;
+        }
+        _ => {}
+    }
+}
+
+fn handle_settings_keys(app: &mut App, key: KeyEvent) {
+    // Define selectable indices (skip section headers)
+    const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 9, 10, 14, 18];
+
+    match key.code {
+        KeyCode::Esc => {
+            app.settings_open = false;
+            app.settings_editing = None;
+        }
+        KeyCode::Up => {
+            // Find the previous selectable index
+            let current = app.settings_selected_index;
+            let pos = SELECTABLE_INDICES.iter().position(|&x| x == current);
+
+            if let Some(pos) = pos {
+                if pos > 0 {
+                    app.settings_selected_index = SELECTABLE_INDICES[pos - 1];
+                }
+            }
+        }
+        KeyCode::Down => {
+            // Find the next selectable index
+            let current = app.settings_selected_index;
+            let pos = SELECTABLE_INDICES.iter().position(|&x| x == current);
+
+            if let Some(pos) = pos {
+                if pos < SELECTABLE_INDICES.len() - 1 {
+                    app.settings_selected_index = SELECTABLE_INDICES[pos + 1];
+                }
+            }
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            // Handle action based on the selected index
+            match app.settings_selected_index {
+                2 => {
+                    // Audio Only checkbox
+                    let _ = app.config.toggle_audio_only();
+                }
+                3 => {
+                    // Bandwidth Limit checkbox
+                    let _ = app.config.toggle_bandwidth_limit();
+                }
+                4 => {
+                    // Keep Temp checkbox
+                    let _ = app.config.toggle_keep_temp();
+                }
+                5 => {
+                    // Include Shorts checkbox
+                    let _ = app.config.toggle_include_shorts();
+                }
+                9 => {
+                    // Download Mode checkbox
+                    let _ = app.config.toggle_download_mode();
+                }
+                10 => {
+                    // Download Dir text field - enter edit mode
+                    app.settings_editing = Some(SettingsField::DownloadDir);
+                }
+                14 => {
+                    // Results Per Page text field - enter edit mode
+                    app.settings_editing = Some(SettingsField::ResultsPerPage);
+                }
+                18 => {
+                    // Custom Format text field - enter edit mode
+                    app.settings_editing = Some(SettingsField::CustomFormat);
+                }
+                _ => {}
+            }
         }
         _ => {}
     }
