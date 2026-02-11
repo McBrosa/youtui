@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use crate::ui::app::{App, FocusedPanel, InputMode, SettingsField};
@@ -296,6 +296,9 @@ fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
 fn render_help_overlay(f: &mut Frame, _app: &App) {
     let area = centered_rect(60, 70, f.size());
 
+    // Clear the background area first to hide content behind the modal
+    f.render_widget(Clear, area);
+
     let help_text = vec![
         Line::from(Span::styled("Keyboard Controls", Style::default().add_modifier(Modifier::BOLD))),
         Line::from(""),
@@ -380,6 +383,9 @@ fn format_duration(seconds: u64) -> String {
 
 fn render_settings_modal(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 70, f.size());
+
+    // Clear the background area first to hide content behind the modal
+    f.render_widget(Clear, area);
 
     let items = settings_items(app);
 
