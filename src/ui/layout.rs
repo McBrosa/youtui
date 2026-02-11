@@ -445,8 +445,12 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
             Span::styled("(leave empty for auto)", Style::default().fg(Color::DarkGray))
         )),
         ListItem::new(""),
+        ListItem::new(""),
         ListItem::new(Line::from(
-            Span::styled("Press S/F2/Esc to close", Style::default().fg(Color::DarkGray))
+            Span::styled("Changes are saved automatically", Style::default().fg(Color::Green))
+        )),
+        ListItem::new(Line::from(
+            Span::styled("Press Esc/S/F2 to close", Style::default().fg(Color::Cyan))
         )),
     ]
 }
