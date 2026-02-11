@@ -11,6 +11,17 @@ A rich terminal UI for searching and playing YouTube videos.
 - 📥 Download mode for permanent storage
 - 🎵 Audio-only mode
 
+## Built With
+
+**Core Libraries:**
+- [ratatui](https://github.com/ratatui/ratatui) - Terminal UI framework
+- [crossterm](https://github.com/crossterm-rs/crossterm) - Cross-platform terminal manipulation
+- [serde](https://github.com/serde-rs/serde) + [toml](https://github.com/toml-rs/toml) - Configuration serialization
+
+**External Dependencies:**
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) - YouTube video fetching and metadata
+- [mpv](https://mpv.io/) - Media player with IPC support for background playback
+
 ## Installation
 
 Requires: `yt-dlp` and one of `mpv`, `vlc`, or `mplayer`
