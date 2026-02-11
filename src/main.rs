@@ -1,5 +1,6 @@
 mod cleanup;
 mod config;
+mod deps;
 mod display;
 mod ipc;
 mod player;
