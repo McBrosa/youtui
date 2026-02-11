@@ -18,10 +18,13 @@ use search::{PaginatedSearch, check_ytdlp};
 use ui::FocusedPanel;
 
 fn main() -> Result<()> {
+    // Check and install dependencies if needed
+    deps::ensure_dependencies()?;
+
     // Load or create config (no CLI parsing)
     let mut config = Config::load_or_create()?;
 
-    // Check dependencies
+    // Check dependencies (now defensive only)
     check_ytdlp()?;
     let player = detect_player()?;
     config.player = player;
