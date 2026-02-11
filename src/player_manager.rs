@@ -99,14 +99,6 @@ impl PlayerManager {
         Ok(())
     }
 
-    pub fn stop(&mut self) -> Result<()> {
-        if let Some(ipc) = self.ipc.as_mut() {
-            ipc.send_command(&["stop"])?;
-            self.status = PlaybackStatus::default();
-        }
-        Ok(())
-    }
-
     pub fn seek(&mut self, seconds: f64) -> Result<()> {
         if let Some(ipc) = self.ipc.as_mut() {
             ipc.send_command(&["seek", &seconds.to_string(), "relative"])?;

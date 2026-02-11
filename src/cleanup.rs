@@ -53,7 +53,3 @@ pub fn setup_signal_handler() {
         eprintln!("\n{}", "Interrupted. Press Ctrl-C again to force exit.".yellow());
     });
 }
-
-pub fn is_interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
-}
