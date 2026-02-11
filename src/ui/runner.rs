@@ -35,15 +35,18 @@ pub fn run_app(
                     if crate::player::supports_background_playback(config.player) {
                         // Background playback with mpv
                         if app.player_manager.is_none() {
-                            match PlayerManager::new() {
-                                Ok(mut pm) => {
-                                    let url = format!("https://www.youtube.com/watch?v={}", result.id);
-                                    if pm.play(&url, &result.title).is_ok() {
-                                        app.player_manager = Some(pm);
+                            // Play from the front of the queue (not necessarily the just-added video)
+                            if let Some(track) = app.queue.get(0) {
+                                match PlayerManager::new() {
+                                    Ok(mut pm) => {
+                                        let url = format!("https://www.youtube.com/watch?v={}", track.id);
+                                        if pm.play(&url, &track.title).is_ok() {
+                                            app.player_manager = Some(pm);
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to create player: {}", e);
+                                    Err(e) => {
+                                        eprintln!("Failed to create player: {}", e);
+                                    }
                                 }
                             }
                         }
