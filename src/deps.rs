@@ -70,6 +70,38 @@ fn get_install_command<'a>(platform: &Platform, deps: &[&'a str]) -> (&'static s
     }
 }
 
+fn get_package_manager_name(platform: &Platform) -> &str {
+    match platform {
+        Platform::MacOS => "Homebrew",
+        Platform::Linux(LinuxDistro::Debian) => "apt",
+        Platform::Linux(LinuxDistro::RedHat) => "dnf",
+        Platform::Linux(LinuxDistro::Arch) => "pacman",
+    }
+}
+
+fn prompt_user(deps: &[&str], platform: &Platform) -> Result<bool> {
+    let deps_str = deps.join(", ");
+    let pm_name = get_package_manager_name(platform);
+
+    println!("\nMissing dependencies: {}", deps_str);
+    println!("\nyoutui requires these tools to search and play YouTube videos.");
+
+    let sudo_note = if matches!(platform, Platform::MacOS) {
+        ""
+    } else {
+        " (requires sudo)"
+    };
+
+    print!("\nInstall now using {}?{} [Y/n]: ", pm_name, sudo_note);
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    let input = input.trim().to_lowercase();
+    Ok(input.is_empty() || input == "y" || input == "yes")
+}
+
 fn detect_platform() -> Result<Platform> {
     if cfg!(target_os = "macos") {
         // Verify Homebrew exists
