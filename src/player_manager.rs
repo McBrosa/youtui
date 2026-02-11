@@ -39,7 +39,7 @@ impl Default for PlaybackStatus {
 impl PlayerManager {
     pub fn new() -> Result<Self> {
         let socket_path = PathBuf::from(format!(
-            "/tmp/yt-search-play-{}.sock",
+            "/tmp/youtui-{}.sock",
             std::process::id()
         ));
 

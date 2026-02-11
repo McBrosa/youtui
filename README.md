@@ -1,4 +1,4 @@
-# yt-search-play
+# youtui
 
 A rich terminal UI for searching and playing YouTube videos.
 
@@ -24,14 +24,14 @@ cargo install --path .
 Launch with no arguments:
 
 ```bash
-yt-search-play
+youtui
 ```
 
 The app will open with an empty search bar. Type your search query and press Enter to search.
 
 ## Settings
 
-Press `S` or `F2` to open the settings modal. All settings are saved immediately to `~/.config/yt-search-play/config.toml` and persist across sessions.
+Press `S` or `F2` to open the settings modal. All settings are saved immediately to `~/.config/youtui/config.toml` and persist across sessions.
 
 Available settings:
 - **Audio Only**: Play audio only (no video)

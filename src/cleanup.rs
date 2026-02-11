@@ -11,7 +11,7 @@ pub struct ManagedTempDir {
 
 impl ManagedTempDir {
     pub fn new(keep: bool) -> anyhow::Result<Self> {
-        let dir = tempfile::TempDir::with_prefix("yt-search-play-")?;
+        let dir = tempfile::TempDir::with_prefix("youtui-")?;
         Ok(ManagedTempDir {
             inner: Some(dir),
             keep,

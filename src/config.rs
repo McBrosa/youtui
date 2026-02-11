@@ -47,7 +47,7 @@ impl Config {
     fn config_path() -> Result<std::path::PathBuf> {
         let config_dir = dirs::config_dir()
             .ok_or(anyhow::anyhow!("No config directory found"))?;
-        Ok(config_dir.join("yt-search-play/config.toml"))
+        Ok(config_dir.join("youtui/config.toml"))
     }
 
     pub fn toggle_audio_only(&mut self) -> Result<()> {
