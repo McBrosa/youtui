@@ -45,6 +45,31 @@ fn parse_os_release(content: &str) -> LinuxDistro {
     LinuxDistro::Debian
 }
 
+fn get_install_command<'a>(platform: &Platform, deps: &[&'a str]) -> (&'static str, Vec<String>) {
+    match platform {
+        Platform::MacOS => {
+            let mut args = vec!["install".to_string()];
+            args.extend(deps.iter().map(|s| s.to_string()));
+            ("brew", args)
+        }
+        Platform::Linux(LinuxDistro::Debian) => {
+            let deps_str = deps.join(" ");
+            let command = format!("sudo apt update && sudo apt install -y {}", deps_str);
+            ("sh", vec!["-c".to_string(), command])
+        }
+        Platform::Linux(LinuxDistro::RedHat) => {
+            let mut args = vec!["dnf".to_string(), "install".to_string(), "-y".to_string()];
+            args.extend(deps.iter().map(|s| s.to_string()));
+            ("sudo", args)
+        }
+        Platform::Linux(LinuxDistro::Arch) => {
+            let mut args = vec!["pacman".to_string(), "-S".to_string(), "--noconfirm".to_string()];
+            args.extend(deps.iter().map(|s| s.to_string()));
+            ("sudo", args)
+        }
+    }
+}
+
 fn detect_platform() -> Result<Platform> {
     if cfg!(target_os = "macos") {
         // Verify Homebrew exists
@@ -110,5 +135,44 @@ mod tests {
     fn test_parse_os_release_default() {
         let content = "ID=unknown\n";
         assert_eq!(parse_os_release(content), LinuxDistro::Debian);
+    }
+
+    #[test]
+    fn test_get_install_command_macos() {
+        let (program, args) = get_install_command(&Platform::MacOS, &["mpv", "yt-dlp"]);
+        assert_eq!(program, "brew");
+        assert_eq!(args, vec!["install", "mpv", "yt-dlp"]);
+    }
+
+    #[test]
+    fn test_get_install_command_debian() {
+        let (program, args) = get_install_command(
+            &Platform::Linux(LinuxDistro::Debian),
+            &["mpv", "yt-dlp"]
+        );
+        assert_eq!(program, "sh");
+        assert_eq!(args[0], "-c");
+        assert!(args[1].contains("apt update"));
+        assert!(args[1].contains("apt install"));
+    }
+
+    #[test]
+    fn test_get_install_command_redhat() {
+        let (program, args) = get_install_command(
+            &Platform::Linux(LinuxDistro::RedHat),
+            &["mpv", "yt-dlp"]
+        );
+        assert_eq!(program, "sudo");
+        assert_eq!(args, vec!["dnf", "install", "-y", "mpv", "yt-dlp"]);
+    }
+
+    #[test]
+    fn test_get_install_command_arch() {
+        let (program, args) = get_install_command(
+            &Platform::Linux(LinuxDistro::Arch),
+            &["mpv", "yt-dlp"]
+        );
+        assert_eq!(program, "sudo");
+        assert_eq!(args, vec!["pacman", "-S", "--noconfirm", "mpv", "yt-dlp"]);
     }
 }
