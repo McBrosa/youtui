@@ -18,3 +18,23 @@ pub enum LinuxDistro {
 pub fn ensure_dependencies() -> Result<()> {
     Ok(())
 }
+
+fn check_dependency(name: &str) -> bool {
+    which::which(name).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_dependency_existing() {
+        // Test with 'ls' which exists on all Unix systems
+        assert!(check_dependency("ls"));
+    }
+
+    #[test]
+    fn test_check_dependency_missing() {
+        assert!(!check_dependency("nonexistent-command-xyz-123"));
+    }
+}
