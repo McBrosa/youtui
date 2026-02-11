@@ -16,6 +16,48 @@ pub enum LinuxDistro {
 }
 
 pub fn ensure_dependencies() -> Result<()> {
+    // Check which dependencies are missing
+    let missing: Vec<&str> = ["yt-dlp", "mpv"]
+        .iter()
+        .copied()
+        .filter(|&dep| !check_dependency(dep))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // Detect platform
+    let platform = detect_platform()?;
+
+    // Prompt user
+    if !prompt_user(&missing, &platform)? {
+        println!("\nInstallation declined.");
+        println!("\nTo use youtui, please install the required dependencies:");
+        println!("  {}", format_manual_command(&platform, &missing));
+        println!("\nThen relaunch youtui.");
+        std::process::exit(0);
+    }
+
+    // Install
+    install_dependencies(&missing, &platform)?;
+
+    // Verify installation
+    let still_missing: Vec<&str> = missing
+        .iter()
+        .copied()
+        .filter(|&dep| !check_dependency(dep))
+        .collect();
+
+    if !still_missing.is_empty() {
+        bail!(
+            "✗ Installation verification failed\n\nThe following dependencies are still missing: {}\n\nPlease install manually:\n  {}",
+            still_missing.join(", "),
+            format_manual_command(&platform, &still_missing)
+        );
+    }
+
+    println!("Launching youtui...\n");
     Ok(())
 }
 
