@@ -87,7 +87,7 @@ fn parse_os_release(content: &str) -> LinuxDistro {
     LinuxDistro::Debian
 }
 
-fn get_install_command<'a>(platform: &Platform, deps: &[&'a str]) -> (&'static str, Vec<String>) {
+fn get_install_command(platform: &Platform, deps: &[&str]) -> (&'static str, Vec<String>) {
     match platform {
         Platform::MacOS => {
             let mut args = vec!["install".to_string()];
@@ -158,7 +158,6 @@ fn install_dependencies(deps: &[&str], platform: &Platform) -> Result<()> {
         .context(format!("Failed to execute {} command", program))?;
 
     if !status.success() {
-        let pm_name = get_package_manager_name(platform);
         bail!(
             "✗ Installation failed\n\nPlease install manually:\n  {}\n\nThen relaunch youtui.",
             format_manual_command(platform, deps)
