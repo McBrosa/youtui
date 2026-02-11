@@ -243,11 +243,23 @@ fn handle_queue_keys(app: &mut App, key: KeyEvent) {
                     app.queue_selected_index = 0;
                 }
 
-                if let Some(ref mut player) = app.player_manager {
-                    if let Some(track) = app.queue.get(0) {
-                        let url = format!("https://www.youtube.com/watch?v={}", track.id);
-                        let title = track.title.clone();
+                if let Some(track) = app.queue.get(0) {
+                    let url = format!("https://www.youtube.com/watch?v={}", track.id);
+                    let title = track.title.clone();
+
+                    if let Some(ref mut player) = app.player_manager {
                         let _ = player.play(&url, &title);
+                    } else {
+                        // Create player manager if it doesn't exist
+                        use crate::player_manager::PlayerManager;
+                        match PlayerManager::new() {
+                            Ok(mut pm) => {
+                                if pm.play(&url, &title).is_ok() {
+                                    app.player_manager = Some(pm);
+                                }
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }
             }

@@ -250,20 +250,57 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
             0
         };
 
-        let filled = "=".repeat(progress.min(progress_width));
-        let empty = "-".repeat(progress_width.saturating_sub(progress));
+        let filled = "━".repeat(progress.min(progress_width));
+        let empty = "─".repeat(progress_width.saturating_sub(progress));
 
-        let icon = if status.paused { "||" } else { ">>" };
         let elapsed = format_duration(status.time_pos as u64);
         let duration = format_duration(status.duration as u64);
 
-        let text = format!(
-            " {} {} [{}{}] {}/{} Vol:{}",
-            icon, status.title, filled, empty, elapsed, duration, status.volume
-        );
+        let line = Line::from(vec![
+            Span::styled(
+                if status.paused { " ⏸ " } else { " ▶ " },
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            ),
+            Span::styled(
+                format!(" {} ", status.title),
+                Style::default().fg(Color::White).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            ),
+            Span::styled(
+                " │ ",
+                Style::default().fg(Color::DarkGray).bg(Color::Cyan)
+            ),
+            Span::styled(
+                filled,
+                Style::default().fg(Color::Yellow).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            ),
+            Span::styled(
+                empty,
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            ),
+            Span::styled(
+                format!(" {} ", elapsed),
+                Style::default().fg(Color::White).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            ),
+            Span::styled(
+                "/",
+                Style::default().fg(Color::DarkGray).bg(Color::Cyan)
+            ),
+            Span::styled(
+                format!(" {} ", duration),
+                Style::default().fg(Color::White).bg(Color::Cyan)
+            ),
+            Span::styled(
+                "│",
+                Style::default().fg(Color::DarkGray).bg(Color::Cyan)
+            ),
+            Span::styled(
+                format!(" 🔊 {}% ", status.volume),
+                Style::default().fg(Color::White).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            ),
+        ]);
 
-        let status_bar = Paragraph::new(text)
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        let status_bar = Paragraph::new(line)
+            .style(Style::default().bg(Color::Cyan));
 
         f.render_widget(status_bar, area);
     }
