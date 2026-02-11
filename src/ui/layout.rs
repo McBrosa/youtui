@@ -272,7 +272,7 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
 fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
     let text = match app.focused_panel {
         FocusedPanel::SearchBar => {
-            "Enter: Search | Esc: Cancel | Tab: Switch Panel".to_string()
+            "Enter: Search | Esc: Cancel | Tab: Switch Panel | F2: Settings".to_string()
         }
         FocusedPanel::Results => {
             if !app.number_input.is_empty() {
@@ -282,7 +282,7 @@ fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
             }
         }
         FocusedPanel::Queue => {
-            "Up/Dn: Navigate | Enter: Jump | Del: Remove | c: Clear | Tab: Switch".to_string()
+            "Up/Dn: Navigate | Enter: Jump | Del: Remove | c: Clear | Tab: Switch | F2: Settings".to_string()
         }
     };
 
