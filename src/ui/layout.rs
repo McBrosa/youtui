@@ -228,7 +228,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // Status bar
+                Constraint::Length(2),  // Status bar (now 2 lines)
                 Constraint::Length(2),  // Controls
             ])
             .split(area);
@@ -243,7 +243,39 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
     if let Some(ref player) = app.player_manager {
         let status = &player.status;
-        let progress_width = area.width.saturating_sub(60) as usize;
+
+        // Split area into two lines
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),  // Title line
+                Constraint::Length(1),  // Progress line
+            ])
+            .split(area);
+
+        // Line 1: Play/Pause button + Title
+        let title_line = Line::from(vec![
+            Span::styled(
+                if status.paused { " ⏸ " } else { " ▶ " },
+                Style::default().fg(Color::Green).bg(Color::Black).add_modifier(Modifier::BOLD)
+            ),
+            Span::styled(
+                format!(" {} ", status.title),
+                Style::default().fg(Color::White).bg(Color::Black).add_modifier(Modifier::BOLD)
+            ),
+        ]);
+
+        let title_widget = Paragraph::new(title_line)
+            .style(Style::default().bg(Color::Black));
+
+        f.render_widget(title_widget, chunks[0]);
+
+        // Line 2: Progress bar + Time + Volume
+        // Calculate progress bar width: subtract space for time display and volume
+        // Time format is roughly " MM:SS / MM:SS " (about 17 chars) + volume " │ 🔊 100% " (about 11 chars)
+        let time_volume_width = 30;
+        let progress_width = chunks[1].width.saturating_sub(time_volume_width) as usize;
+
         let progress = if status.duration > 0.0 {
             (status.time_pos / status.duration * progress_width as f64) as usize
         } else {
@@ -256,18 +288,10 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
         let elapsed = format_duration(status.time_pos as u64);
         let duration = format_duration(status.duration as u64);
 
-        let line = Line::from(vec![
+        let progress_line = Line::from(vec![
             Span::styled(
-                if status.paused { " ⏸ " } else { " ▶ " },
-                Style::default().fg(Color::Green).bg(Color::Black).add_modifier(Modifier::BOLD)
-            ),
-            Span::styled(
-                format!(" {} ", status.title),
-                Style::default().fg(Color::White).bg(Color::Black).add_modifier(Modifier::BOLD)
-            ),
-            Span::styled(
-                " │ ",
-                Style::default().fg(Color::DarkGray).bg(Color::Black)
+                " ",
+                Style::default().bg(Color::Black)
             ),
             Span::styled(
                 filled,
@@ -299,10 +323,10 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]);
 
-        let status_bar = Paragraph::new(line)
+        let progress_widget = Paragraph::new(progress_line)
             .style(Style::default().bg(Color::Black));
 
-        f.render_widget(status_bar, area);
+        f.render_widget(progress_widget, chunks[1]);
     }
 }
 

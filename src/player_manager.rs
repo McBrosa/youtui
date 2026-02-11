@@ -87,6 +87,8 @@ impl PlayerManager {
         self.status.playing = true;
         self.status.paused = false;
         self.status.eof_reached = false;
+        self.status.time_pos = 0.0;
+        self.status.duration = 0.0;  // Reset duration for new track
 
         Ok(())
     }
@@ -122,9 +124,17 @@ impl PlayerManager {
                 }
             }
 
+            // Only update duration if we get a valid value that makes sense
+            // This prevents duration from being overwritten with incorrect values
+            // when seeking or pausing. Once we have a valid duration, never decrease it.
             if let Ok(val) = ipc.get_property("duration") {
                 if let Some(dur) = val.as_f64() {
-                    self.status.duration = dur;
+                    // Only update if:
+                    // 1. Duration is positive AND
+                    // 2. Either we don't have a duration yet (0.0) OR the new duration is greater
+                    if dur > 0.0 && (self.status.duration == 0.0 || dur > self.status.duration) {
+                        self.status.duration = dur;
+                    }
                 }
             }
 
