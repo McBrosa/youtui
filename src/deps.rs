@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, Context};
 use std::process::Command;
 use std::io::{self, Write};
 
@@ -100,6 +100,41 @@ fn prompt_user(deps: &[&str], platform: &Platform) -> Result<bool> {
 
     let input = input.trim().to_lowercase();
     Ok(input.is_empty() || input == "y" || input == "yes")
+}
+
+fn install_dependencies(deps: &[&str], platform: &Platform) -> Result<()> {
+    println!("\nInstalling dependencies...");
+
+    let (program, args) = get_install_command(platform, deps);
+    let args_display: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    println!("Running: {} {}", program, args_display.join(" "));
+    println!();
+
+    let status = Command::new(program)
+        .args(&args)
+        .status()
+        .context(format!("Failed to execute {} command", program))?;
+
+    if !status.success() {
+        let pm_name = get_package_manager_name(platform);
+        bail!(
+            "✗ Installation failed\n\nPlease install manually:\n  {}\n\nThen relaunch youtui.",
+            format_manual_command(platform, deps)
+        );
+    }
+
+    println!("\n✓ Installation complete!\n");
+    Ok(())
+}
+
+fn format_manual_command(platform: &Platform, deps: &[&str]) -> String {
+    let deps_str = deps.join(" ");
+    match platform {
+        Platform::MacOS => format!("brew install {}", deps_str),
+        Platform::Linux(LinuxDistro::Debian) => format!("sudo apt install {}", deps_str),
+        Platform::Linux(LinuxDistro::RedHat) => format!("sudo dnf install {}", deps_str),
+        Platform::Linux(LinuxDistro::Arch) => format!("sudo pacman -S {}", deps_str),
+    }
 }
 
 fn detect_platform() -> Result<Platform> {
