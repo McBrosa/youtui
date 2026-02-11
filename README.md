@@ -24,10 +24,40 @@ A rich terminal UI for searching and playing YouTube videos.
 
 ## Installation
 
-Requires: `yt-dlp` and one of `mpv`, `vlc`, or `mplayer`
+**System Requirements:**
+- macOS (with Homebrew) or Linux (Debian/Ubuntu, Fedora/RHEL, or Arch)
+- Internet connection (for first-time dependency setup)
 
+**First Launch:**
 ```bash
 cargo install --path .
+youtui
+```
+
+On first launch, youtui will automatically detect if `yt-dlp` and `mpv` are missing and offer to install them using your system's package manager (Homebrew on macOS, apt/dnf/pacman on Linux). Just accept the prompt and youtui will handle the setup.
+
+**Manual Installation (optional):**
+
+If you prefer to install dependencies yourself:
+
+**macOS:**
+```bash
+brew install mpv yt-dlp
+```
+
+**Linux (Debian/Ubuntu):**
+```bash
+sudo apt install mpv yt-dlp
+```
+
+**Linux (Fedora/RHEL):**
+```bash
+sudo dnf install mpv yt-dlp
+```
+
+**Linux (Arch):**
+```bash
+sudo pacman -S mpv yt-dlp
 ```
 
 ## Usage
