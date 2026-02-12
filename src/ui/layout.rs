@@ -15,7 +15,7 @@ pub fn render_ui(f: &mut Frame, app: &App) {
 
     // Add status bar if playing
     if app.player_manager.is_some() {
-        constraints.push(Constraint::Length(3)); // Status bar + controls
+        constraints.push(Constraint::Length(4)); // Status bar (2 lines) + controls (2 lines)
     } else {
         constraints.push(Constraint::Length(2)); // Just controls
     }
@@ -343,7 +343,7 @@ fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
             }
         }
         FocusedPanel::Queue => {
-            "Up/Dn: Navigate | Enter: Jump | Del: Remove | c: Clear | Tab: Switch | F2: Settings".to_string()
+            "Up/Dn: Navigate | Enter: Jump | Del: Remove | n: Next | c: Clear | Tab: Switch | F2: Settings".to_string()
         }
     };
 
@@ -382,12 +382,12 @@ fn render_help_overlay(f: &mut Frame, _app: &App) {
         Line::from("Queue (when focused):"),
         Line::from("  Up/Dn       - Navigate queue"),
         Line::from("  Enter       - Jump to track"),
-        Line::from("  Del/Bksp    - Remove track"),
-        Line::from("  c           - Clear queue"),
+        Line::from("  Del/Bksp    - Remove track (auto-next if playing)"),
+        Line::from("  n           - Next track"),
+        Line::from("  c           - Clear queue and stop player"),
         Line::from(""),
         Line::from("Playback (global):"),
         Line::from("  Space       - Play/Pause"),
-        Line::from("  n           - Next track"),
         Line::from("  </>         - Seek -/+ 10 seconds"),
         Line::from("  +/-         - Volume up/down"),
         Line::from("  m           - Mute toggle"),
@@ -474,6 +474,7 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
         checkbox_item(3, "Bandwidth Limit (360p video, 128k audio)", app.config.bandwidth_limit, selected),
         checkbox_item(4, "Keep Temporary Files", app.config.keep_temp, selected),
         checkbox_item(5, "Include YouTube Shorts", app.config.include_shorts, selected),
+        checkbox_item(6, "Auto Play Queue (uncheck to load paused)", app.config.auto_play_queue, selected),
         ListItem::new(""),
 
         // Downloads section header
@@ -481,8 +482,8 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
             Span::styled("Downloads", Style::default().add_modifier(Modifier::BOLD))
         )),
         ListItem::new("─────────"),
-        checkbox_item(9, "Download Mode (save permanently)", app.config.download_mode, selected),
-        text_field_item(10, "Download Directory", &app.config.download_dir, selected, editing, SettingsField::DownloadDir),
+        checkbox_item(10, "Download Mode (save permanently)", app.config.download_mode, selected),
+        text_field_item(11, "Download Directory", &app.config.download_dir, selected, editing, SettingsField::DownloadDir),
         ListItem::new(""),
 
         // Display section header
@@ -490,7 +491,7 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
             Span::styled("Display", Style::default().add_modifier(Modifier::BOLD))
         )),
         ListItem::new("───────"),
-        text_field_item(14, "Results Per Page",
+        text_field_item(15, "Results Per Page",
             &app.results_per_page_input.as_ref()
                 .unwrap_or(&app.config.results_per_page.to_string()),
             selected, editing, SettingsField::ResultsPerPage),
@@ -501,7 +502,7 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
             Span::styled("Advanced", Style::default().add_modifier(Modifier::BOLD))
         )),
         ListItem::new("────────"),
-        text_field_item(18, "Custom Format", &app.config.custom_format, selected, editing, SettingsField::CustomFormat),
+        text_field_item(19, "Custom Format", &app.config.custom_format, selected, editing, SettingsField::CustomFormat),
         ListItem::new(Line::from(
             Span::styled("(leave empty for auto)", Style::default().fg(Color::DarkGray))
         )),

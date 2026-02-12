@@ -3,6 +3,10 @@ use std::fs;
 use anyhow::{Context, Result};
 use crate::player::PlayerType;
 
+fn default_auto_play_queue() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip)]
@@ -16,6 +20,8 @@ pub struct Config {
     pub download_dir: String,
     pub results_per_page: usize,
     pub custom_format: String,
+    #[serde(default = "default_auto_play_queue")]
+    pub auto_play_queue: bool,
 }
 
 impl Config {
@@ -75,6 +81,11 @@ impl Config {
         self.save()
     }
 
+    pub fn toggle_auto_play_queue(&mut self) -> Result<()> {
+        self.auto_play_queue = !self.auto_play_queue;
+        self.save()
+    }
+
     pub fn format(&self) -> String {
         if !self.custom_format.is_empty() {
             self.custom_format.clone()
@@ -100,6 +111,7 @@ impl Default for Config {
                 .to_string(),
             results_per_page: 20,
             custom_format: String::new(),
+            auto_play_queue: true,
         }
     }
 }

@@ -246,15 +246,16 @@ fn handle_queue_keys(app: &mut App, key: KeyEvent) {
                 if let Some(track) = app.queue.get(0) {
                     let url = format!("https://www.youtube.com/watch?v={}", track.id);
                     let title = track.title.clone();
+                    let video_id = track.id.clone();
 
                     if let Some(ref mut player) = app.player_manager {
-                        let _ = player.play(&url, &title);
+                        let _ = player.play(&url, &title, &video_id);
                     } else {
                         // Create player manager if it doesn't exist
                         use crate::player_manager::PlayerManager;
                         match PlayerManager::new() {
                             Ok(mut pm) => {
-                                if pm.play(&url, &title).is_ok() {
+                                if pm.play(&url, &title, &video_id).is_ok() {
                                     app.player_manager = Some(pm);
                                 }
                             }
@@ -265,27 +266,36 @@ fn handle_queue_keys(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Delete | KeyCode::Backspace => {
-            app.queue.remove(app.queue_selected_index);
-            if app.queue_selected_index >= app.queue.len() && app.queue_selected_index > 0 {
-                app.queue_selected_index -= 1;
+            if app.queue_selected_index < app.queue.len() {
+                let removed_video = app.queue.get(app.queue_selected_index).map(|v| v.id.clone());
+                app.queue.remove(app.queue_selected_index);
+
+                if app.queue_selected_index >= app.queue.len() && app.queue_selected_index > 0 {
+                    app.queue_selected_index -= 1;
+                }
+
+                // Check if the removed video was currently playing
+                if let Some(removed_id) = removed_video {
+                    if let Some(ref player) = app.player_manager {
+                        if player.current_video_id.as_ref() == Some(&removed_id) {
+                            // Currently playing video was removed, go to next (automatic)
+                            app.handle_next_video(false);
+                        }
+                    }
+                }
             }
         }
         KeyCode::Char('c') => {
             app.queue.clear();
             app.queue_selected_index = 0;
+            // Clear player when queue is cleared
+            if let Some(ref mut player) = app.player_manager {
+                let _ = player.clear();
+            }
         }
         KeyCode::Char('n') => {
-            // Next track (from queue panel)
-            if app.player_manager.is_some() {
-                let next = app.queue.pop_front();
-                if let Some(next_track) = next {
-                    let url = format!("https://www.youtube.com/watch?v={}", next_track.id);
-                    let title = next_track.title.clone();
-                    if let Some(pm) = app.player_manager.as_mut() {
-                        let _ = pm.play(&url, &title);
-                    }
-                }
-            }
+            // Next track - manual action, always auto-plays
+            app.handle_next_video(true);
         }
         KeyCode::Char('h') => {
             app.input_mode = InputMode::Help;
@@ -381,7 +391,7 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
     }
 
     // Define selectable indices (skip section headers)
-    const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 9, 10, 14, 18];
+    const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 6, 10, 11, 15, 19];
 
     match key.code {
         KeyCode::Esc => {
@@ -430,20 +440,24 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
                     // Include Shorts checkbox
                     let _ = app.config.toggle_include_shorts();
                 }
-                9 => {
+                6 => {
+                    // Auto Play Queue checkbox
+                    let _ = app.config.toggle_auto_play_queue();
+                }
+                10 => {
                     // Download Mode checkbox
                     let _ = app.config.toggle_download_mode();
                 }
-                10 => {
+                11 => {
                     // Download Dir text field - enter edit mode
                     app.settings_editing = Some(SettingsField::DownloadDir);
                 }
-                14 => {
+                15 => {
                     // Results Per Page text field - enter edit mode
                     app.settings_editing = Some(SettingsField::ResultsPerPage);
                     app.results_per_page_input = Some(app.config.results_per_page.to_string());
                 }
-                18 => {
+                19 => {
                     // Custom Format text field - enter edit mode
                     app.settings_editing = Some(SettingsField::CustomFormat);
                 }

@@ -98,4 +98,63 @@ impl App {
     pub fn has_prev_page(&self) -> bool {
         self.page > 0
     }
+
+    pub fn handle_next_video(&mut self, manual: bool) {
+        // Remove the currently playing track from front of queue
+        if !self.queue.is_empty() {
+            self.queue.pop_front();
+            // Adjust selected index if needed
+            if self.queue_selected_index > 0 {
+                self.queue_selected_index -= 1;
+            }
+        }
+
+        // Now play the new front of the queue (if any)
+        if !self.queue.is_empty() {
+            if let Some(track) = self.queue.get(0) {
+                let url = format!("https://www.youtube.com/watch?v={}", track.id);
+                let title = track.title.clone();
+                let video_id = track.id.clone();
+
+                // Manual 'n' press always auto-plays, automatic transitions respect setting
+                let should_auto_play = manual || self.config.auto_play_queue;
+
+                if let Some(ref mut player) = self.player_manager {
+                    let result = if should_auto_play {
+                        player.play(&url, &title, &video_id)
+                    } else {
+                        player.load_paused(&url, &title, &video_id)
+                    };
+
+                    if result.is_err() {
+                        self.player_manager = None;
+                    }
+                } else {
+                    // Create player manager if it doesn't exist
+                    use crate::player_manager::PlayerManager;
+                    match PlayerManager::new() {
+                        Ok(mut pm) => {
+                            let result = if should_auto_play {
+                                pm.play(&url, &title, &video_id)
+                            } else {
+                                pm.load_paused(&url, &title, &video_id)
+                            };
+
+                            if result.is_ok() {
+                                self.player_manager = Some(pm);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create player: {}", e);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Queue is empty, clear the player
+            if let Some(ref mut player) = self.player_manager {
+                let _ = player.clear();
+            }
+        }
+    }
 }

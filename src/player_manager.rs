@@ -9,6 +9,7 @@ pub struct PlayerManager {
     socket_path: PathBuf,
     ipc: Option<IpcClient>,
     pub status: PlaybackStatus,
+    pub current_video_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +60,7 @@ impl PlayerManager {
             socket_path,
             ipc: None,
             status: PlaybackStatus::default(),
+            current_video_id: None,
         })
     }
 
@@ -75,13 +77,13 @@ impl PlayerManager {
         Ok(())
     }
 
-    pub fn play(&mut self, url: &str, title: &str) -> Result<()> {
+    pub fn play(&mut self, url: &str, title: &str, video_id: &str) -> Result<()> {
         if self.ipc.is_none() {
             self.connect()?;
         }
 
         let ipc = self.ipc.as_mut().unwrap();
-        ipc.send_command(&["loadfile", url])?;
+        ipc.send_command(&["loadfile", url, "replace"])?;
 
         self.status.title = title.to_string();
         self.status.playing = true;
@@ -89,6 +91,37 @@ impl PlayerManager {
         self.status.eof_reached = false;
         self.status.time_pos = 0.0;
         self.status.duration = 0.0;  // Reset duration for new track
+        self.current_video_id = Some(video_id.to_string());
+
+        Ok(())
+    }
+
+    pub fn load_paused(&mut self, url: &str, title: &str, video_id: &str) -> Result<()> {
+        if self.ipc.is_none() {
+            self.connect()?;
+        }
+
+        let ipc = self.ipc.as_mut().unwrap();
+        ipc.send_command(&["loadfile", url, "replace", "pause=yes"])?;
+
+        self.status.title = title.to_string();
+        self.status.playing = true;
+        self.status.paused = true;
+        self.status.eof_reached = false;
+        self.status.time_pos = 0.0;
+        self.status.duration = 0.0;
+        self.current_video_id = Some(video_id.to_string());
+
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.send_command(&["stop"])?;
+        }
+
+        self.status = PlaybackStatus::default();
+        self.current_video_id = None;
 
         Ok(())
     }

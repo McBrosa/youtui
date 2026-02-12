@@ -40,7 +40,7 @@ pub fn run_app(
                                 match PlayerManager::new() {
                                     Ok(mut pm) => {
                                         let url = format!("https://www.youtube.com/watch?v={}", track.id);
-                                        if pm.play(&url, &track.title).is_ok() {
+                                        if pm.play(&url, &track.title, &track.id).is_ok() {
                                             app.player_manager = Some(pm);
                                         }
                                     }
@@ -109,24 +109,8 @@ pub fn run_app(
         }
 
         if player_finished {
-            // Remove the finished track from queue front
-            app.queue.pop_front();
-
-            if !app.queue.is_empty() {
-                // Play next track
-                if let Some(track) = app.queue.get(0) {
-                    let url = format!("https://www.youtube.com/watch?v={}", track.id);
-                    let title = track.title.clone();
-                    if let Some(ref mut player) = app.player_manager {
-                        if player.play(&url, &title).is_err() {
-                            app.player_manager = None;
-                        }
-                    }
-                }
-            } else {
-                // Queue empty, stop player
-                app.player_manager = None;
-            }
+            // EOF is automatic transition, respect auto_play_queue setting
+            app.handle_next_video(false);
         }
 
         // Sync config changes to search and app state
