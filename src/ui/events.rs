@@ -44,7 +44,7 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
     // Global settings toggle (works from any panel except Help, but not while editing)
     if app.input_mode != InputMode::Help {
         match key.code {
-            KeyCode::Char('s') | KeyCode::Char('S') if app.focused_panel != FocusedPanel::SearchBar => {
+            KeyCode::Char('s') | KeyCode::Char('S') if app.focused_panel == FocusedPanel::Queue => {
                 app.settings_open = !app.settings_open;
                 return;
             }
@@ -172,9 +172,10 @@ fn handle_results_keys(app: &mut App, key: KeyEvent) {
         }
         (KeyCode::Enter, _) => {
             let idx = if !app.number_input.is_empty() {
+                let page_len = app.current_page_results().len();
                 let result = app.number_input.parse::<usize>().ok().and_then(|num| {
-                    if num > 0 && num <= app.results.len() {
-                        Some(num - 1)
+                    if num > 0 && num <= page_len {
+                        Some(app.page * app.page_size + num - 1)
                     } else {
                         None
                     }
@@ -275,11 +276,27 @@ fn handle_queue_keys(app: &mut App, key: KeyEvent) {
                 }
 
                 // Check if the removed video was currently playing
-                if let Some(removed_id) = removed_video {
-                    if let Some(ref player) = app.player_manager {
-                        if player.current_video_id.as_ref() == Some(&removed_id) {
-                            // Currently playing video was removed, go to next (automatic)
-                            app.handle_next_video(false);
+                let was_playing = removed_video.as_ref().map_or(false, |removed_id| {
+                    app.player_manager
+                        .as_ref()
+                        .and_then(|pm| pm.current_video_id.as_ref())
+                        .map(|curr| curr == removed_id)
+                        .unwrap_or(false)
+                });
+
+                if was_playing {
+                    // The currently-playing track was removed; play whatever is now at the
+                    // front WITHOUT popping again (calling handle_next_video would double-pop).
+                    if app.queue.is_empty() {
+                        if let Some(ref mut pm) = app.player_manager {
+                            let _ = pm.clear();
+                        }
+                    } else if let Some(track) = app.queue.get(0) {
+                        let url = format!("https://www.youtube.com/watch?v={}", track.id);
+                        let title = track.title.clone();
+                        let video_id = track.id.clone();
+                        if let Some(ref mut pm) = app.player_manager {
+                            let _ = pm.play(&url, &title, &video_id);
                         }
                     }
                 }
@@ -711,7 +728,20 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_open_with_s_key() {
+    fn test_settings_open_with_s_key_from_queue() {
+        // 's' opens settings only from the Queue panel; from Results it focuses SearchBar
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.settings_open = false;
+        app.focused_panel = FocusedPanel::Queue;
+
+        let key = KeyEvent::from(KeyCode::Char('s'));
+        handle_browse_keys(&mut app, key);
+
+        assert!(app.settings_open);
+    }
+
+    #[test]
+    fn test_s_key_from_results_focuses_search_bar() {
         let mut app = App::new("test query".to_string(), 10, Config::default());
         app.settings_open = false;
         app.focused_panel = FocusedPanel::Results;
@@ -719,7 +749,8 @@ mod tests {
         let key = KeyEvent::from(KeyCode::Char('s'));
         handle_browse_keys(&mut app, key);
 
-        assert!(app.settings_open);
+        assert!(!app.settings_open);
+        assert_eq!(app.focused_panel, FocusedPanel::SearchBar);
     }
 
     #[test]
@@ -787,7 +818,7 @@ mod tests {
     fn test_settings_enter_edit_mode() {
         let mut app = App::new("test query".to_string(), 10, Config::default());
         app.settings_open = true;
-        app.settings_selected_index = 10; // Download Dir
+        app.settings_selected_index = 11; // Download Dir (index 10 is Download Mode checkbox)
 
         let key = KeyEvent::from(KeyCode::Enter);
         handle_browse_keys(&mut app, key);
@@ -810,7 +841,8 @@ mod tests {
     fn test_settings_end_to_end_workflow() {
         // Create app with default settings
         let mut app = App::new("test".to_string(), 10, Config::default());
-        app.focused_panel = FocusedPanel::Results;
+        // 's' opens settings from Queue panel (from Results it focuses SearchBar)
+        app.focused_panel = FocusedPanel::Queue;
 
         // Open settings with 's' key
         let key = KeyEvent::from(KeyCode::Char('s'));
@@ -827,13 +859,13 @@ mod tests {
         handle_browse_keys(&mut app, key);
         assert!(app.config.bandwidth_limit);
 
-        // Navigate to download dir (index 10)
-        // From index 3, need to go: 4, 5, 9, 10 (4 down presses)
-        for _ in 0..4 {
+        // Navigate to download dir (index 11)
+        // From index 3: 3→4→5→6→10→11 (5 down presses; index 10 is Download Mode checkbox)
+        for _ in 0..5 {
             let key = KeyEvent::from(KeyCode::Down);
             handle_browse_keys(&mut app, key);
         }
-        assert_eq!(app.settings_selected_index, 10);
+        assert_eq!(app.settings_selected_index, 11);
 
         // Enter edit mode
         let key = KeyEvent::from(KeyCode::Enter);
@@ -865,5 +897,335 @@ mod tests {
         // Verify changes persisted
         assert!(app.config.bandwidth_limit);
         assert!(app.config.download_dir.ends_with("test"));
+    }
+
+    // --- Helper ---
+
+    fn create_test_track(id: &str, title: &str) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            title: title.to_string(),
+            duration: "5:00".to_string(),
+            channel: "Test Channel".to_string(),
+            views: "1K".to_string(),
+        }
+    }
+
+    // --- Video selection & play action ---
+
+    #[test]
+    fn test_enter_sets_play_action_for_selected_result() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.results = create_test_results(10);
+        app.total_results = 10;
+        app.page = 0;
+        app.selected_index = 3;
+        app.focused_panel = FocusedPanel::Results;
+
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_results_keys(&mut app, key);
+
+        assert_eq!(app.pending_action, AppAction::Play(3));
+    }
+
+    #[test]
+    fn test_enter_computes_correct_global_index_on_second_page() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.results = create_test_results(30);
+        app.total_results = 30;
+        app.page = 2;
+        app.selected_index = 4;
+        app.focused_panel = FocusedPanel::Results;
+
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_results_keys(&mut app, key);
+
+        // page=2, page_size=10, selected=4 → global index = 24
+        assert_eq!(app.pending_action, AppAction::Play(24));
+    }
+
+    #[test]
+    fn test_number_quickpick_respects_current_page() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.results = create_test_results(30);
+        app.total_results = 30;
+        app.page = 1;
+        app.focused_panel = FocusedPanel::Results;
+
+        let key = KeyEvent::from(KeyCode::Char('3'));
+        handle_results_keys(&mut app, key);
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_results_keys(&mut app, key);
+
+        // Expected: page=1, page_size=10, number=3 → global index 12
+        // Actual (bug): Play(2)
+        assert_eq!(app.pending_action, AppAction::Play(12));
+    }
+
+    #[test]
+    fn test_number_quickpick_on_page_zero_is_correct() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.results = create_test_results(20);
+        app.total_results = 20;
+        app.page = 0;
+        app.focused_panel = FocusedPanel::Results;
+
+        let key = KeyEvent::from(KeyCode::Char('5'));
+        handle_results_keys(&mut app, key);
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_results_keys(&mut app, key);
+
+        // On page 0 the bug doesn't manifest: num-1 = 4, page*size+num-1 = 4
+        assert_eq!(app.pending_action, AppAction::Play(4));
+    }
+
+    #[test]
+    fn test_number_quickpick_out_of_range_is_ignored() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.results = create_test_results(5);
+        app.total_results = 5;
+        app.page = 0;
+        app.focused_panel = FocusedPanel::Results;
+
+        // Type "9" (only 5 results exist)
+        let key = KeyEvent::from(KeyCode::Char('9'));
+        handle_results_keys(&mut app, key);
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_results_keys(&mut app, key);
+
+        assert_eq!(app.pending_action, AppAction::None);
+    }
+
+    #[test]
+    fn test_down_arrow_does_not_scroll_past_current_page() {
+        let mut app = App::new("test".to_string(), 5, Config::default());
+        app.results = create_test_results(20);
+        app.total_results = 20;
+        app.page = 0;
+        app.selected_index = 4; // last item on page 0
+        app.focused_panel = FocusedPanel::Results;
+
+        let key = KeyEvent::from(KeyCode::Down);
+        handle_results_keys(&mut app, key);
+
+        // Should stay at 4, not advance to page-1 territory
+        assert_eq!(app.selected_index, 4);
+        assert_eq!(app.page, 0);
+    }
+
+    // --- Queue navigation ---
+
+    #[test]
+    fn test_queue_down_navigation() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue.push_back(create_test_track("1", "Track 1"));
+        app.queue.push_back(create_test_track("2", "Track 2"));
+        app.queue.push_back(create_test_track("3", "Track 3"));
+        app.queue_selected_index = 0;
+
+        let key = KeyEvent::from(KeyCode::Down);
+        handle_queue_keys(&mut app, key);
+
+        assert_eq!(app.queue_selected_index, 1);
+    }
+
+    #[test]
+    fn test_queue_up_navigation() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue.push_back(create_test_track("1", "Track 1"));
+        app.queue.push_back(create_test_track("2", "Track 2"));
+        app.queue_selected_index = 1;
+
+        let key = KeyEvent::from(KeyCode::Up);
+        handle_queue_keys(&mut app, key);
+
+        assert_eq!(app.queue_selected_index, 0);
+    }
+
+    #[test]
+    fn test_queue_up_at_top_stays() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue.push_back(create_test_track("1", "Track 1"));
+        app.queue_selected_index = 0;
+
+        let key = KeyEvent::from(KeyCode::Up);
+        handle_queue_keys(&mut app, key);
+
+        assert_eq!(app.queue_selected_index, 0);
+    }
+
+    #[test]
+    fn test_queue_down_at_bottom_stays() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue.push_back(create_test_track("1", "Track 1"));
+        app.queue.push_back(create_test_track("2", "Track 2"));
+        app.queue_selected_index = 1; // last
+
+        let key = KeyEvent::from(KeyCode::Down);
+        handle_queue_keys(&mut app, key);
+
+        assert_eq!(app.queue_selected_index, 1);
+    }
+
+    // --- Queue delete ---
+
+    #[test]
+    fn test_queue_delete_removes_selected_item() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue.push_back(create_test_track("1", "Track 1"));
+        app.queue.push_back(create_test_track("2", "Track 2"));
+        app.queue.push_back(create_test_track("3", "Track 3"));
+        app.queue_selected_index = 1;
+
+        let key = KeyEvent::from(KeyCode::Delete);
+        handle_queue_keys(&mut app, key);
+
+        assert_eq!(app.queue.len(), 2);
+        assert_eq!(app.queue.get(0).unwrap().id, "1");
+        assert_eq!(app.queue.get(1).unwrap().id, "3");
+        assert_eq!(app.queue_selected_index, 1);
+    }
+
+    #[test]
+    fn test_queue_delete_clamps_index_when_last_item_removed() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue.push_back(create_test_track("1", "Track 1"));
+        app.queue.push_back(create_test_track("2", "Track 2"));
+        app.queue_selected_index = 1; // last item
+
+        let key = KeyEvent::from(KeyCode::Delete);
+        handle_queue_keys(&mut app, key);
+
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue_selected_index, 0);
+    }
+
+    #[test]
+    fn test_queue_delete_on_empty_queue_is_safe() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue_selected_index = 0;
+
+        let key = KeyEvent::from(KeyCode::Delete);
+        handle_queue_keys(&mut app, key); // Should not panic
+
+        assert!(app.queue.is_empty());
+    }
+
+    // --- Queue clear ---
+
+    #[test]
+    fn test_queue_clear_empties_queue_and_resets_index() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue.push_back(create_test_track("1", "Track 1"));
+        app.queue.push_back(create_test_track("2", "Track 2"));
+        app.queue.push_back(create_test_track("3", "Track 3"));
+        app.queue_selected_index = 2;
+
+        let key = KeyEvent::from(KeyCode::Char('c'));
+        handle_queue_keys(&mut app, key);
+
+        assert!(app.queue.is_empty());
+        assert_eq!(app.queue_selected_index, 0);
+    }
+
+    // --- Queue Enter (play / reorder) ---
+
+    #[test]
+    fn test_queue_enter_on_non_first_item_moves_it_to_front() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue.push_back(create_test_track("1", "Track 1"));
+        app.queue.push_back(create_test_track("2", "Track 2"));
+        app.queue.push_back(create_test_track("3", "Track 3"));
+        app.queue_selected_index = 2; // Track 3
+
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_queue_keys(&mut app, key);
+
+        // Track 3 moved to front, selection reset to 0
+        assert_eq!(app.queue.get(0).unwrap().id, "3");
+        assert_eq!(app.queue_selected_index, 0);
+    }
+
+    #[test]
+    fn test_queue_enter_on_first_item_preserves_order() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.queue.push_back(create_test_track("1", "Track 1"));
+        app.queue.push_back(create_test_track("2", "Track 2"));
+        app.queue_selected_index = 0;
+
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_queue_keys(&mut app, key);
+
+        // Order unchanged
+        assert_eq!(app.queue.get(0).unwrap().id, "1");
+        assert_eq!(app.queue.get(1).unwrap().id, "2");
+    }
+
+    // --- Focus cycling ---
+
+    #[test]
+    fn test_tab_cycles_through_all_panels() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::SearchBar;
+
+        cycle_focus_forward(&mut app);
+        assert_eq!(app.focused_panel, FocusedPanel::Results);
+        cycle_focus_forward(&mut app);
+        assert_eq!(app.focused_panel, FocusedPanel::Queue);
+        cycle_focus_forward(&mut app);
+        assert_eq!(app.focused_panel, FocusedPanel::SearchBar);
+    }
+
+    #[test]
+    fn test_shift_tab_cycles_backward_through_all_panels() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::Results;
+
+        cycle_focus_backward(&mut app);
+        assert_eq!(app.focused_panel, FocusedPanel::SearchBar);
+        cycle_focus_backward(&mut app);
+        assert_eq!(app.focused_panel, FocusedPanel::Queue);
+        cycle_focus_backward(&mut app);
+        assert_eq!(app.focused_panel, FocusedPanel::Results);
+    }
+
+    // --- Search flow ---
+
+    #[test]
+    fn test_new_search_clears_number_input() {
+        let mut app = App::new("old".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::SearchBar;
+        app.search_input = "new query".to_string();
+        app.number_input = "3".to_string();
+
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_search_bar_keys(&mut app, key);
+
+        assert!(app.number_input.is_empty() || app.pending_action != AppAction::None);
+        assert_eq!(app.focused_panel, FocusedPanel::Results);
+    }
+
+    #[test]
+    fn test_empty_search_input_does_not_trigger_search() {
+        let mut app = App::new("old".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::SearchBar;
+        app.search_input = String::new();
+
+        let key = KeyEvent::from(KeyCode::Enter);
+        handle_search_bar_keys(&mut app, key);
+
+        assert_eq!(app.pending_action, AppAction::None);
+    }
+
+    #[test]
+    fn test_search_bar_backspace_removes_last_char() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::SearchBar;
+        app.search_input = "hello".to_string();
+
+        let key = KeyEvent::from(KeyCode::Backspace);
+        handle_search_bar_keys(&mut app, key);
+
+        assert_eq!(app.search_input, "hell");
     }
 }

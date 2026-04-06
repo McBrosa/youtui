@@ -192,8 +192,13 @@ impl PlayerManager {
         Ok(())
     }
 
-    pub fn is_eof(&self) -> bool {
-        self.status.eof_reached
+    pub fn is_eof(&mut self) -> bool {
+        if self.status.eof_reached {
+            self.status.eof_reached = false; // consume so the same EOF fires only once
+            true
+        } else {
+            false
+        }
     }
 }
 

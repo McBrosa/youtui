@@ -128,4 +128,172 @@ mod tests {
         assert_eq!(queue.len(), 0);
         assert!(queue.is_empty());
     }
+
+    // --- move_to_front ---
+
+    #[test]
+    fn test_move_to_front_middle_item() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.push_back(create_test_track("3", "Track 3"));
+
+        queue.move_to_front(2);
+
+        assert_eq!(queue.get(0).unwrap().id, "3");
+        assert_eq!(queue.get(1).unwrap().id, "1");
+        assert_eq!(queue.get(2).unwrap().id, "2");
+        assert_eq!(queue.selected_index, 0);
+    }
+
+    #[test]
+    fn test_move_to_front_already_at_front_is_noop() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.selected_index = 1;
+
+        queue.move_to_front(0);
+
+        // Order unchanged, selected_index preserved
+        assert_eq!(queue.get(0).unwrap().id, "1");
+        assert_eq!(queue.get(1).unwrap().id, "2");
+        assert_eq!(queue.selected_index, 1);
+    }
+
+    #[test]
+    fn test_move_to_front_resets_selected_index() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.push_back(create_test_track("3", "Track 3"));
+        queue.selected_index = 2;
+
+        queue.move_to_front(2);
+
+        assert_eq!(queue.selected_index, 0);
+    }
+
+    // --- pop_front adjusts selected_index ---
+
+    #[test]
+    fn test_pop_front_decrements_selected_index_when_above_zero() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.push_back(create_test_track("3", "Track 3"));
+        queue.selected_index = 2;
+
+        queue.pop_front();
+
+        assert_eq!(queue.selected_index, 1);
+        assert_eq!(queue.get(0).unwrap().id, "2");
+    }
+
+    #[test]
+    fn test_pop_front_does_not_underflow_selected_index() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.selected_index = 0;
+
+        queue.pop_front();
+
+        assert_eq!(queue.selected_index, 0);
+    }
+
+    // --- remove adjusts selected_index ---
+
+    #[test]
+    fn test_remove_item_before_selected_decrements_index() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.push_back(create_test_track("3", "Track 3"));
+        queue.selected_index = 2;
+
+        queue.remove(0); // Remove Track 1 (before selected)
+
+        assert_eq!(queue.selected_index, 1);
+    }
+
+    #[test]
+    fn test_remove_item_after_selected_does_not_change_index() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.push_back(create_test_track("3", "Track 3"));
+        queue.selected_index = 0;
+
+        queue.remove(2); // Remove Track 3 (after selected)
+
+        assert_eq!(queue.selected_index, 0);
+    }
+
+    #[test]
+    fn test_remove_at_selected_index_does_not_adjust_index() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.push_back(create_test_track("3", "Track 3"));
+        queue.selected_index = 1;
+
+        queue.remove(1); // Remove the selected item itself
+
+        // index == removed index, no decrement (per `index < selected_index` condition)
+        assert_eq!(queue.selected_index, 1);
+    }
+
+    #[test]
+    fn test_remove_out_of_bounds_returns_none_and_is_safe() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+
+        let result = queue.remove(5);
+
+        assert!(result.is_none());
+        assert_eq!(queue.len(), 1);
+    }
+
+    // --- get / iter ---
+
+    #[test]
+    fn test_get_valid_index() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+
+        assert_eq!(queue.get(0).unwrap().id, "1");
+        assert_eq!(queue.get(1).unwrap().id, "2");
+    }
+
+    #[test]
+    fn test_get_out_of_bounds_returns_none() {
+        let queue = Queue::new();
+        assert!(queue.get(0).is_none());
+    }
+
+    #[test]
+    fn test_iter_returns_all_tracks_in_order() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.push_back(create_test_track("3", "Track 3"));
+
+        let ids: Vec<&str> = queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn test_clear_resets_selected_index() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.selected_index = 1;
+
+        queue.clear();
+
+        assert_eq!(queue.selected_index, 0);
+        assert!(queue.is_empty());
+    }
 }
