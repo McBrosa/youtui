@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use crate::search::SearchResult;
+use std::collections::VecDeque;
 
 pub struct Queue {
     tracks: VecDeque<SearchResult>,
@@ -16,23 +16,25 @@ impl Queue {
 
     pub fn push_back(&mut self, track: SearchResult) {
         self.tracks.push_back(track);
+        self.normalize_selection();
     }
 
     pub fn pop_front(&mut self) -> Option<SearchResult> {
-        if !self.tracks.is_empty() && self.selected_index > 0 {
+        let track = self.tracks.pop_front();
+        if track.is_some() && self.selected_index > 0 {
             self.selected_index = self.selected_index.saturating_sub(1);
         }
-        self.tracks.pop_front()
+        self.normalize_selection();
+        track
     }
 
     pub fn remove(&mut self, index: usize) -> Option<SearchResult> {
-        if index >= self.tracks.len() {
-            return None;
-        }
+        let track = self.tracks.remove(index)?;
         if index < self.selected_index {
             self.selected_index = self.selected_index.saturating_sub(1);
         }
-        self.tracks.remove(index)
+        self.normalize_selection();
+        Some(track)
     }
 
     pub fn clear(&mut self) {
@@ -57,11 +59,18 @@ impl Queue {
     }
 
     pub fn move_to_front(&mut self, index: usize) {
-        if index < self.tracks.len() && index > 0 {
-            let track = self.tracks.remove(index).unwrap();
+        if index < self.tracks.len()
+            && index > 0
+            && let Some(track) = self.tracks.remove(index)
+        {
             self.tracks.push_front(track);
             self.selected_index = 0;
         }
+        self.normalize_selection();
+    }
+
+    fn normalize_selection(&mut self) {
+        self.selected_index = self.selected_index.min(self.tracks.len().saturating_sub(1));
     }
 }
 
@@ -242,6 +251,28 @@ mod tests {
 
         // index == removed index, no decrement (per `index < selected_index` condition)
         assert_eq!(queue.selected_index, 1);
+    }
+
+    #[test]
+    fn test_remove_selected_last_item_clamps_selection() {
+        let mut queue = Queue::new();
+        queue.push_back(create_test_track("1", "Track 1"));
+        queue.push_back(create_test_track("2", "Track 2"));
+        queue.selected_index = 1;
+
+        queue.remove(1);
+
+        assert_eq!(queue.selected_index, 0);
+        assert_eq!(queue.get(0).unwrap().id, "1");
+    }
+
+    #[test]
+    fn test_empty_pop_repairs_out_of_range_selection() {
+        let mut queue = Queue::new();
+        queue.selected_index = usize::MAX;
+
+        assert!(queue.pop_front().is_none());
+        assert_eq!(queue.selected_index, 0);
     }
 
     #[test]

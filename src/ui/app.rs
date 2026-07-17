@@ -28,7 +28,16 @@ pub enum AppAction {
     None,
     Play(usize),
     NewSearch(String),
-    FetchNextPage,
+    FetchNextPage(usize),
+    PrefetchNextPage(usize),
+    CancelSearch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPhase {
+    Initial,
+    RequestedPage { target_page: usize },
+    Prefetch { target_page: usize },
 }
 
 pub struct App {
@@ -49,15 +58,23 @@ pub struct App {
     pub queue_selected_index: usize,
     pub focused_panel: FocusedPanel,
     pub loading: bool,
+    pub search_phase: Option<SearchPhase>,
     pub settings_open: bool,
     pub settings_selected_index: usize,
     pub settings_editing: Option<SettingsField>,
-    pub results_per_page_input: Option<String>,
+    pub settings_text_input: Option<String>,
+    pub status_message: Option<String>,
     pub config: Config,
 }
 
 impl App {
     pub fn new(query: String, page_size: usize, config: Config) -> Self {
+        // A zero-sized page makes pagination unable to advance and can also lead
+        // to divide-by-zero errors while rendering page totals. Config files are
+        // user-editable, so keep this invariant at the UI boundary as well as in
+        // the settings editor.
+        let page_size = page_size.max(1);
+
         Self {
             results: Vec::new(),
             selected_index: 0,
@@ -76,27 +93,52 @@ impl App {
             queue_selected_index: 0,
             focused_panel: FocusedPanel::Results,
             loading: false,
+            search_phase: None,
             settings_open: false,
             settings_selected_index: 2,
             settings_editing: None,
-            results_per_page_input: None,
+            settings_text_input: None,
+            status_message: None,
             config,
         }
     }
 
     pub fn current_page_results(&self) -> &[SearchResult] {
-        let start = self.page * self.page_size;
-        let end = (start + self.page_size).min(self.results.len());
+        let page_size = self.page_size.max(1);
+        let start = self.page.saturating_mul(page_size).min(self.results.len());
+        let end = start.saturating_add(page_size).min(self.results.len());
         &self.results[start..end]
     }
 
     pub fn has_next_page(&self) -> bool {
-        let end = (self.page + 1) * self.page_size;
+        let end = self
+            .page
+            .saturating_add(1)
+            .saturating_mul(self.page_size.max(1));
         end < self.results.len() || !self.exhausted
     }
 
     pub fn has_prev_page(&self) -> bool {
         self.page > 0
+    }
+
+    pub(crate) fn schedule_page_prefetch(&mut self) {
+        if self.loading || self.exhausted || !matches!(self.pending_action, AppAction::None) {
+            return;
+        }
+
+        let page_size = self.page_size.max(1);
+        let current_page_end = self.page.saturating_add(1).saturating_mul(page_size);
+
+        if current_page_end > self.results.len() {
+            self.pending_action = AppAction::FetchNextPage(self.page);
+            return;
+        }
+
+        let next_page_end = self.page.saturating_add(2).saturating_mul(page_size);
+        if next_page_end > self.results.len() {
+            self.pending_action = AppAction::PrefetchNextPage(self.page);
+        }
     }
 
     pub fn handle_next_video(&mut self, manual: bool) {
@@ -121,39 +163,52 @@ impl App {
 
                 if let Some(ref mut player) = self.player_manager {
                     let result = if should_auto_play {
-                        player.play(&url, &title, &video_id)
+                        player.play(&self.config, &url, &title, &video_id)
                     } else {
-                        player.load_paused(&url, &title, &video_id)
+                        player.load_paused(&self.config, &url, &title, &video_id)
                     };
 
-                    if result.is_err() {
+                    if let Err(error) = result {
                         self.player_manager = None;
+                        self.status_message = Some(format!("Playback stopped: {error}"));
+                    } else {
+                        self.status_message = None;
                     }
                 } else {
                     // Create player manager if it doesn't exist
                     use crate::player_manager::PlayerManager;
-                    match PlayerManager::new() {
+                    match PlayerManager::new(&self.config) {
                         Ok(mut pm) => {
                             let result = if should_auto_play {
-                                pm.play(&url, &title, &video_id)
+                                pm.play(&self.config, &url, &title, &video_id)
                             } else {
-                                pm.load_paused(&url, &title, &video_id)
+                                pm.load_paused(&self.config, &url, &title, &video_id)
                             };
 
-                            if result.is_ok() {
-                                self.player_manager = Some(pm);
+                            match result {
+                                Ok(()) => {
+                                    self.player_manager = Some(pm);
+                                    self.status_message = None;
+                                }
+                                Err(error) => {
+                                    self.status_message =
+                                        Some(format!("Could not start playback: {error}"));
+                                }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Failed to create player: {}", e);
+                        Err(error) => {
+                            self.status_message = Some(format!("Could not create player: {error}"));
                         }
                     }
                 }
             }
         } else {
-            // Queue is empty, clear the player
-            if let Some(ref mut player) = self.player_manager {
-                let _ = player.clear();
+            // Do not retain an idle manager here: AppAction::Play treats the
+            // absence of a manager as the signal to start a fresh selection.
+            if let Some(mut player) = self.player_manager.take()
+                && let Err(error) = player.clear()
+            {
+                self.status_message = Some(format!("Playback stopped: {error}"));
             }
         }
     }
@@ -224,6 +279,27 @@ mod tests {
         let app = App::new("test".to_string(), 5, Config::default());
         let page = app.current_page_results();
         assert!(page.is_empty());
+    }
+
+    #[test]
+    fn test_zero_page_size_is_normalized() {
+        let mut app = App::new("test".to_string(), 0, Config::default());
+        app.results = make_results(2);
+
+        assert_eq!(app.page_size, 1);
+        assert_eq!(app.current_page_results().len(), 1);
+        assert!(app.has_next_page());
+    }
+
+    #[test]
+    fn test_out_of_range_page_returns_empty_slice() {
+        let mut app = App::new("test".to_string(), 5, Config::default());
+        app.results = make_results(2);
+        app.page = usize::MAX;
+        app.exhausted = true;
+
+        assert!(app.current_page_results().is_empty());
+        assert!(!app.has_next_page());
     }
 
     // --- has_next_page / has_prev_page ---

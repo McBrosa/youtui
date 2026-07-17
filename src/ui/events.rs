@@ -1,15 +1,51 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::ui::app::{App, AppAction, FocusedPanel, InputMode, SettingsField};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::config::clamp_results_per_page;
+use crate::player_manager::PlayerManager;
+use crate::ui::app::{App, AppAction, FocusedPanel, InputMode, SearchPhase, SettingsField};
 
 pub fn handle_key_event(app: &mut App, key: KeyEvent) {
-    // Global Tab key for focus cycling (works in any mode except Help)
-    if app.input_mode != InputMode::Help && key.code == KeyCode::Tab {
-        if key.modifiers.contains(KeyModifiers::SHIFT) {
-            cycle_focus_backward(app);
-        } else {
-            cycle_focus_forward(app);
-        }
+    // Some terminals report key releases in addition to presses. Handling both
+    // makes text input and shortcuts fire twice.
+    if key.kind == KeyEventKind::Release {
         return;
+    }
+
+    // Ctrl-C is the emergency exit even while a modal or text editor owns the
+    // rest of the keyboard.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return;
+    }
+
+    // Status messages behave like a toast: they remain visible until the next
+    // interaction, while any new failure from that interaction can replace it.
+    app.status_message = None;
+
+    // Modal input owns the keyboard. In particular, Tab must not move focus in
+    // the obscured UI while Settings is open.
+    if app.settings_open {
+        handle_settings_keys(app, key);
+        return;
+    }
+
+    // Global Tab key for focus cycling (works in any mode except Help).
+    if app.input_mode != InputMode::Help {
+        match key.code {
+            KeyCode::BackTab => {
+                cycle_focus_backward(app);
+                return;
+            }
+            KeyCode::Tab => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    cycle_focus_backward(app);
+                } else {
+                    cycle_focus_forward(app);
+                }
+                return;
+            }
+            _ => {}
+        }
     }
 
     match app.input_mode {
@@ -41,32 +77,36 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Global settings toggle (works from any panel except Help, but not while editing)
-    if app.input_mode != InputMode::Help {
-        match key.code {
-            KeyCode::Char('s') | KeyCode::Char('S') if app.focused_panel == FocusedPanel::Queue => {
-                app.settings_open = !app.settings_open;
-                return;
-            }
-            KeyCode::F(2) => {
-                app.settings_open = !app.settings_open;
-                return;
-            }
-            _ => {}
+    // Settings has one consistent global shortcut. Lowercase `s` and `/`
+    // remain dedicated to search focus.
+    match key.code {
+        KeyCode::Char('S') if app.focused_panel != FocusedPanel::SearchBar => {
+            app.settings_open = true;
+            return;
         }
+        KeyCode::F(2) => {
+            app.settings_open = true;
+            return;
+        }
+        _ => {}
     }
 
     // Global quit keys work from any panel
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) => {
+        (KeyCode::Char('q' | 'Q'), _) if app.focused_panel != FocusedPanel::SearchBar => {
             app.should_quit = true;
             return;
         }
         (KeyCode::Esc, _) => {
-            // Esc in search bar returns to results, otherwise quit
+            // Esc in the search editor cancels editing. While results are
+            // loading it cancels that search without terminating the app.
             if app.focused_panel == FocusedPanel::SearchBar {
                 app.search_input.clear();
                 app.focused_panel = FocusedPanel::Results;
+                return;
+            }
+            if app.loading {
+                app.pending_action = AppAction::CancelSearch;
                 return;
             }
             app.should_quit = true;
@@ -80,49 +120,44 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
     }
 
     // Global playback controls (work from any panel, don't conflict with panel keys)
-    if app.player_manager.is_some() {
+    if app.focused_panel != FocusedPanel::SearchBar {
         match key.code {
             KeyCode::Char(' ') => {
-                if let Some(pm) = app.player_manager.as_mut() {
-                    let _ = pm.toggle_pause();
+                if run_player_command(app, |player| player.toggle_pause()) {
+                    return;
                 }
-                return;
             }
             KeyCode::Char('<') => {
-                if let Some(pm) = app.player_manager.as_mut() {
-                    let _ = pm.seek(-10.0);
+                if run_player_command(app, |player| player.seek(-10.0)) {
+                    return;
                 }
-                return;
             }
             KeyCode::Char('>') => {
-                if let Some(pm) = app.player_manager.as_mut() {
-                    let _ = pm.seek(10.0);
+                if run_player_command(app, |player| player.seek(10.0)) {
+                    return;
                 }
-                return;
             }
             KeyCode::Char('=') | KeyCode::Char('+') => {
-                let new_vol = app.player_manager.as_ref().unwrap().status.volume + 5;
-                let new_vol = new_vol.min(100);
-                if let Some(pm) = app.player_manager.as_mut() {
-                    let _ = pm.set_volume(new_vol);
+                if run_player_command(app, |player| {
+                    player.set_volume((player.status.volume + 5).min(100))
+                }) {
+                    return;
                 }
-                return;
             }
             KeyCode::Char('-') if app.focused_panel != FocusedPanel::SearchBar => {
-                let new_vol = app.player_manager.as_ref().unwrap().status.volume - 5;
-                let new_vol = new_vol.max(0);
-                if let Some(pm) = app.player_manager.as_mut() {
-                    let _ = pm.set_volume(new_vol);
+                if run_player_command(app, |player| {
+                    player.set_volume((player.status.volume - 5).max(0))
+                }) {
+                    return;
                 }
-                return;
             }
             KeyCode::Char('m') if app.focused_panel != FocusedPanel::SearchBar => {
-                let current_vol = app.player_manager.as_ref().unwrap().status.volume;
-                let new_vol = if current_vol > 0 { 0 } else { 100 };
-                if let Some(pm) = app.player_manager.as_mut() {
-                    let _ = pm.set_volume(new_vol);
+                if run_player_command(app, |player| {
+                    let new_volume = if player.status.volume > 0 { 0 } else { 100 };
+                    player.set_volume(new_volume)
+                }) {
+                    return;
                 }
-                return;
             }
             _ => {}
         }
@@ -135,47 +170,96 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn run_player_command(
+    app: &mut App,
+    command: impl FnOnce(&mut PlayerManager) -> anyhow::Result<()>,
+) -> bool {
+    let Some(player) = app.player_manager.as_mut() else {
+        return false;
+    };
+
+    if let Err(error) = command(player) {
+        app.player_manager = None;
+        app.status_message = Some(format!("Playback stopped: {error}"));
+    }
+    true
+}
+
 fn handle_results_keys(app: &mut App, key: KeyEvent) {
     match (key.code, key.modifiers) {
-        (KeyCode::Up, _) => {
+        (KeyCode::Up | KeyCode::Char('k'), _) => {
             if app.selected_index > 0 {
                 app.selected_index -= 1;
             }
         }
-        (KeyCode::Down, _) => {
+        (KeyCode::Down | KeyCode::Char('j'), _) => {
             let page_results = app.current_page_results();
             if app.selected_index < page_results.len().saturating_sub(1) {
                 app.selected_index += 1;
             }
         }
-        (KeyCode::Char('n'), _) if app.has_next_page() => {
-            app.page += 1;
+        (KeyCode::Home | KeyCode::Char('g'), _) => {
             app.selected_index = 0;
-
-            let end = (app.page + 1) * app.page_size;
-            if end > app.results.len() && !app.exhausted {
-                app.pending_action = AppAction::FetchNextPage;
+        }
+        (KeyCode::End | KeyCode::Char('G'), _) => {
+            app.selected_index = app.current_page_results().len().saturating_sub(1);
+        }
+        (KeyCode::Char('n') | KeyCode::PageDown, _) if app.has_next_page() => {
+            let target_page = app.page.saturating_add(1);
+            let target_start = target_page.saturating_mul(app.page_size.max(1));
+            if target_start < app.results.len() {
+                app.page = target_page;
+                app.selected_index = 0;
+                app.schedule_page_prefetch();
+            } else if !app.loading && !app.exhausted {
+                app.loading = true;
+                app.search_phase = Some(SearchPhase::RequestedPage { target_page });
+                app.pending_action = AppAction::FetchNextPage(target_page);
+            } else if matches!(
+                app.search_phase,
+                Some(SearchPhase::Prefetch {
+                    target_page: prefetched_page
+                }) if prefetched_page == target_page
+            ) {
+                // The requested page is already being prefetched. Remember the
+                // user's intent and switch as soon as its snapshot arrives.
+                app.search_phase = Some(SearchPhase::RequestedPage { target_page });
             }
         }
-        (KeyCode::Char('p'), _) if app.has_prev_page() => {
+        (KeyCode::Char('p') | KeyCode::PageUp, _) if app.has_prev_page() => {
             app.page -= 1;
             app.selected_index = 0;
+            if let Some(SearchPhase::RequestedPage { target_page }) = app.search_phase {
+                // The user explicitly moved away from a partially loaded page.
+                // Keep fetching it, but do not force focus back on later updates.
+                app.search_phase = Some(SearchPhase::Prefetch { target_page });
+            }
+            app.schedule_page_prefetch();
         }
-        (KeyCode::Char('h'), _) => {
+        (KeyCode::Char('h' | '?'), _) => {
             app.input_mode = InputMode::Help;
         }
-        (KeyCode::Char('s'), _) => {
+        (KeyCode::Char('s' | '/'), _) => {
             app.focused_panel = FocusedPanel::SearchBar;
         }
         (KeyCode::Char(c), _) if c.is_ascii_digit() => {
-            app.number_input.push(c);
+            if app.number_input.len() < 6 {
+                app.number_input.push(c);
+            }
         }
         (KeyCode::Enter, _) => {
             let idx = if !app.number_input.is_empty() {
                 let page_len = app.current_page_results().len();
+                let page_start = app.page.saturating_mul(app.page_size.max(1));
                 let result = app.number_input.parse::<usize>().ok().and_then(|num| {
-                    if num > 0 && num <= page_len {
-                        Some(app.page * app.page_size + num - 1)
+                    let global_start = page_start.saturating_add(1);
+                    let global_end = page_start.saturating_add(page_len);
+                    if (global_start..=global_end).contains(&num) {
+                        // Match the number displayed beside the result.
+                        Some(num - 1)
+                    } else if num > 0 && num <= page_len {
+                        // Keep page-local quick picks for muscle memory.
+                        Some(page_start.saturating_add(num - 1))
                     } else {
                         None
                     }
@@ -183,13 +267,17 @@ fn handle_results_keys(app: &mut App, key: KeyEvent) {
                 app.number_input.clear();
                 result
             } else {
-                Some(app.page * app.page_size + app.selected_index)
+                Some(
+                    app.page
+                        .saturating_mul(app.page_size.max(1))
+                        .saturating_add(app.selected_index),
+                )
             };
 
-            if let Some(idx) = idx {
-                if idx < app.results.len() {
-                    app.pending_action = AppAction::Play(idx);
-                }
+            if let Some(idx) = idx
+                && idx < app.results.len()
+            {
+                app.pending_action = AppAction::Play(idx);
             }
         }
         (KeyCode::Backspace, _) => {
@@ -200,24 +288,31 @@ fn handle_results_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_search_bar_keys(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char(c) => {
-            app.search_input.push(c);
+    match (key.code, key.modifiers) {
+        (KeyCode::Char(c), modifiers)
+            if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            if app.search_input.len() < 4096 {
+                app.search_input.push(c);
+            }
         }
-        KeyCode::Backspace => {
+        (KeyCode::Backspace, _) => {
             app.search_input.pop();
         }
-        KeyCode::Enter => {
-            if !app.search_input.is_empty() {
+        (KeyCode::Enter, _) => {
+            let query = app.search_input.trim().to_string();
+            if !query.is_empty() {
                 // Update query immediately so search bar shows new query
-                app.query = app.search_input.clone();
+                app.query.clone_from(&query);
                 app.loading = true;
-                app.pending_action = AppAction::NewSearch(app.search_input.clone());
+                app.search_phase = Some(SearchPhase::Initial);
+                app.pending_action = AppAction::NewSearch(query);
                 app.search_input.clear();
+                app.number_input.clear();
                 app.focused_panel = FocusedPanel::Results;
             }
         }
-        KeyCode::Esc => {
+        (KeyCode::Esc, _) => {
             app.search_input.clear();
             app.focused_panel = FocusedPanel::Results;
         }
@@ -227,77 +322,52 @@ fn handle_search_bar_keys(app: &mut App, key: KeyEvent) {
 
 fn handle_queue_keys(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Char('k') => {
             if app.queue_selected_index > 0 {
                 app.queue_selected_index -= 1;
             }
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Char('j') => {
             if app.queue_selected_index < app.queue.len().saturating_sub(1) {
                 app.queue_selected_index += 1;
             }
         }
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.queue_selected_index = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            app.queue_selected_index = app.queue.len().saturating_sub(1);
+        }
         KeyCode::Enter => {
-            if !app.queue.is_empty() && app.queue_selected_index < app.queue.len() {
-                if app.queue_selected_index > 0 {
-                    app.queue.move_to_front(app.queue_selected_index);
-                    app.queue_selected_index = 0;
-                }
-
-                if let Some(track) = app.queue.get(0) {
-                    let url = format!("https://www.youtube.com/watch?v={}", track.id);
-                    let title = track.title.clone();
-                    let video_id = track.id.clone();
-
-                    if let Some(ref mut player) = app.player_manager {
-                        let _ = player.play(&url, &title, &video_id);
-                    } else {
-                        // Create player manager if it doesn't exist
-                        use crate::player_manager::PlayerManager;
-                        match PlayerManager::new() {
-                            Ok(mut pm) => {
-                                if pm.play(&url, &title, &video_id).is_ok() {
-                                    app.player_manager = Some(pm);
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                }
+            if promote_selected_queue_item(app) {
+                play_queue_front(app);
             }
         }
         KeyCode::Delete | KeyCode::Backspace => {
             if app.queue_selected_index < app.queue.len() {
-                let removed_video = app.queue.get(app.queue_selected_index).map(|v| v.id.clone());
+                let was_playing = removed_queue_item_was_playing(
+                    app.queue_selected_index,
+                    app.player_manager
+                        .as_ref()
+                        .and_then(|pm| pm.current_video_id.as_deref()),
+                );
                 app.queue.remove(app.queue_selected_index);
 
                 if app.queue_selected_index >= app.queue.len() && app.queue_selected_index > 0 {
                     app.queue_selected_index -= 1;
                 }
 
-                // Check if the removed video was currently playing
-                let was_playing = removed_video.as_ref().map_or(false, |removed_id| {
-                    app.player_manager
-                        .as_ref()
-                        .and_then(|pm| pm.current_video_id.as_ref())
-                        .map(|curr| curr == removed_id)
-                        .unwrap_or(false)
-                });
-
                 if was_playing {
                     // The currently-playing track was removed; play whatever is now at the
                     // front WITHOUT popping again (calling handle_next_video would double-pop).
                     if app.queue.is_empty() {
-                        if let Some(ref mut pm) = app.player_manager {
-                            let _ = pm.clear();
+                        if let Some(mut pm) = app.player_manager.take()
+                            && let Err(error) = pm.clear()
+                        {
+                            app.status_message = Some(format!("Could not stop playback: {error}"));
                         }
-                    } else if let Some(track) = app.queue.get(0) {
-                        let url = format!("https://www.youtube.com/watch?v={}", track.id);
-                        let title = track.title.clone();
-                        let video_id = track.id.clone();
-                        if let Some(ref mut pm) = app.player_manager {
-                            let _ = pm.play(&url, &title, &video_id);
-                        }
+                    } else {
+                        play_queue_front(app);
                     }
                 }
             }
@@ -306,24 +376,78 @@ fn handle_queue_keys(app: &mut App, key: KeyEvent) {
             app.queue.clear();
             app.queue_selected_index = 0;
             // Clear player when queue is cleared
-            if let Some(ref mut player) = app.player_manager {
-                let _ = player.clear();
+            if let Some(mut player) = app.player_manager.take()
+                && let Err(error) = player.clear()
+            {
+                app.status_message = Some(format!("Could not stop playback: {error}"));
             }
         }
         KeyCode::Char('n') => {
             // Next track - manual action, always auto-plays
             app.handle_next_video(true);
         }
-        KeyCode::Char('h') => {
+        KeyCode::Char('s' | '/') => {
+            app.focused_panel = FocusedPanel::SearchBar;
+        }
+        KeyCode::Char('h' | '?') => {
             app.input_mode = InputMode::Help;
         }
         _ => {}
     }
 }
 
+fn promote_selected_queue_item(app: &mut App) -> bool {
+    if app.queue.is_empty() || app.queue_selected_index >= app.queue.len() {
+        return false;
+    }
+    if app.queue_selected_index > 0 {
+        app.queue.move_to_front(app.queue_selected_index);
+        app.queue_selected_index = 0;
+    }
+    true
+}
+
+fn play_queue_front(app: &mut App) {
+    let Some(track) = app.queue.get(0) else {
+        return;
+    };
+    let url = format!("https://www.youtube.com/watch?v={}", track.id);
+    let title = track.title.clone();
+    let video_id = track.id.clone();
+
+    let result = if let Some(player) = app.player_manager.as_mut() {
+        player.play(&app.config, &url, &title, &video_id)
+    } else {
+        match PlayerManager::new(&app.config) {
+            Ok(mut player) => match player.play(&app.config, &url, &title, &video_id) {
+                Ok(()) => {
+                    app.player_manager = Some(player);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    };
+
+    match result {
+        Ok(()) => app.status_message = None,
+        Err(error) => {
+            app.player_manager = None;
+            app.status_message = Some(format!("Could not start playback: {error}"));
+        }
+    }
+}
+
+fn removed_queue_item_was_playing(selected_index: usize, current_video_id: Option<&str>) -> bool {
+    // Queue position, not video ID, identifies the active entry. Duplicate
+    // videos are valid queue entries and a later duplicate is not playing.
+    selected_index == 0 && current_video_id.is_some()
+}
+
 fn handle_help_keys(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q') => {
+        KeyCode::Esc | KeyCode::Char('h' | '?' | 'q') => {
             app.input_mode = InputMode::Browse;
         }
         _ => {}
@@ -333,74 +457,26 @@ fn handle_help_keys(app: &mut App, key: KeyEvent) {
 fn handle_settings_keys(app: &mut App, key: KeyEvent) {
     // If editing a text field, handle text input
     if let Some(field) = app.settings_editing {
-        match key.code {
-            KeyCode::Char(c) => {
-                // Append character to appropriate field
-                match field {
-                    SettingsField::DownloadDir => {
-                        app.config.download_dir.push(c);
-                        let _ = app.config.save();
-                    }
-                    SettingsField::ResultsPerPage => {
-                        // Only accept digits
-                        if c.is_ascii_digit() {
-                            if let Some(ref mut input) = app.results_per_page_input {
-                                input.push(c);
-                                // Try to parse and save (if valid)
-                                if let Ok(new_val) = input.parse::<usize>() {
-                                    if new_val <= 999 {  // Reasonable upper bound
-                                        app.config.results_per_page = new_val;
-                                        let _ = app.config.save();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    SettingsField::CustomFormat => {
-                        app.config.custom_format.push(c);
-                        let _ = app.config.save();
-                    }
+        match (key.code, key.modifiers) {
+            (KeyCode::Char(c), modifiers)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let accepts_character =
+                    field != SettingsField::ResultsPerPage || c.is_ascii_digit();
+                if accepts_character
+                    && let Some(input) = app.settings_text_input.as_mut()
+                    && input.len() < 4096
+                {
+                    input.push(c);
                 }
             }
-            KeyCode::Backspace => {
-                // Remove last character
-                match field {
-                    SettingsField::DownloadDir => {
-                        app.config.download_dir.pop();
-                        let _ = app.config.save();
-                    }
-                    SettingsField::ResultsPerPage => {
-                        if let Some(ref mut input) = app.results_per_page_input {
-                            input.pop();
-                            // If not empty, try to parse and save
-                            if !input.is_empty() {
-                                if let Ok(new_val) = input.parse::<usize>() {
-                                    app.config.results_per_page = new_val;
-                                    let _ = app.config.save();
-                                }
-                            }
-                            // If empty string, don't update config yet (wait for exit)
-                        }
-                    }
-                    SettingsField::CustomFormat => {
-                        app.config.custom_format.pop();
-                        let _ = app.config.save();
-                    }
+            (KeyCode::Backspace, _) => {
+                if let Some(input) = app.settings_text_input.as_mut() {
+                    input.pop();
                 }
             }
-            KeyCode::Enter | KeyCode::Esc => {
-                // Exit edit mode and finalize ResultsPerPage
-                if field == SettingsField::ResultsPerPage {
-                    if let Some(ref input) = app.results_per_page_input {
-                        // Parse the input string, default to 20 if empty or invalid
-                        let value = input.parse::<usize>().unwrap_or(20);
-                        // Clamp to 1-100 range
-                        app.config.results_per_page = value.clamp(1, 100);
-                        let _ = app.config.save();
-                    }
-                    app.results_per_page_input = None;
-                }
-                app.settings_editing = None;
+            (KeyCode::Enter | KeyCode::Esc, _) => {
+                finish_settings_edit(app, field);
             }
             _ => {}
         }
@@ -414,28 +490,28 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.settings_open = false;
             app.settings_editing = None;
-            app.results_per_page_input = None;
+            app.settings_text_input = None;
         }
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::BackTab => {
             // Find the previous selectable index
             let current = app.settings_selected_index;
             let pos = SELECTABLE_INDICES.iter().position(|&x| x == current);
 
-            if let Some(pos) = pos {
-                if pos > 0 {
-                    app.settings_selected_index = SELECTABLE_INDICES[pos - 1];
-                }
+            if let Some(pos) = pos
+                && pos > 0
+            {
+                app.settings_selected_index = SELECTABLE_INDICES[pos - 1];
             }
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Tab => {
             // Find the next selectable index
             let current = app.settings_selected_index;
             let pos = SELECTABLE_INDICES.iter().position(|&x| x == current);
 
-            if let Some(pos) = pos {
-                if pos < SELECTABLE_INDICES.len() - 1 {
-                    app.settings_selected_index = SELECTABLE_INDICES[pos + 1];
-                }
+            if let Some(pos) = pos
+                && pos < SELECTABLE_INDICES.len() - 1
+            {
+                app.settings_selected_index = SELECTABLE_INDICES[pos + 1];
             }
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -443,40 +519,48 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
             match app.settings_selected_index {
                 2 => {
                     // Audio Only checkbox
-                    let _ = app.config.toggle_audio_only();
+                    let result = app.config.toggle_audio_only();
+                    record_settings_save_result(app, result);
                 }
                 3 => {
                     // Bandwidth Limit checkbox
-                    let _ = app.config.toggle_bandwidth_limit();
+                    let result = app.config.toggle_bandwidth_limit();
+                    record_settings_save_result(app, result);
                 }
                 4 => {
                     // Keep Temp checkbox
-                    let _ = app.config.toggle_keep_temp();
+                    let result = app.config.toggle_keep_temp();
+                    record_settings_save_result(app, result);
                 }
                 5 => {
                     // Include Shorts checkbox
-                    let _ = app.config.toggle_include_shorts();
+                    let result = app.config.toggle_include_shorts();
+                    record_settings_save_result(app, result);
                 }
                 6 => {
                     // Auto Play Queue checkbox
-                    let _ = app.config.toggle_auto_play_queue();
+                    let result = app.config.toggle_auto_play_queue();
+                    record_settings_save_result(app, result);
                 }
                 10 => {
                     // Download Mode checkbox
-                    let _ = app.config.toggle_download_mode();
+                    let result = app.config.toggle_download_mode();
+                    record_settings_save_result(app, result);
                 }
                 11 => {
                     // Download Dir text field - enter edit mode
                     app.settings_editing = Some(SettingsField::DownloadDir);
+                    app.settings_text_input = Some(app.config.download_dir.clone());
                 }
                 15 => {
                     // Results Per Page text field - enter edit mode
                     app.settings_editing = Some(SettingsField::ResultsPerPage);
-                    app.results_per_page_input = Some(app.config.results_per_page.to_string());
+                    app.settings_text_input = Some(app.config.results_per_page.to_string());
                 }
                 19 => {
                     // Custom Format text field - enter edit mode
                     app.settings_editing = Some(SettingsField::CustomFormat);
+                    app.settings_text_input = Some(app.config.custom_format.clone());
                 }
                 _ => {}
             }
@@ -485,11 +569,43 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn record_settings_save_result(app: &mut App, result: anyhow::Result<()>) {
+    if let Err(error) = result {
+        app.status_message = Some(format!("Could not save settings: {error}"));
+    }
+}
+
+fn finish_settings_edit(app: &mut App, field: SettingsField) {
+    let input = app.settings_text_input.take().unwrap_or_default();
+    match field {
+        SettingsField::DownloadDir => {
+            if input.trim().is_empty() {
+                app.status_message = Some("Download directory cannot be empty".to_string());
+                app.settings_editing = None;
+                return;
+            }
+            app.config.download_dir = input;
+        }
+        SettingsField::ResultsPerPage => {
+            let value = input
+                .parse::<usize>()
+                .unwrap_or(app.config.results_per_page);
+            app.config.results_per_page = clamp_results_per_page(value);
+        }
+        SettingsField::CustomFormat => app.config.custom_format = input,
+    }
+
+    if let Err(error) = app.config.save() {
+        app.status_message = Some(format!("Could not save settings: {error}"));
+    }
+    app.settings_editing = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::SearchResult;
     use crate::config::Config;
+    use crate::search::SearchResult;
 
     fn create_test_results(count: usize) -> Vec<SearchResult> {
         (0..count)
@@ -573,6 +689,138 @@ mod tests {
 
         assert_eq!(app.page, 1);
         assert_eq!(app.selected_index, 0);
+        assert_eq!(app.pending_action, AppAction::PrefetchNextPage(1));
+    }
+
+    #[test]
+    fn test_cached_partial_next_page_is_completed_before_prefetching() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.results = create_test_results(15);
+        app.total_results = 15;
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('n')));
+
+        assert_eq!(app.page, 1);
+        assert_eq!(app.pending_action, AppAction::FetchNextPage(1));
+    }
+
+    #[test]
+    fn test_cached_navigation_does_not_refetch_fully_cached_following_page() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.results = create_test_results(30);
+        app.total_results = 30;
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('n')));
+
+        assert_eq!(app.page, 1);
+        assert_eq!(app.pending_action, AppAction::None);
+    }
+
+    #[test]
+    fn test_previous_page_schedules_missing_following_page_prefetch() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.results = create_test_results(25);
+        app.total_results = 25;
+        app.page = 2;
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('p')));
+
+        assert_eq!(app.page, 1);
+        assert_eq!(app.pending_action, AppAction::PrefetchNextPage(1));
+    }
+
+    #[test]
+    fn test_cached_navigation_does_not_schedule_while_search_is_loading() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.results = create_test_results(20);
+        app.total_results = 20;
+        app.loading = true;
+        app.search_phase = Some(SearchPhase::Prefetch { target_page: 1 });
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('n')));
+
+        assert_eq!(app.page, 1);
+        assert_eq!(app.pending_action, AppAction::None);
+    }
+
+    #[test]
+    fn test_cached_navigation_does_not_schedule_after_search_exhaustion() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.results = create_test_results(20);
+        app.total_results = 20;
+        app.exhausted = true;
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('n')));
+
+        assert_eq!(app.page, 1);
+        assert_eq!(app.pending_action, AppAction::None);
+    }
+
+    #[test]
+    fn test_cached_navigation_preserves_an_existing_pending_action() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.results = create_test_results(20);
+        app.total_results = 20;
+        app.pending_action = AppAction::Play(3);
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('n')));
+
+        assert_eq!(app.page, 1);
+        assert_eq!(app.pending_action, AppAction::Play(3));
+    }
+
+    #[test]
+    fn test_uncached_next_page_keeps_current_page_visible_while_loading() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.results = create_test_results(10);
+        app.total_results = 10;
+        app.page = 0;
+        app.selected_index = 5;
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('n')));
+
+        assert_eq!(app.page, 0);
+        assert_eq!(app.selected_index, 5);
+        assert!(app.loading);
+        assert_eq!(
+            app.search_phase,
+            Some(SearchPhase::RequestedPage { target_page: 1 })
+        );
+        assert_eq!(app.pending_action, AppAction::FetchNextPage(1));
+    }
+
+    #[test]
+    fn test_results_remain_navigable_while_search_prefetches() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.results = create_test_results(5);
+        app.total_results = 5;
+        app.loading = true;
+        app.search_phase = Some(SearchPhase::Prefetch { target_page: 1 });
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Down));
+
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn test_esc_cancels_loading_search_without_quitting() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.loading = true;
+        app.search_phase = Some(SearchPhase::Initial);
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        assert_eq!(app.pending_action, AppAction::CancelSearch);
+        assert!(!app.should_quit);
     }
 
     #[test]
@@ -604,6 +852,25 @@ mod tests {
 
         assert_eq!(app.page, 1);
         assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_previous_page_during_loading_prevents_forced_forward_navigation() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.results = create_test_results(15);
+        app.total_results = 15;
+        app.page = 1;
+        app.loading = true;
+        app.search_phase = Some(SearchPhase::RequestedPage { target_page: 1 });
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('p')));
+
+        assert_eq!(app.page, 0);
+        assert_eq!(
+            app.search_phase,
+            Some(SearchPhase::Prefetch { target_page: 1 })
+        );
     }
 
     #[test]
@@ -722,19 +989,21 @@ mod tests {
         let key = KeyEvent::from(KeyCode::Enter);
         handle_browse_keys(&mut app, key);
 
-        assert_eq!(app.pending_action, AppAction::NewSearch("new query".to_string()));
+        assert_eq!(
+            app.pending_action,
+            AppAction::NewSearch("new query".to_string())
+        );
         assert_eq!(app.focused_panel, FocusedPanel::Results);
         assert!(app.search_input.is_empty());
     }
 
     #[test]
-    fn test_settings_open_with_s_key_from_queue() {
-        // 's' opens settings only from the Queue panel; from Results it focuses SearchBar
+    fn test_settings_open_with_uppercase_s() {
         let mut app = App::new("test query".to_string(), 10, Config::default());
         app.settings_open = false;
         app.focused_panel = FocusedPanel::Queue;
 
-        let key = KeyEvent::from(KeyCode::Char('s'));
+        let key = KeyEvent::from(KeyCode::Char('S'));
         handle_browse_keys(&mut app, key);
 
         assert!(app.settings_open);
@@ -841,11 +1110,10 @@ mod tests {
     fn test_settings_end_to_end_workflow() {
         // Create app with default settings
         let mut app = App::new("test".to_string(), 10, Config::default());
-        // 's' opens settings from Queue panel (from Results it focuses SearchBar)
         app.focused_panel = FocusedPanel::Queue;
 
-        // Open settings with 's' key
-        let key = KeyEvent::from(KeyCode::Char('s'));
+        // Open settings with the global uppercase-S shortcut.
+        let key = KeyEvent::from(KeyCode::Char('S'));
         handle_browse_keys(&mut app, key);
         assert!(app.settings_open);
 
@@ -881,13 +1149,19 @@ mod tests {
             handle_browse_keys(&mut app, key);
         }
 
-        // Verify text was appended
-        assert_eq!(app.config.download_dir, format!("{}test", initial_dir));
+        // Editing is buffered, so no filesystem write occurs per keystroke.
+        assert_eq!(app.config.download_dir, initial_dir);
+        let expected_dir = format!("{}test", initial_dir);
+        assert_eq!(
+            app.settings_text_input.as_deref(),
+            Some(expected_dir.as_str())
+        );
 
         // Exit edit mode
         let key = KeyEvent::from(KeyCode::Esc);
         handle_browse_keys(&mut app, key);
         assert_eq!(app.settings_editing, None);
+        assert_eq!(app.config.download_dir, format!("{}test", initial_dir));
 
         // Close settings
         let key = KeyEvent::from(KeyCode::Esc);
@@ -959,6 +1233,21 @@ mod tests {
 
         // Expected: page=1, page_size=10, number=3 → global index 12
         // Actual (bug): Play(2)
+        assert_eq!(app.pending_action, AppAction::Play(12));
+    }
+
+    #[test]
+    fn test_number_quickpick_accepts_displayed_global_number() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.results = create_test_results(30);
+        app.total_results = 30;
+        app.page = 1;
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_results_keys(&mut app, KeyEvent::from(KeyCode::Char('1')));
+        handle_results_keys(&mut app, KeyEvent::from(KeyCode::Char('3')));
+        handle_results_keys(&mut app, KeyEvent::from(KeyCode::Enter));
+
         assert_eq!(app.pending_action, AppAction::Play(12));
     }
 
@@ -1138,8 +1427,7 @@ mod tests {
         app.queue.push_back(create_test_track("3", "Track 3"));
         app.queue_selected_index = 2; // Track 3
 
-        let key = KeyEvent::from(KeyCode::Enter);
-        handle_queue_keys(&mut app, key);
+        assert!(promote_selected_queue_item(&mut app));
 
         // Track 3 moved to front, selection reset to 0
         assert_eq!(app.queue.get(0).unwrap().id, "3");
@@ -1153,12 +1441,17 @@ mod tests {
         app.queue.push_back(create_test_track("2", "Track 2"));
         app.queue_selected_index = 0;
 
-        let key = KeyEvent::from(KeyCode::Enter);
-        handle_queue_keys(&mut app, key);
+        assert!(promote_selected_queue_item(&mut app));
 
         // Order unchanged
         assert_eq!(app.queue.get(0).unwrap().id, "1");
         assert_eq!(app.queue.get(1).unwrap().id, "2");
+    }
+
+    #[test]
+    fn test_later_duplicate_is_not_treated_as_playing() {
+        assert!(!removed_queue_item_was_playing(1, Some("duplicate-id")));
+        assert!(removed_queue_item_was_playing(0, Some("duplicate-id")));
     }
 
     // --- Focus cycling ---
@@ -1201,7 +1494,7 @@ mod tests {
         let key = KeyEvent::from(KeyCode::Enter);
         handle_search_bar_keys(&mut app, key);
 
-        assert!(app.number_input.is_empty() || app.pending_action != AppAction::None);
+        assert!(app.number_input.is_empty());
         assert_eq!(app.focused_panel, FocusedPanel::Results);
     }
 
@@ -1218,6 +1511,24 @@ mod tests {
     }
 
     #[test]
+    fn test_search_ignores_whitespace_only_input_and_trims_queries() {
+        let mut app = App::new("old".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::SearchBar;
+        app.search_input = "   ".to_string();
+
+        handle_search_bar_keys(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.pending_action, AppAction::None);
+
+        app.search_input = "  new query  ".to_string();
+        handle_search_bar_keys(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.pending_action,
+            AppAction::NewSearch("new query".to_string())
+        );
+        assert_eq!(app.query, "new query");
+    }
+
+    #[test]
     fn test_search_bar_backspace_removes_last_char() {
         let mut app = App::new("test".to_string(), 10, Config::default());
         app.focused_panel = FocusedPanel::SearchBar;
@@ -1227,5 +1538,82 @@ mod tests {
         handle_search_bar_keys(&mut app, key);
 
         assert_eq!(app.search_input, "hell");
+    }
+
+    #[test]
+    fn test_search_bar_accepts_q_instead_of_quitting() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::SearchBar;
+
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Char('q')));
+
+        assert_eq!(app.search_input, "q");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn test_key_release_is_ignored() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::SearchBar;
+        let key = KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+
+        handle_key_event(&mut app, key);
+
+        assert!(app.search_input.is_empty());
+    }
+
+    #[test]
+    fn test_backtab_cycles_focus_backward() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::BackTab));
+
+        assert_eq!(app.focused_panel, FocusedPanel::SearchBar);
+    }
+
+    #[test]
+    fn test_question_mark_opens_help() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Char('?')));
+
+        assert_eq!(app.input_mode, InputMode::Help);
+    }
+
+    #[test]
+    fn test_zero_results_per_page_is_not_applied_while_editing() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.settings_open = true;
+        app.settings_selected_index = 15;
+        app.settings_editing = Some(SettingsField::ResultsPerPage);
+        app.settings_text_input = Some(String::new());
+        let original = app.config.results_per_page;
+
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Char('0')));
+
+        assert_eq!(app.config.results_per_page, original);
+        assert_eq!(app.settings_text_input.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn test_empty_download_directory_is_rejected() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        let original = app.config.download_dir.clone();
+        app.settings_editing = Some(SettingsField::DownloadDir);
+        app.settings_text_input = Some("   ".to_string());
+
+        finish_settings_edit(&mut app, SettingsField::DownloadDir);
+
+        assert_eq!(app.config.download_dir, original);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Download directory cannot be empty")
+        );
     }
 }
