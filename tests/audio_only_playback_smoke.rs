@@ -252,6 +252,7 @@ impl PtyProcess {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let window_ptr = std::ptr::from_mut(&mut window);
         // SAFETY: openpty initializes both file descriptors on success. They
         // are immediately wrapped in owned Files exactly once below.
         let result = unsafe {
@@ -260,7 +261,7 @@ impl PtyProcess {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut window,
+                window_ptr,
             )
         };
         assert_eq!(result, 0, "openpty failed: {}", io::Error::last_os_error());

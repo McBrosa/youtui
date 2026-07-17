@@ -144,14 +144,14 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
                     return;
                 }
             }
-            KeyCode::Char('-') if app.focused_panel != FocusedPanel::SearchBar => {
+            KeyCode::Char('-') => {
                 if run_player_command(app, |player| {
                     player.set_volume((player.status.volume - 5).max(0))
                 }) {
                     return;
                 }
             }
-            KeyCode::Char('m') if app.focused_panel != FocusedPanel::SearchBar => {
+            KeyCode::Char('m') => {
                 if run_player_command(app, |player| {
                     let new_volume = if player.status.volume > 0 { 0 } else { 100 };
                     player.set_volume(new_volume)
