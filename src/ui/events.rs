@@ -151,13 +151,13 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
                     return;
                 }
             }
-            KeyCode::Char('m') => {
+            KeyCode::Char('m')
                 if run_player_command(app, |player| {
                     let new_volume = if player.status.volume > 0 { 0 } else { 100 };
                     player.set_volume(new_volume)
-                }) {
-                    return;
-                }
+                }) =>
+            {
+                return;
             }
             _ => {}
         }
