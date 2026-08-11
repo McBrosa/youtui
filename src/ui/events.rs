@@ -240,11 +240,6 @@ fn toggle_video_view(app: &mut App) {
     if app.video_view {
         app.video_view = false;
         app.video.stop();
-        if let Some(player) = app.player_manager.as_mut()
-            && let Err(error) = player.set_video_track(true)
-        {
-            app.status_message = Some(format!("Could not restore mpv video: {error}"));
-        }
         return;
     }
 
@@ -261,11 +256,6 @@ fn toggle_video_view(app: &mut App) {
         return;
     }
 
-    if let Some(player) = app.player_manager.as_mut()
-        && let Err(error) = player.set_video_track(false)
-    {
-        app.status_message = Some(format!("Could not disable mpv video: {error}"));
-    }
     app.video_view = true;
 }
 
@@ -1301,53 +1291,25 @@ mod tests {
 
     #[test]
     fn video_view_toggles_on_and_off_while_a_track_is_playing() {
-        let (mut app, server) = app_with_command_capture(Config::default(), 100.0);
+        // Toggling touches no mpv IPC: mpv always runs --no-video, so there
+        // is no window/track to switch.
+        let (client_stream, _server_stream) = UnixStream::pair().unwrap();
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        let mut player = PlayerManager::from_test_stream(client_stream);
+        player.current_video_id = Some("abc123".to_string());
+        app.player_manager = Some(player);
         app.focused_panel = FocusedPanel::Results;
 
         handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('v')));
         assert!(app.video_view);
-        assert_eq!(server.join().unwrap(), json!(["set_property", "vid", "no"]));
-
-        // Toggling off restores mpv's own video track.
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
-        let server = thread::spawn(move || {
-            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            let request: Value = serde_json::from_str(&line).unwrap();
-            writeln!(
-                &server_stream,
-                "{}",
-                json!({ "request_id": request["request_id"], "error": "success" })
-            )
-            .unwrap();
-            request["command"].clone()
-        });
-        app.player_manager = Some(PlayerManager::from_test_stream(client_stream));
 
         handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('v')));
         assert!(!app.video_view);
-        assert_eq!(
-            server.join().unwrap(),
-            json!(["set_property", "vid", "auto"])
-        );
     }
 
     #[test]
     fn esc_returns_from_video_view_instead_of_quitting() {
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
-        let server = thread::spawn(move || {
-            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            let request: Value = serde_json::from_str(&line).unwrap();
-            writeln!(
-                &server_stream,
-                "{}",
-                json!({ "request_id": request["request_id"], "error": "success" })
-            )
-            .unwrap();
-        });
+        let (client_stream, _server_stream) = UnixStream::pair().unwrap();
         let mut app = App::new("test".to_string(), 10, Config::default());
         app.player_manager = Some(PlayerManager::from_test_stream(client_stream));
         app.video_view = true;
@@ -1357,7 +1319,6 @@ mod tests {
 
         assert!(!app.video_view);
         assert!(!app.should_quit);
-        server.join().unwrap();
     }
 
     #[test]

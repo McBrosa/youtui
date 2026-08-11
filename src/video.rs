@@ -271,6 +271,27 @@ impl VideoState {
         self.retried_after_evict = false;
     }
 
+    /// Start resolving the stream URL for `video_id` ahead of time so the
+    /// first toggle into the video view skips the ~3s yt-dlp wait. Safe to
+    /// call every tick: it is a no-op when the URL is cached or a resolution
+    /// for the same id is already in flight.
+    pub fn prefetch(&mut self, video_id: &str) {
+        if self.cache.contains_key(video_id) {
+            return;
+        }
+        let already_pending = self
+            .resolving
+            .as_ref()
+            .is_some_and(|pending| pending.video_id == video_id);
+        if already_pending {
+            return;
+        }
+        self.resolving = Some(PendingResolve {
+            video_id: video_id.to_string(),
+            rx: spawn_resolve(video_id),
+        });
+    }
+
     pub fn render_state(&self) -> VideoDisplay<'_> {
         if let Some(error) = &self.error {
             return VideoDisplay::Error(error);
@@ -512,6 +533,16 @@ mod tests {
                 "-",
             ]
         );
+    }
+
+    #[test]
+    fn prefetch_is_a_noop_when_the_url_is_already_cached() {
+        let mut state = VideoState::new();
+        state
+            .cache
+            .insert("abc123".to_string(), "https://cached".to_string());
+        state.prefetch("abc123");
+        assert!(state.resolving.is_none());
     }
 
     #[test]

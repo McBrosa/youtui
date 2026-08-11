@@ -309,18 +309,6 @@ impl PlayerManager {
         Ok(())
     }
 
-    /// Enable or disable mpv's own video decode/window. Used by the terminal
-    /// video view: mpv's window is redundant while ffmpeg supplies frames to
-    /// the TUI, so it is turned off on activation and restored on exit.
-    pub fn set_video_track(&mut self, enabled: bool) -> Result<()> {
-        self.reconnect_for_active_track()?;
-        if let Some(ipc) = self.ipc.as_mut() {
-            let value = if enabled { "auto" } else { "no" };
-            ipc.send_command(&["set_property", "vid", value])?;
-        }
-        Ok(())
-    }
-
     pub fn set_volume(&mut self, volume: i32) -> Result<()> {
         let volume = volume.clamp(0, 100);
         self.reconnect_for_active_track()?;
@@ -399,9 +387,10 @@ fn build_mpv_command(socket_path: &Path, config: &Config) -> Command {
         .arg(format!("--input-ipc-server={}", socket_path.display()))
         .arg(format!("--ytdl-format={}", config.format()));
 
-    if config.audio_only {
-        command.arg("--no-video");
-    }
+    // mpv is audio-only in every mode: video renders in the terminal (see
+    // src/video.rs), and an OS video window would steal keyboard focus from
+    // the TUI whenever playback starts.
+    command.arg("--no-video");
 
     command
         .stdin(Stdio::null())
@@ -489,44 +478,14 @@ mod tests {
     }
 
     #[test]
-    fn set_video_track_sends_no_and_auto_for_the_vid_property() {
-        for (enabled, expected) in [(false, "no"), (true, "auto")] {
-            let (client_stream, server_stream) = UnixStream::pair().unwrap();
-            let server = thread::spawn(move || {
-                let mut reader = BufReader::new(server_stream.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
-                writeln!(
-                    &server_stream,
-                    "{}",
-                    json!({
-                        "request_id": request["request_id"],
-                        "error": "success",
-                    })
-                )
-                .unwrap();
-                request["command"].clone()
-            });
-            let mut manager = PlayerManager::from_test_stream(client_stream);
-
-            manager.set_video_track(enabled).unwrap();
-
-            assert_eq!(
-                server.join().unwrap(),
-                json!(["set_property", "vid", expected])
-            );
-        }
-    }
-
-    #[test]
     fn mpv_command_respects_video_and_format_configuration() {
         let video = Config {
             bandwidth_limit: true,
             ..Config::default()
         };
         let args = command_args(&video);
-        assert!(!args.iter().any(|arg| arg == "--no-video"));
+        // mpv never decodes video; frames come from the terminal pipeline.
+        assert!(args.iter().any(|arg| arg == "--no-video"));
         assert!(args.iter().any(|arg| {
             arg == "--ytdl-format=bestvideo[height<=360]+bestaudio/best[height<=360]/best"
         }));

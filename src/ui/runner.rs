@@ -637,6 +637,17 @@ fn poll_player(app: &mut App, terminal_size: (u16, u16)) -> bool {
         sync_video(app, terminal_size);
     }
 
+    // Warm the stream-URL cache for the playing track so the first toggle
+    // into the video view doesn't wait on yt-dlp. No-op once cached/pending.
+    if !app.config.audio_only
+        && let Some(video_id) = app
+            .player_manager
+            .as_ref()
+            .and_then(|player| player.current_video_id.clone())
+    {
+        app.video.prefetch(&video_id);
+    }
+
     true
 }
 

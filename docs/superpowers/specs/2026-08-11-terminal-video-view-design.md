@@ -50,14 +50,19 @@ mpv (audio master, existing)          ffmpeg (frame source, new)
 - **A reader thread** reads exactly `W*H*3` bytes per frame and sends frames
   over a bounded channel; stale frames are dropped (only latest matters).
 
-### mpv window while video view is active
+### mpv never opens an OS window
 
-When the terminal video view is toggled on, mpv's own OS video window is
-redundant. Set the mpv property `vid` to `no` (`{"command": ["set_property",
-"vid", "no"]}`) when the view activates, and restore `vid=auto` when the view
-deactivates. This keeps audio playing, drops mpv's video decode, and closes
-its window without restarting playback. If the property set fails, log to the
-status message and continue — coexisting windows are acceptable degradation.
+mpv always runs with `--no-video`: video renders in the terminal, and an OS
+video window would steal keyboard focus from the TUI every time playback
+starts. The `audio_only` config setting still controls the yt-dlp format and
+gates the terminal video view; it no longer changes mpv's flags.
+
+### Stream URL prefetch
+
+Every status-poll tick warms the URL cache for the currently playing track
+(`VideoState::prefetch`, a no-op when the URL is cached or already
+resolving), so the first toggle into the video view skips the ~3s yt-dlp
+resolution. This covers all play paths, including automatic queue advance.
 
 ## Components
 
