@@ -68,6 +68,8 @@ pub struct App {
     pub settings_text_input: Option<String>,
     pub status_message: Option<String>,
     pub config: Config,
+    pub video_view: bool,
+    pub video: crate::video::VideoState,
 }
 
 impl App {
@@ -104,6 +106,8 @@ impl App {
             settings_text_input: None,
             status_message: None,
             config,
+            video_view: false,
+            video: crate::video::VideoState::new(),
         }
     }
 

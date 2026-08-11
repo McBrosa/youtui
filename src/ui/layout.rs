@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use crate::ui::app::{App, FocusedPanel, InputMode, SearchPhase, SettingsField};
+use crate::video::{Frame as VideoFrame, VideoDisplay};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -23,24 +24,32 @@ pub fn render_ui(f: &mut Frame, app: &App) {
         return;
     }
 
-    let footer_height = if app.player_manager.is_some() && area.height >= 14 {
-        4
+    let footer_height = footer_height(app.player_manager.is_some(), area.height);
+
+    if app.video_view {
+        // The video widget takes over everywhere the search bar and
+        // results/queue panels normally live; only the footer stays.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(footer_height)])
+            .split(area);
+
+        render_video_view(f, app, chunks[0]);
+        render_footer(f, app, chunks[1]);
     } else {
-        2
-    };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(footer_height),
+            ])
+            .split(area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(footer_height),
-        ])
-        .split(area);
-
-    render_search_bar(f, app, chunks[0]);
-    render_main_content(f, app, chunks[1]);
-    render_footer(f, app, chunks[2]);
+        render_search_bar(f, app, chunks[0]);
+        render_main_content(f, app, chunks[1]);
+        render_footer(f, app, chunks[2]);
+    }
 
     if app.input_mode == InputMode::Help {
         render_help_overlay(f, app);
@@ -134,6 +143,108 @@ fn render_main_content(f: &mut Frame, app: &App, area: Rect) {
         // the focused panel instead of squeezing both panels into unusability.
         render_results(f, app, area);
     }
+}
+
+/// Height of the footer (status + controls, or just controls) for a given
+/// terminal height and whether a player is active. Shared with the runner's
+/// status-poll loop so the ffmpeg pane it sizes matches what gets rendered.
+pub fn footer_height(has_player: bool, area_height: u16) -> u16 {
+    if has_player && area_height >= 14 {
+        4
+    } else {
+        2
+    }
+}
+
+/// Terminal cell dimensions available to the video pane for a given
+/// terminal size, mirroring the layout `render_ui` uses when `video_view`
+/// is active (full width, height minus the footer).
+pub fn video_pane_size(has_player: bool, area_width: u16, area_height: u16) -> (u16, u16) {
+    let rows = area_height.saturating_sub(footer_height(has_player, area_height));
+    (area_width, rows)
+}
+
+fn render_video_view(f: &mut Frame, app: &App, area: Rect) {
+    match app.video.render_state() {
+        VideoDisplay::Error(message) => render_video_message(f, area, message, Color::Red),
+        VideoDisplay::Loading => render_video_message(f, area, "loading video…", Color::Yellow),
+        VideoDisplay::Placeholder => {
+            render_video_message(f, area, "no video playing", Color::DarkGray)
+        }
+        VideoDisplay::Frame(frame, paused) => {
+            let lines = frame_to_lines(frame);
+            f.render_widget(Paragraph::new(lines), area);
+            if paused {
+                render_pause_overlay(f, area);
+            }
+        }
+    }
+}
+
+fn render_video_message(f: &mut Frame, area: Rect, message: &str, color: Color) {
+    let paragraph = Paragraph::new(Line::from(Span::styled(
+        message,
+        Style::default().fg(color),
+    )))
+    .alignment(Alignment::Center);
+    let centered = Rect::new(
+        area.x,
+        area.y + area.height / 2,
+        area.width,
+        1.min(area.height),
+    );
+    f.render_widget(paragraph, centered);
+}
+
+fn render_pause_overlay(f: &mut Frame, area: Rect) {
+    let text = " ⏸ PAUSED ";
+    let width = (Line::from(text).width() as u16).min(area.width);
+    let overlay = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height / 2,
+        width,
+        1.min(area.height),
+    );
+    let paragraph = Paragraph::new(Span::styled(
+        text,
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    ))
+    .alignment(Alignment::Center);
+    f.render_widget(paragraph, overlay);
+}
+
+/// Pure mapping from a decoded frame to the `▀` cell lines used to render
+/// it: each cell's foreground is the top pixel, background the bottom pixel,
+/// giving 2x vertical resolution. Kept separate from rendering so it is
+/// testable without a `Frame`/`Terminal`.
+fn frame_to_lines(frame: &VideoFrame) -> Vec<Line<'static>> {
+    let width = frame.width as usize;
+    let rows = (frame.height_px / 2) as usize;
+    (0..rows)
+        .map(|row| {
+            let spans: Vec<Span<'static>> = (0..width)
+                .map(|col| {
+                    let (fr, fg_g, fb) = video_pixel_at(frame, col, row * 2);
+                    let (br, bg_g, bb) = video_pixel_at(frame, col, row * 2 + 1);
+                    Span::styled(
+                        "▀",
+                        Style::default()
+                            .fg(Color::Rgb(fr, fg_g, fb))
+                            .bg(Color::Rgb(br, bg_g, bb)),
+                    )
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn video_pixel_at(frame: &VideoFrame, x: usize, y: usize) -> (u8, u8, u8) {
+    let idx = (y * frame.width as usize + x) * 3;
+    (frame.rgb[idx], frame.rgb[idx + 1], frame.rgb[idx + 2])
 }
 
 /// Keep the edit cursor visible without slicing through a UTF-8 code point.
@@ -652,6 +763,17 @@ fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(message, Style::default().fg(Color::Yellow)),
         ])
+    } else if app.video_view {
+        controls_line(
+            &[
+                ("v", "Back"),
+                ("Space", "Pause"),
+                ("< >", "Seek"),
+                ("n", "Next"),
+                ("q", "Quit"),
+            ],
+            area.width as usize,
+        )
     } else {
         match app.focused_panel {
             FocusedPanel::SearchBar => controls_line(
@@ -845,6 +967,7 @@ fn render_help_overlay(f: &mut Frame, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )),
+            help_row("    v           ", "Toggle terminal video view"),
             help_row("    ? / h       ", "Toggle this help"),
             help_row("    S / F2      ", "Settings"),
             help_row("    q           ", "Quit (outside this Help window)"),
@@ -914,6 +1037,7 @@ fn compact_help_text(panel: FocusedPanel) -> Vec<Line<'static>> {
 
     lines.extend([
         help_row("  Space / <>  ", "Pause / seek"),
+        help_row("  v           ", "Toggle video view"),
         help_row("  S/F2 / q    ", "Settings / quit"),
         help_row("  Esc / ?     ", "Close help"),
     ]);
@@ -1259,6 +1383,53 @@ mod tests {
         app.total_results = 1;
         app.exhausted = true;
         app
+    }
+
+    #[test]
+    fn frame_to_lines_maps_top_pixel_to_fg_and_bottom_pixel_to_bg() {
+        // 2x4 pixel frame -> 2 columns, 2 cell rows of half-block glyphs.
+        #[rustfmt::skip]
+        let rgb = vec![
+            255, 0, 0,     0, 255, 0,   // pixel row 0
+            0, 0, 255,     255, 255, 0, // pixel row 1
+            10, 20, 30,    40, 50, 60,  // pixel row 2
+            70, 80, 90,    100, 110, 120, // pixel row 3
+        ];
+        let frame = VideoFrame {
+            width: 2,
+            height_px: 4,
+            rgb,
+        };
+
+        let lines = frame_to_lines(&frame);
+        assert_eq!(lines.len(), 2);
+
+        let top_left = &lines[0].spans[0];
+        assert_eq!(top_left.content, "▀");
+        assert_eq!(top_left.style.fg, Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(top_left.style.bg, Some(Color::Rgb(0, 0, 255)));
+
+        let top_right = &lines[0].spans[1];
+        assert_eq!(top_right.style.fg, Some(Color::Rgb(0, 255, 0)));
+        assert_eq!(top_right.style.bg, Some(Color::Rgb(255, 255, 0)));
+
+        let bottom_left = &lines[1].spans[0];
+        assert_eq!(bottom_left.style.fg, Some(Color::Rgb(10, 20, 30)));
+        assert_eq!(bottom_left.style.bg, Some(Color::Rgb(70, 80, 90)));
+
+        let bottom_right = &lines[1].spans[1];
+        assert_eq!(bottom_right.style.fg, Some(Color::Rgb(40, 50, 60)));
+        assert_eq!(bottom_right.style.bg, Some(Color::Rgb(100, 110, 120)));
+    }
+
+    #[test]
+    fn video_view_placeholder_renders_without_panicking() {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_unicode_content();
+        app.video_view = true;
+
+        terminal.draw(|frame| render_ui(frame, &app)).unwrap();
     }
 
     #[test]

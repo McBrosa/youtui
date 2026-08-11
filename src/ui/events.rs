@@ -103,6 +103,12 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
             return;
         }
         (KeyCode::Esc, _) => {
+            // The video view always returns to search/queue on Esc,
+            // regardless of what would otherwise happen (cancel, quit).
+            if app.video_view {
+                toggle_video_view(app);
+                return;
+            }
             // Esc in the search editor cancels editing. While results are
             // loading it cancels that search without terminating the app.
             if app.focused_panel == FocusedPanel::SearchBar {
@@ -127,6 +133,18 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
     // Global playback controls (work from any panel, don't conflict with panel keys)
     if app.focused_panel != FocusedPanel::SearchBar {
         match key.code {
+            KeyCode::Char('v') => {
+                toggle_video_view(app);
+                return;
+            }
+            KeyCode::Char('n') if app.video_view => {
+                app.handle_next_video(true);
+                return;
+            }
+            KeyCode::Char('h' | '?') if app.video_view => {
+                app.input_mode = InputMode::Help;
+                return;
+            }
             KeyCode::Char(' ') => {
                 if run_player_command(app, |player| player.toggle_pause()) {
                     return;
@@ -201,11 +219,54 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
         }
     }
 
-    match app.focused_panel {
-        FocusedPanel::SearchBar => handle_search_bar_keys(app, key),
-        FocusedPanel::Results => handle_results_keys(app, key),
-        FocusedPanel::Queue => handle_queue_keys(app, key),
+    // Panel-specific keys (navigation, search editing, digit quick-picks) do
+    // not make sense over the video widget; the playback controls above
+    // still work, everything else is simply ignored while it is active.
+    if !app.video_view {
+        match app.focused_panel {
+            FocusedPanel::SearchBar => handle_search_bar_keys(app, key),
+            FocusedPanel::Results => handle_results_keys(app, key),
+            FocusedPanel::Queue => handle_queue_keys(app, key),
+        }
     }
+}
+
+/// Toggle the terminal video view on/off. Turning it on requires an active,
+/// non-audio-only track; turning it off always works and always stops any
+/// in-flight video session. Also flips mpv's own `vid` property so its
+/// redundant OS window/decode gets out of the way (best-effort: failure is
+/// reported but never blocks the toggle).
+fn toggle_video_view(app: &mut App) {
+    if app.video_view {
+        app.video_view = false;
+        app.video.stop();
+        if let Some(player) = app.player_manager.as_mut()
+            && let Err(error) = player.set_video_track(true)
+        {
+            app.status_message = Some(format!("Could not restore mpv video: {error}"));
+        }
+        return;
+    }
+
+    let is_playing = app
+        .player_manager
+        .as_ref()
+        .is_some_and(|player| player.current_video_id.is_some());
+    if !is_playing {
+        app.status_message = Some("Nothing playing".to_string());
+        return;
+    }
+    if app.config.audio_only {
+        app.status_message = Some("Audio-only mode — no video".to_string());
+        return;
+    }
+
+    if let Some(player) = app.player_manager.as_mut()
+        && let Err(error) = player.set_video_track(false)
+    {
+        app.status_message = Some(format!("Could not disable mpv video: {error}"));
+    }
+    app.video_view = true;
 }
 
 fn handle_timestamp_keys(app: &mut App, key: KeyEvent) {
@@ -1203,6 +1264,100 @@ mod tests {
         handle_browse_keys(&mut app, key);
 
         assert!(app.should_quit);
+    }
+
+    // --- Video view toggle ---
+
+    #[test]
+    fn video_view_toggle_is_blocked_with_a_status_message_when_nothing_is_playing() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('v')));
+
+        assert!(!app.video_view);
+        assert_eq!(app.status_message.as_deref(), Some("Nothing playing"));
+    }
+
+    #[test]
+    fn video_view_toggle_is_blocked_with_a_status_message_in_audio_only_mode() {
+        let (client_stream, _server_stream) = UnixStream::pair().unwrap();
+        let config = Config {
+            audio_only: true,
+            ..Config::default()
+        };
+        let mut app = App::new("test".to_string(), 10, config);
+        app.focused_panel = FocusedPanel::Results;
+        app.player_manager = Some(PlayerManager::from_test_stream(client_stream));
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('v')));
+
+        assert!(!app.video_view);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Audio-only mode — no video")
+        );
+    }
+
+    #[test]
+    fn video_view_toggles_on_and_off_while_a_track_is_playing() {
+        let (mut app, server) = app_with_command_capture(Config::default(), 100.0);
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        assert!(app.video_view);
+        assert_eq!(server.join().unwrap(), json!(["set_property", "vid", "no"]));
+
+        // Toggling off restores mpv's own video track.
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(
+                &server_stream,
+                "{}",
+                json!({ "request_id": request["request_id"], "error": "success" })
+            )
+            .unwrap();
+            request["command"].clone()
+        });
+        app.player_manager = Some(PlayerManager::from_test_stream(client_stream));
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        assert!(!app.video_view);
+        assert_eq!(
+            server.join().unwrap(),
+            json!(["set_property", "vid", "auto"])
+        );
+    }
+
+    #[test]
+    fn esc_returns_from_video_view_instead_of_quitting() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(
+                &server_stream,
+                "{}",
+                json!({ "request_id": request["request_id"], "error": "success" })
+            )
+            .unwrap();
+        });
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.player_manager = Some(PlayerManager::from_test_stream(client_stream));
+        app.video_view = true;
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        assert!(!app.video_view);
+        assert!(!app.should_quit);
+        server.join().unwrap();
     }
 
     #[test]

@@ -220,7 +220,8 @@ pub fn run_app(
         }
 
         if last_tick.elapsed() >= TICK_RATE {
-            if poll_player(&mut app) {
+            let terminal_size = terminal.size()?;
+            if poll_player(&mut app, (terminal_size.width, terminal_size.height)) {
                 dirty = true;
             }
             last_tick = Instant::now();
@@ -603,7 +604,7 @@ fn start_queue_if_idle(app: &mut App) {
     }
 }
 
-fn poll_player(app: &mut App) -> bool {
+fn poll_player(app: &mut App, terminal_size: (u16, u16)) -> bool {
     let Some(player) = app.player_manager.as_mut() else {
         return false;
     };
@@ -622,7 +623,32 @@ fn poll_player(app: &mut App) -> bool {
     if finished {
         app.handle_next_video(false);
     }
+
+    if app.video_view {
+        sync_video(app, terminal_size);
+    }
+
     true
+}
+
+/// Drive the terminal video pipeline from the latest mpv status. Runs on the
+/// same tick as `poll_player` so it always sees fresh position/pause state.
+/// Video failures never touch `app.player_manager` or `app.status_message`;
+/// they are surfaced only inside the video pane (see `video::VideoState`).
+fn sync_video(app: &mut App, (width, height): (u16, u16)) {
+    let (video_id, playing, paused, time_pos) = match app.player_manager.as_ref() {
+        Some(player) => (
+            player.current_video_id.clone(),
+            player.status.playing,
+            player.status.paused,
+            player.status.time_pos,
+        ),
+        None => (None, false, false, 0.0),
+    };
+    let has_player = app.player_manager.is_some();
+    let (cols, rows) = crate::ui::layout::video_pane_size(has_player, width, height);
+    app.video
+        .sync(playing, paused, video_id.as_deref(), time_pos, cols, rows);
 }
 
 fn sync_runtime_settings(
