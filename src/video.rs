@@ -421,7 +421,7 @@ fn resolve_stream_url(watch_url: &str) -> Result<String, String> {
         .args([
             "-g",
             "-f",
-            "bestvideo[height<=480]/best[height<=480]",
+            "bestvideo[height<=144]/best[height<=144]/best",
             watch_url,
         ])
         .output()

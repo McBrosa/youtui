@@ -25,7 +25,7 @@ audio/playback master; a separate ffmpeg process supplies frames.
 
 - Pixel graphics protocols (kitty/sixel/iTerm2).
 - Braille or ASCII-luminance art modes.
-- Configurable fps or resolution (fixed: 12 fps, 480p source cap).
+- Configurable fps or resolution (fixed: 12 fps, 144p source cap).
 - VLC/mplayer fallback support — mpv only (fallback players run in the
   foreground and own the terminal anyway).
 
@@ -116,7 +116,7 @@ Implementation notes:
 
 ### 3. Stream URL resolution
 
-- Command: `yt-dlp -g -f "bestvideo[height<=480]/best[height<=480]" <watch-url>`
+- Command: `yt-dlp -g -f "bestvideo[height<=144]/best[height<=144]/best" <watch-url>`
   where watch-url is `https://www.youtube.com/watch?v=<id>` (same construction
   as `src/ui/runner.rs:578`).
 - First line of stdout = direct stream URL. Video-only stream is fine — audio
