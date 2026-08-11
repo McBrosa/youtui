@@ -432,8 +432,8 @@ impl VideoState {
                 self.session = Some(session);
                 self.error = None;
             }
-            Err(_error) => {
-                self.error = Some("video unavailable: ffmpeg not found".to_string());
+            Err(error) => {
+                self.error = Some(format!("video unavailable: {error}"));
             }
         }
     }
