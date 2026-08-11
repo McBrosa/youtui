@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,10 @@ pub struct Frame {
 /// spawning a process.
 pub fn ffmpeg_args(url: &str, position: f64, w_px: u16, h_px: u16) -> Vec<String> {
     vec![
+        // Read the input at its native frame rate. Without this ffmpeg
+        // decodes as fast as the network allows and the pipeline races far
+        // ahead of mpv's audio clock.
+        "-re".to_string(),
         "-ss".to_string(),
         position.to_string(),
         "-i".to_string(),
@@ -52,11 +58,21 @@ pub fn drift_exceeded(mpv_pos: f64, expected: f64) -> bool {
 pub struct VideoSession {
     child: Child,
     reader: Option<JoinHandle<()>>,
-    rx: Receiver<Frame>,
+    /// Latest decoded frame, overwritten by the reader thread. A slot rather
+    /// than a channel so the newest frame always wins.
+    latest: Arc<Mutex<Option<Frame>>>,
+    /// Frames the reader thread has decoded so far — the pipeline clock.
+    /// Counting consumed frames instead would undercount (the UI polls
+    /// slower than 12 fps) and make `expected_position` lag mpv until the
+    /// drift check killed a perfectly healthy session.
+    frames_read: Arc<AtomicU64>,
     cols: u16,
     rows: u16,
     start_pos: f64,
-    frames_shown: u64,
+    started_at: Instant,
+    /// Whether `start_pos` has been rebased onto mpv's clock after the first
+    /// frame arrived (see `rebase`).
+    rebased: bool,
     stopped: bool,
     /// Whether the URL used to start this session came from the cache
     /// (as opposed to a fresh yt-dlp resolution). Stale cached URLs are the
@@ -88,57 +104,70 @@ impl VideoSession {
             .take()
             .context("ffmpeg stdout pipe unavailable")?;
         let frame_size = cols as usize * h_px as usize * 3;
-        let (tx, rx) = mpsc::sync_channel::<Frame>(1);
+        let latest = Arc::new(Mutex::new(None::<Frame>));
+        let frames_read = Arc::new(AtomicU64::new(0));
 
-        let reader = thread::Builder::new()
-            .name("youtui-video-reader".to_string())
-            .spawn(move || {
-                loop {
-                    let mut buf = vec![0u8; frame_size];
-                    if stdout.read_exact(&mut buf).is_err() {
-                        // Pipe closed: ffmpeg was killed or the stream ended.
-                        break;
+        let reader = {
+            let latest = Arc::clone(&latest);
+            let frames_read = Arc::clone(&frames_read);
+            thread::Builder::new()
+                .name("youtui-video-reader".to_string())
+                .spawn(move || {
+                    loop {
+                        let mut buf = vec![0u8; frame_size];
+                        if stdout.read_exact(&mut buf).is_err() {
+                            // Pipe closed: ffmpeg was killed or the stream ended.
+                            break;
+                        }
+                        let frame = Frame {
+                            width: cols,
+                            height_px: h_px,
+                            rgb: buf,
+                        };
+                        *latest.lock().unwrap() = Some(frame);
+                        frames_read.fetch_add(1, Ordering::Relaxed);
                     }
-                    let frame = Frame {
-                        width: cols,
-                        height_px: h_px,
-                        rgb: buf,
-                    };
-                    // Only the latest frame matters; drop it if the render
-                    // side hasn't consumed the previous one yet.
-                    let _ = tx.try_send(frame);
-                }
-            })
-            .context("Failed to spawn video reader thread")?;
+                })
+                .context("Failed to spawn video reader thread")?
+        };
 
         Ok(VideoSession {
             child,
             reader: Some(reader),
-            rx,
+            latest,
+            frames_read,
             cols,
             rows,
             start_pos: position,
-            frames_shown: 0,
+            started_at: Instant::now(),
+            rebased: false,
             stopped: false,
             from_cache: false,
             dead_handled: false,
         })
     }
 
-    /// Latest frame if a new one arrived; updates frames_shown.
+    /// Latest frame if a new one arrived since the last poll.
     pub fn poll_frame(&mut self) -> Option<Frame> {
-        match self.rx.try_recv() {
-            Ok(frame) => {
-                self.frames_shown += 1;
-                Some(frame)
-            }
-            Err(_) => None,
-        }
+        self.latest.lock().unwrap().take()
     }
 
-    /// Position ffmpeg is expected to be at: start_pos + frames_shown / 12.0
+    /// Frames ffmpeg has decoded so far.
+    fn frames_read(&self) -> u64 {
+        self.frames_read.load(Ordering::Relaxed)
+    }
+
+    /// Position ffmpeg is expected to be at: start_pos + frames_read / 12.0
     pub fn expected_position(&self) -> f64 {
-        self.start_pos + self.frames_shown as f64 / 12.0
+        self.start_pos + self.frames_read() as f64 / 12.0
+    }
+
+    /// Absorb ffmpeg's startup latency (network open + seek): once the first
+    /// frame has arrived, treat mpv's current position as the point the
+    /// pipeline clock started. Without this the constant startup lag reads as
+    /// drift and can kill a healthy session on slow connections.
+    fn rebase(&mut self, mpv_pos: f64) {
+        self.start_pos = mpv_pos - self.frames_read() as f64 / 12.0;
     }
 
     /// Has the ffmpeg process exited (crashed, killed, or reached EOF)?
@@ -294,6 +323,10 @@ impl VideoState {
             if let Some(frame) = session.poll_frame() {
                 self.last_frame = Some(frame);
             }
+            if !session.rebased && session.frames_read() > 0 {
+                session.rebase(time_pos);
+                session.rebased = true;
+            }
             return;
         }
 
@@ -309,9 +342,16 @@ impl VideoState {
 
     fn restart_if_stale(&mut self, time_pos: f64, cols: u16, rows: u16) {
         let stale = self.session.as_ref().is_some_and(|session| {
-            session.cols != cols
-                || session.rows != rows
-                || drift_exceeded(time_pos, session.expected_position())
+            if session.cols != cols || session.rows != rows {
+                return true;
+            }
+            // No drift verdict until the first frame arrives — startup
+            // latency (network open + seek) is not drift. A pipeline that
+            // produces nothing for 10s is hung; give up on it instead.
+            if session.frames_read() == 0 {
+                return session.started_at.elapsed() > Duration::from_secs(10);
+            }
+            drift_exceeded(time_pos, session.expected_position())
         });
         if stale {
             self.session = None;
@@ -327,7 +367,7 @@ impl VideoState {
         }
         session.dead_handled = true;
 
-        let died_immediately = session.frames_shown == 0;
+        let died_immediately = session.frames_read() == 0;
         let from_cache = session.from_cache;
         self.session = None;
 
@@ -449,6 +489,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-re",
                 "-ss",
                 "42.5",
                 "-i",

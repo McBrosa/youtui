@@ -492,13 +492,13 @@ fn parse_search_entry(line: &str) -> serde_json::Result<Option<ParsedSearchEntry
         .and_then(|index| usize::try_from(index).ok());
 
     Ok(
-        SearchResult::from_line_parts(title, duration, channel, &views, &published, id).map(|result| {
-            ParsedSearchEntry {
+        SearchResult::from_line_parts(title, duration, channel, &views, &published, id).map(
+            |result| ParsedSearchEntry {
                 result,
                 duration_seconds,
                 playlist_index,
-            }
-        }),
+            },
+        ),
     )
 }
 

@@ -19,6 +19,8 @@ use crate::ui::app::{AppAction, SearchPhase};
 use crate::ui::{App, handle_key_event, layout::render_ui, terminal::Tui};
 
 const TICK_RATE: Duration = Duration::from_millis(250);
+/// Tick while the video view is active: ~12fps to match the frame pipeline.
+const VIDEO_TICK_RATE: Duration = Duration::from_millis(83);
 const SEARCH_POLL_RATE: Duration = Duration::from_millis(50);
 const SEARCH_CACHE_CAPACITY: usize = 8;
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -206,8 +208,15 @@ pub fn run_app(
             dirty = false;
         }
 
+        // The video view repaints on the tick, so 250ms would cap it at 4fps;
+        // tighten the tick to keep frame delivery close to the 12fps pipeline.
+        let tick_rate = if app.video_view {
+            VIDEO_TICK_RATE
+        } else {
+            TICK_RATE
+        };
         let timeout =
-            event_poll_timeout(TICK_RATE.saturating_sub(last_tick.elapsed()), app.loading);
+            event_poll_timeout(tick_rate.saturating_sub(last_tick.elapsed()), app.loading);
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
@@ -219,7 +228,7 @@ pub fn run_app(
             }
         }
 
-        if last_tick.elapsed() >= TICK_RATE {
+        if last_tick.elapsed() >= tick_rate {
             let terminal_size = terminal.size()?;
             if poll_player(&mut app, (terminal_size.width, terminal_size.height)) {
                 dirty = true;
