@@ -36,7 +36,14 @@ pub fn ffmpeg_args(url: &str, position: f64, w_px: u16, h_px: u16) -> Vec<String
         "-i".to_string(),
         url.to_string(),
         "-vf".to_string(),
-        format!("scale={w_px}:{h_px},fps=12"),
+        // Fit inside the pane preserving aspect ratio, then letterbox with
+        // black bars to the exact pane size so every frame is the same
+        // byte length. Grid pixels are ~square (2 stacked per ~1:2 cell),
+        // so no cell-aspect correction is needed.
+        format!(
+            "scale={w_px}:{h_px}:force_original_aspect_ratio=decrease,\
+             pad={w_px}:{h_px}:(ow-iw)/2:(oh-ih)/2,fps=12"
+        ),
         "-f".to_string(),
         "rawvideo".to_string(),
         "-pix_fmt".to_string(),
@@ -495,7 +502,7 @@ mod tests {
                 "-i",
                 "https://example.com/stream",
                 "-vf",
-                "scale=80:48,fps=12",
+                "scale=80:48:force_original_aspect_ratio=decrease,pad=80:48:(ow-iw)/2:(oh-ih)/2,fps=12",
                 "-f",
                 "rawvideo",
                 "-pix_fmt",

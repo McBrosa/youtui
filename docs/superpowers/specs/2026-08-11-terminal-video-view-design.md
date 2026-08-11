@@ -154,10 +154,11 @@ The UI already polls mpv `STATUS_PROPERTIES` including `time-pos`
 - Widget draws the latest frame: for each cell `(x, y)` set char `▀`,
   fg = RGB of pixel `(x, 2y)`, bg = RGB of pixel `(x, 2y+1)`. Use
   `ratatui::style::Color::Rgb`.
-- Letterboxing: ffmpeg's `scale=W:H` stretches to the pane. Acceptable —
-  simplicity over aspect ratio. (Ceiling: add
-  `force_original_aspect_ratio=decrease,pad=…` to the filter later if the
-  stretch bothers anyone.)
+- Letterboxing: the filter uses `force_original_aspect_ratio=decrease` plus a
+  centered `pad` to the exact pane size, so the video keeps its aspect ratio
+  with black bars and every frame stays the same byte length. Grid pixels are
+  ~square (two stacked per ~1:2 terminal cell), so no cell-aspect correction
+  is applied.
 - States, in priority order: error message → "loading video…" →
   last frame (+ `⏸` overlay when paused) → "no video playing" placeholder.
 
