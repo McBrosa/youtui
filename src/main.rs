@@ -8,6 +8,7 @@ mod player_manager;
 mod queue;
 mod search;
 mod ui;
+mod video;
 
 use std::ffi::OsString;
 

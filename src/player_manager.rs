@@ -309,6 +309,18 @@ impl PlayerManager {
         Ok(())
     }
 
+    /// Enable or disable mpv's own video decode/window. Used by the terminal
+    /// video view: mpv's window is redundant while ffmpeg supplies frames to
+    /// the TUI, so it is turned off on activation and restored on exit.
+    pub fn set_video_track(&mut self, enabled: bool) -> Result<()> {
+        self.reconnect_for_active_track()?;
+        if let Some(ipc) = self.ipc.as_mut() {
+            let value = if enabled { "auto" } else { "no" };
+            ipc.send_command(&["set_property", "vid", value])?;
+        }
+        Ok(())
+    }
+
     pub fn set_volume(&mut self, volume: i32) -> Result<()> {
         let volume = volume.clamp(0, 100);
         self.reconnect_for_active_track()?;
@@ -474,6 +486,37 @@ mod tests {
         manager.seek_absolute(83.5).unwrap();
 
         assert_eq!(server.join().unwrap(), json!(["seek", "83.5", "absolute"]));
+    }
+
+    #[test]
+    fn set_video_track_sends_no_and_auto_for_the_vid_property() {
+        for (enabled, expected) in [(false, "no"), (true, "auto")] {
+            let (client_stream, server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                writeln!(
+                    &server_stream,
+                    "{}",
+                    json!({
+                        "request_id": request["request_id"],
+                        "error": "success",
+                    })
+                )
+                .unwrap();
+                request["command"].clone()
+            });
+            let mut manager = PlayerManager::from_test_stream(client_stream);
+
+            manager.set_video_track(enabled).unwrap();
+
+            assert_eq!(
+                server.join().unwrap(),
+                json!(["set_property", "vid", expected])
+            );
+        }
     }
 
     #[test]
