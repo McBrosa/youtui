@@ -163,6 +163,12 @@ fn visible_input(input: &str, available_width: usize) -> String {
     }
 }
 
+/// Left-align to `width` display columns (wide-glyph aware via `Span::width`).
+fn pad_column(text: &str, width: usize) -> String {
+    let padding = " ".repeat(width.saturating_sub(Span::raw(text).width()));
+    format!("{text}{padding}")
+}
+
 fn render_results(f: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.focused_panel == FocusedPanel::Results;
 
@@ -212,6 +218,19 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
             ]
         }
     } else {
+        // Column widths over the visible page so duration | channel | views |
+        // published line up across rows.
+        let column_width = |field: fn(&crate::search::SearchResult) -> &str| {
+            results
+                .iter()
+                .map(|result| Span::raw(field(result)).width())
+                .max()
+                .unwrap_or(0)
+        };
+        let duration_width = column_width(|r| &r.duration);
+        let channel_width = column_width(|r| &r.channel);
+        let views_width = column_width(|r| &r.views);
+
         results
             .iter()
             .enumerate()
@@ -230,14 +249,31 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
                     ),
                 ]);
 
-                let meta_line = Line::from(vec![
+                let mut meta_spans = vec![
                     Span::raw("     "),
-                    Span::styled(result.duration.as_str(), Style::default().fg(Color::Green)),
+                    Span::styled(
+                        pad_column(&result.duration, duration_width),
+                        Style::default().fg(Color::Green),
+                    ),
                     Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(result.channel.as_str(), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        pad_column(&result.channel, channel_width),
+                        Style::default().fg(Color::Cyan),
+                    ),
                     Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(result.views.as_str(), Style::default().fg(Color::Gray)),
-                ]);
+                    Span::styled(
+                        pad_column(&result.views, views_width),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ];
+                if !result.published.is_empty() {
+                    meta_spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+                    meta_spans.push(Span::styled(
+                        result.published.as_str(),
+                        Style::default().fg(Color::Gray),
+                    ));
+                }
+                let meta_line = Line::from(meta_spans);
 
                 ListItem::new(vec![title_line, meta_line])
             })
@@ -1156,6 +1192,7 @@ mod tests {
             duration: "3:45".to_string(),
             channel: "チャンネル".to_string(),
             views: "1M".to_string(),
+            published: String::new(),
             id: "unicode".to_string(),
         });
         app.total_results = 1;
@@ -1214,6 +1251,7 @@ mod tests {
             duration: "3:00".to_string(),
             channel: "Channel".to_string(),
             views: "1K".to_string(),
+            published: String::new(),
             id: index.to_string(),
         }));
         app.page = 1;

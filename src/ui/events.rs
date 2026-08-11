@@ -614,6 +614,7 @@ mod tests {
                 duration: "5:00".to_string(),
                 channel: "Test Channel".to_string(),
                 views: "1K".to_string(),
+                published: String::new(),
                 id: format!("id{}", i + 1),
             })
             .collect()
@@ -1182,6 +1183,7 @@ mod tests {
             duration: "5:00".to_string(),
             channel: "Test Channel".to_string(),
             views: "1K".to_string(),
+            published: String::new(),
         }
     }
 

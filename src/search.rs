@@ -22,6 +22,8 @@ pub struct SearchResult {
     pub duration: String,
     pub channel: String,
     pub views: String,
+    /// Relative upload age ("3 days ago"), empty when unknown.
+    pub published: String,
     pub id: String,
 }
 
@@ -31,6 +33,7 @@ impl SearchResult {
         duration: &str,
         channel: &str,
         views: &str,
+        published: &str,
         id: &str,
     ) -> Option<Self> {
         let id = id.trim();
@@ -42,6 +45,7 @@ impl SearchResult {
             duration: duration.to_string(),
             channel: channel.to_string(),
             views: views.to_string(),
+            published: published.to_string(),
             id: id.to_string(),
         })
     }
@@ -152,6 +156,8 @@ impl PaginatedSearch {
         cmd.arg("--flat-playlist")
             .arg("--lazy-playlist")
             .arg("--no-warnings")
+            .arg("--extractor-args")
+            .arg("youtubetab:approximate_date")
             .arg("--playlist-items")
             .arg(&range)
             .arg(&search_id)
@@ -460,6 +466,25 @@ fn parse_search_entry(line: &str) -> serde_json::Result<Option<ParsedSearchEntry
         .and_then(Value::as_u64)
         .map(format_view_count)
         .unwrap_or_else(|| "0 views".to_string());
+    let published = entry
+        .get("timestamp")
+        .and_then(Value::as_i64)
+        .map(|timestamp| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs() as i64)
+                .unwrap_or(timestamp);
+            let age = format_relative_age(now.saturating_sub(timestamp));
+            match entry
+                .get("upload_date")
+                .and_then(Value::as_str)
+                .and_then(format_upload_date)
+            {
+                Some(date) => format!("{age} ({date})"),
+                None => age,
+            }
+        })
+        .unwrap_or_default();
     let duration_seconds = entry.get("duration").and_then(Value::as_f64);
     let playlist_index = entry
         .get("playlist_index")
@@ -467,7 +492,7 @@ fn parse_search_entry(line: &str) -> serde_json::Result<Option<ParsedSearchEntry
         .and_then(|index| usize::try_from(index).ok());
 
     Ok(
-        SearchResult::from_line_parts(title, duration, channel, &views, id).map(|result| {
+        SearchResult::from_line_parts(title, duration, channel, &views, &published, id).map(|result| {
             ParsedSearchEntry {
                 result,
                 duration_seconds,
@@ -475,6 +500,35 @@ fn parse_search_entry(line: &str) -> serde_json::Result<Option<ParsedSearchEntry
             }
         }),
     )
+}
+
+/// Format seconds-since-upload as "x hours/days/weeks/months/years ago".
+/// yt-dlp's approximate_date is day-granular, so sub-day ages read "1 hour ago" at minimum.
+fn format_relative_age(age_seconds: i64) -> String {
+    let hours = (age_seconds / 3600).max(1);
+    let days = age_seconds / 86_400;
+    let (count, unit) = if days >= 365 {
+        (days / 365, "year")
+    } else if days >= 30 {
+        (days / 30, "month")
+    } else if days >= 7 {
+        (days / 7, "week")
+    } else if days >= 1 {
+        (days, "day")
+    } else {
+        (hours, "hour")
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural} ago")
+}
+
+/// "20260730" -> "2026-07-30". yt-dlp's approximate date has no real time of
+/// day (always midnight UTC), so only the date is shown.
+fn format_upload_date(raw: &str) -> Option<String> {
+    if raw.len() != 8 || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("{}-{}-{}", &raw[..4], &raw[4..6], &raw[6..8]))
 }
 
 fn format_view_count(count: u64) -> String {
@@ -747,6 +801,18 @@ mod tests {
 
     #[test]
     fn view_counts_are_compact_and_readable() {
+        assert_eq!(
+            format_upload_date("20260730"),
+            Some("2026-07-30".to_string())
+        );
+        assert_eq!(format_upload_date("garbage!"), None);
+        assert_eq!(format_relative_age(0), "1 hour ago");
+        assert_eq!(format_relative_age(3 * 3600), "3 hours ago");
+        assert_eq!(format_relative_age(86_400), "1 day ago");
+        assert_eq!(format_relative_age(6 * 86_400), "6 days ago");
+        assert_eq!(format_relative_age(14 * 86_400), "2 weeks ago");
+        assert_eq!(format_relative_age(60 * 86_400), "2 months ago");
+        assert_eq!(format_relative_age(800 * 86_400), "2 years ago");
         assert_eq!(format_view_count(999), "999 views");
         assert_eq!(format_view_count(1_000), "1K views");
         assert_eq!(format_view_count(1_250), "1.3K views");

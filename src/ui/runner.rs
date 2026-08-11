@@ -674,6 +674,7 @@ mod tests {
             duration: "1:00".to_string(),
             channel: "Channel".to_string(),
             views: "1".to_string(),
+            published: String::new(),
         }
     }
 
