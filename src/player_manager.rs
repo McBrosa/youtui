@@ -147,6 +147,25 @@ impl PlayerManager {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_stream(stream: std::os::unix::net::UnixStream) -> Self {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        Self {
+            process: Command::new("sleep").arg("5").spawn().unwrap(),
+            socket_path: socket_dir.path().join("mpv.sock"),
+            _socket_dir: socket_dir,
+            ipc: Some(IpcClient::from_stream(stream).unwrap()),
+            options: PlaybackOptions::from(&config),
+            status: PlaybackStatus {
+                playing: true,
+                ..PlaybackStatus::default()
+            },
+            current_video_id: Some("video-id".to_string()),
+            current_playlist_entry_id: Some(1),
+        }
+    }
+
     pub fn connect(&mut self) -> Result<()> {
         let start = Instant::now();
 
@@ -275,6 +294,17 @@ impl PlayerManager {
         self.reconnect_for_active_track()?;
         if let Some(ipc) = self.ipc.as_mut() {
             ipc.send_command(&["seek", &seconds.to_string(), "relative"])?;
+        }
+        Ok(())
+    }
+
+    pub fn seek_absolute(&mut self, seconds: f64) -> Result<()> {
+        if !seconds.is_finite() {
+            bail!("Seek position must be a finite number");
+        }
+        self.reconnect_for_active_track()?;
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.send_command(&["seek", &seconds.to_string(), "absolute"])?;
         }
         Ok(())
     }
@@ -418,6 +448,32 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn absolute_seek_sends_absolute_ipc_command() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(
+                &server_stream,
+                "{}",
+                json!({
+                    "request_id": request["request_id"],
+                    "error": "success",
+                })
+            )
+            .unwrap();
+            request["command"].clone()
+        });
+        let mut manager = PlayerManager::from_test_stream(client_stream);
+
+        manager.seek_absolute(83.5).unwrap();
+
+        assert_eq!(server.join().unwrap(), json!(["seek", "83.5", "absolute"]));
     }
 
     #[test]

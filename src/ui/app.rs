@@ -20,6 +20,8 @@ pub enum FocusedPanel {
 pub enum SettingsField {
     DownloadDir,
     ResultsPerPage,
+    SeekStep,
+    SeekStepLarge,
     CustomFormat,
 }
 
@@ -51,6 +53,7 @@ pub struct App {
     pub input_mode: InputMode,
     pub search_input: String,
     pub number_input: String,
+    pub timestamp_input: Option<String>,
     pub pending_action: AppAction,
     pub should_quit: bool,
     pub player_manager: Option<PlayerManager>,
@@ -86,6 +89,7 @@ impl App {
             input_mode: InputMode::Browse,
             search_input: String::new(),
             number_input: String::new(),
+            timestamp_input: None,
             pending_action: AppAction::None,
             should_quit: false,
             player_manager: None,

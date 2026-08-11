@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::config::clamp_results_per_page;
+use crate::config::{clamp_results_per_page, clamp_seek_step};
 use crate::player_manager::PlayerManager;
 use crate::ui::app::{App, AppAction, FocusedPanel, InputMode, SearchPhase, SettingsField};
 
@@ -30,7 +30,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
     }
 
     // Global Tab key for focus cycling (works in any mode except Help).
-    if app.input_mode != InputMode::Help {
+    if app.input_mode != InputMode::Help && app.timestamp_input.is_none() {
         match key.code {
             KeyCode::BackTab => {
                 cycle_focus_backward(app);
@@ -74,6 +74,11 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
     // If settings are open, handle settings navigation (including editing)
     if app.settings_open {
         handle_settings_keys(app, key);
+        return;
+    }
+
+    if app.timestamp_input.is_some() {
+        handle_timestamp_keys(app, key);
         return;
     }
 
@@ -137,6 +142,39 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
                     return;
                 }
             }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let seconds = -(app.config.seek_step_large as f64);
+                if run_player_command(app, |player| player.seek(seconds)) {
+                    return;
+                }
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let seconds = app.config.seek_step_large as f64;
+                if run_player_command(app, |player| player.seek(seconds)) {
+                    return;
+                }
+            }
+            KeyCode::Left => {
+                let seconds = -(app.config.seek_step as f64);
+                if run_player_command(app, |player| player.seek(seconds)) {
+                    return;
+                }
+            }
+            KeyCode::Right => {
+                let seconds = app.config.seek_step as f64;
+                if run_player_command(app, |player| player.seek(seconds)) {
+                    return;
+                }
+            }
+            KeyCode::Char('t')
+                if app
+                    .player_manager
+                    .as_ref()
+                    .is_some_and(|player| player.current_video_id.is_some()) =>
+            {
+                app.timestamp_input = Some(String::new());
+                return;
+            }
             KeyCode::Char('=') | KeyCode::Char('+') => {
                 if run_player_command(app, |player| {
                     player.set_volume((player.status.volume + 5).min(100))
@@ -168,6 +206,71 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
         FocusedPanel::Results => handle_results_keys(app, key),
         FocusedPanel::Queue => handle_queue_keys(app, key),
     }
+}
+
+fn handle_timestamp_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) if c.is_ascii_digit() || c == ':' => {
+            if let Some(input) = app.timestamp_input.as_mut()
+                && input.len() < 8
+            {
+                input.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(input) = app.timestamp_input.as_mut() {
+                input.pop();
+            }
+        }
+        KeyCode::Enter => {
+            let seconds = app.timestamp_input.as_deref().and_then(parse_timestamp);
+            let Some(mut seconds) = seconds else {
+                app.status_message = Some("Invalid timestamp".to_string());
+                return;
+            };
+
+            if let Some(player) = app.player_manager.as_ref()
+                && player.status.duration > 0.0
+            {
+                seconds = seconds.clamp(0.0, player.status.duration);
+            }
+            if run_player_command(app, |player| player.seek_absolute(seconds)) {
+                app.timestamp_input = None;
+            }
+        }
+        KeyCode::Esc => app.timestamp_input = None,
+        _ => {}
+    }
+}
+
+fn parse_timestamp(input: &str) -> Option<f64> {
+    let segments: Vec<&str> = input.split(':').collect();
+    if !(1..=3).contains(&segments.len())
+        || segments
+            .iter()
+            .any(|segment| segment.is_empty() || !segment.chars().all(|c| c.is_ascii_digit()))
+        || segments
+            .iter()
+            .skip(1)
+            .any(|segment| segment.len() > 2 || segment.parse::<u64>().ok().is_none_or(|n| n >= 60))
+    {
+        return None;
+    }
+
+    let values: Vec<u64> = segments
+        .iter()
+        .map(|segment| segment.parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    let seconds = match values.as_slice() {
+        [seconds] => *seconds,
+        [minutes, seconds] => minutes.checked_mul(60)?.checked_add(*seconds)?,
+        [hours, minutes, seconds] => hours
+            .checked_mul(3600)?
+            .checked_add(minutes.checked_mul(60)?)?
+            .checked_add(*seconds)?,
+        _ => return None,
+    };
+    Some(seconds as f64)
 }
 
 fn run_player_command(
@@ -461,8 +564,12 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
             (KeyCode::Char(c), modifiers)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                let accepts_character =
-                    field != SettingsField::ResultsPerPage || c.is_ascii_digit();
+                let accepts_character = !matches!(
+                    field,
+                    SettingsField::ResultsPerPage
+                        | SettingsField::SeekStep
+                        | SettingsField::SeekStepLarge
+                ) || c.is_ascii_digit();
                 if accepts_character
                     && let Some(input) = app.settings_text_input.as_mut()
                     && input.len() < 4096
@@ -484,7 +591,7 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
     }
 
     // Define selectable indices (skip section headers)
-    const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 6, 10, 11, 15, 19];
+    const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 6, 7, 8, 12, 13, 17, 21];
 
     match key.code {
         KeyCode::Esc => {
@@ -542,22 +649,30 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
                     let result = app.config.toggle_auto_play_queue();
                     record_settings_save_result(app, result);
                 }
-                10 => {
+                7 => {
+                    app.settings_editing = Some(SettingsField::SeekStep);
+                    app.settings_text_input = Some(app.config.seek_step.to_string());
+                }
+                8 => {
+                    app.settings_editing = Some(SettingsField::SeekStepLarge);
+                    app.settings_text_input = Some(app.config.seek_step_large.to_string());
+                }
+                12 => {
                     // Download Mode checkbox
                     let result = app.config.toggle_download_mode();
                     record_settings_save_result(app, result);
                 }
-                11 => {
+                13 => {
                     // Download Dir text field - enter edit mode
                     app.settings_editing = Some(SettingsField::DownloadDir);
                     app.settings_text_input = Some(app.config.download_dir.clone());
                 }
-                15 => {
+                17 => {
                     // Results Per Page text field - enter edit mode
                     app.settings_editing = Some(SettingsField::ResultsPerPage);
                     app.settings_text_input = Some(app.config.results_per_page.to_string());
                 }
-                19 => {
+                21 => {
                     // Custom Format text field - enter edit mode
                     app.settings_editing = Some(SettingsField::CustomFormat);
                     app.settings_text_input = Some(app.config.custom_format.clone());
@@ -592,6 +707,14 @@ fn finish_settings_edit(app: &mut App, field: SettingsField) {
                 .unwrap_or(app.config.results_per_page);
             app.config.results_per_page = clamp_results_per_page(value);
         }
+        SettingsField::SeekStep => {
+            let value = input.parse::<u64>().unwrap_or(app.config.seek_step);
+            app.config.seek_step = clamp_seek_step(value);
+        }
+        SettingsField::SeekStepLarge => {
+            let value = input.parse::<u64>().unwrap_or(app.config.seek_step_large);
+            app.config.seek_step_large = clamp_seek_step(value);
+        }
         SettingsField::CustomFormat => app.config.custom_format = input,
     }
 
@@ -605,7 +728,37 @@ fn finish_settings_edit(app: &mut App, field: SettingsField) {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::player_manager::PlayerManager;
     use crate::search::SearchResult;
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::thread::{self, JoinHandle};
+
+    fn app_with_command_capture(config: Config, duration: f64) -> (App, JoinHandle<Value>) {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(
+                &server_stream,
+                "{}",
+                json!({
+                    "request_id": request["request_id"],
+                    "error": "success",
+                })
+            )
+            .unwrap();
+            request["command"].clone()
+        });
+        let mut app = App::new("test".to_string(), 10, config);
+        let mut player = PlayerManager::from_test_stream(client_stream);
+        player.status.duration = duration;
+        app.player_manager = Some(player);
+        (app, server)
+    }
 
     fn create_test_results(count: usize) -> Vec<SearchResult> {
         (0..count)
@@ -618,6 +771,134 @@ mod tests {
                 id: format!("id{}", i + 1),
             })
             .collect()
+    }
+
+    #[test]
+    fn parses_supported_timestamps() {
+        assert_eq!(parse_timestamp("90"), Some(90.0));
+        assert_eq!(parse_timestamp("12:34"), Some(754.0));
+        assert_eq!(parse_timestamp("1:02:03"), Some(3723.0));
+    }
+
+    #[test]
+    fn rejects_invalid_timestamps() {
+        for input in ["", "1:99", ":30", "1:2:3:4", "ab", "12:"] {
+            assert_eq!(parse_timestamp(input), None, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn arrow_keys_dispatch_configured_relative_seeks() {
+        let cases = [
+            (KeyCode::Left, KeyModifiers::NONE, -7.0_f64),
+            (KeyCode::Right, KeyModifiers::NONE, 7.0),
+            (KeyCode::Left, KeyModifiers::SHIFT, -75.0),
+            (KeyCode::Right, KeyModifiers::SHIFT, 75.0),
+        ];
+
+        for (code, modifiers, expected) in cases {
+            let config = Config {
+                seek_step: 7,
+                seek_step_large: 75,
+                ..Config::default()
+            };
+            let (mut app, server) = app_with_command_capture(config, 0.0);
+
+            handle_key_event(&mut app, KeyEvent::new(code, modifiers));
+
+            assert_eq!(
+                server.join().unwrap(),
+                json!(["seek", expected.to_string(), "relative"])
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_prompt_opens_only_for_an_active_player() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Char('t')));
+        assert!(app.timestamp_input.is_none());
+
+        let (client_stream, _server_stream) = UnixStream::pair().unwrap();
+        let mut inactive_player = PlayerManager::from_test_stream(client_stream);
+        inactive_player.current_video_id = None;
+        app.player_manager = Some(inactive_player);
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Char('t')));
+        assert!(app.timestamp_input.is_none());
+
+        app.player_manager.as_mut().unwrap().current_video_id = Some("video-id".to_string());
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Char('t')));
+        assert_eq!(app.timestamp_input.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn timestamp_prompt_handles_text_backspace_invalid_input_and_escape() {
+        let (client_stream, _server_stream) = UnixStream::pair().unwrap();
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.player_manager = Some(PlayerManager::from_test_stream(client_stream));
+        app.timestamp_input = Some(String::new());
+
+        for c in "123456789".chars() {
+            handle_key_event(&mut app, KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(app.timestamp_input.as_deref(), Some("12345678"));
+        app.timestamp_input = Some(String::new());
+
+        for c in "12:3x".chars() {
+            handle_key_event(&mut app, KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(app.timestamp_input.as_deref(), Some("12:3"));
+
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.timestamp_input.as_deref(), Some("12:"));
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.status_message.as_deref(), Some("Invalid timestamp"));
+        assert_eq!(app.timestamp_input.as_deref(), Some("12:"));
+
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.timestamp_input.is_none());
+    }
+
+    #[test]
+    fn timestamp_enter_seeks_absolute_and_clamps_to_duration() {
+        let (mut app, server) = app_with_command_capture(Config::default(), 100.0);
+        app.timestamp_input = Some("2:30".to_string());
+
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        assert!(app.timestamp_input.is_none());
+        assert_eq!(server.join().unwrap(), json!(["seek", "100", "absolute"]));
+    }
+
+    #[test]
+    fn digits_still_select_results_when_timestamp_prompt_is_closed() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.results = create_test_results(10);
+        app.total_results = 10;
+        app.focused_panel = FocusedPanel::Results;
+
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Char('3')));
+
+        assert_eq!(app.number_input, "3");
+    }
+
+    #[test]
+    fn settings_seek_steps_accept_only_digits_and_clamp_on_commit() {
+        let mut app = App::new("test".to_string(), 10, Config::default());
+        app.settings_open = true;
+        app.settings_editing = Some(SettingsField::SeekStep);
+        app.settings_text_input = Some(String::new());
+
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Char('x')));
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Char('0')));
+        assert_eq!(app.settings_text_input.as_deref(), Some("0"));
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.config.seek_step, 1);
+
+        app.settings_editing = Some(SettingsField::SeekStepLarge);
+        app.settings_text_input = Some("9999".to_string());
+        handle_key_event(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.config.seek_step_large, 3600);
     }
 
     #[test]
@@ -1088,7 +1369,7 @@ mod tests {
     fn test_settings_enter_edit_mode() {
         let mut app = App::new("test query".to_string(), 10, Config::default());
         app.settings_open = true;
-        app.settings_selected_index = 11; // Download Dir (index 10 is Download Mode checkbox)
+        app.settings_selected_index = 13; // Download Dir (index 12 is Download Mode checkbox)
 
         let key = KeyEvent::from(KeyCode::Enter);
         handle_browse_keys(&mut app, key);
@@ -1128,13 +1409,13 @@ mod tests {
         handle_browse_keys(&mut app, key);
         assert!(app.config.bandwidth_limit);
 
-        // Navigate to download dir (index 11)
-        // From index 3: 3→4→5→6→10→11 (5 down presses; index 10 is Download Mode checkbox)
-        for _ in 0..5 {
+        // Navigate to download dir (index 13)
+        // From index 3: 4→5→6→7→8→12→13 (7 down presses; index 12 is Download Mode checkbox)
+        for _ in 0..7 {
             let key = KeyEvent::from(KeyCode::Down);
             handle_browse_keys(&mut app, key);
         }
-        assert_eq!(app.settings_selected_index, 11);
+        assert_eq!(app.settings_selected_index, 13);
 
         // Enter edit mode
         let key = KeyEvent::from(KeyCode::Enter);

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::ui::app::{App, FocusedPanel, InputMode, SearchPhase, SettingsField};
 use ratatui::{
     Frame,
@@ -540,6 +542,28 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
             chunks[0],
         );
 
+        if let Some(input) = app.timestamp_input.as_deref() {
+            let prompt = Line::from(vec![
+                Span::styled(
+                    " Jump to: ",
+                    Style::default().fg(Color::Gray).bg(Color::Black),
+                ),
+                Span::styled(
+                    input,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▌", Style::default().fg(Color::Yellow).bg(Color::Black)),
+            ]);
+            f.render_widget(
+                Paragraph::new(prompt).style(Style::default().bg(Color::Black)),
+                chunks[1],
+            );
+            return;
+        }
+
         // Line 2: progress bar + time + volume
         let elapsed = format_duration(status.time_pos.max(0.0) as u64);
         let duration = format_duration(status.duration.max(0.0) as u64);
@@ -803,6 +827,15 @@ fn render_help_overlay(f: &mut Frame, app: &App) {
             )),
             help_row("    Space       ", "Play / Pause"),
             help_row("    < / >       ", "Seek -/+ 10 seconds"),
+            help_row(
+                "    ← / →       ",
+                format!("Seek ±{}s", app.config.seek_step),
+            ),
+            help_row(
+                "    Shift+←/→   ",
+                format!("Seek ±{}s", app.config.seek_step_large),
+            ),
+            help_row("    t           ", "Jump to timestamp"),
             help_row("    + / -       ", "Volume up / down"),
             help_row("    m           ", "Mute toggle"),
             Line::from(""),
@@ -887,7 +920,7 @@ fn compact_help_text(panel: FocusedPanel) -> Vec<Line<'static>> {
     lines
 }
 
-fn help_row(key: &'static str, desc: &'static str) -> Line<'static> {
+fn help_row(key: &'static str, desc: impl Into<Cow<'static, str>>) -> Line<'static> {
     Line::from(vec![
         Span::styled(key, Style::default().fg(Color::Cyan)),
         Span::styled(desc, Style::default().fg(Color::White)),
@@ -924,7 +957,7 @@ fn format_duration(seconds: u64) -> String {
 }
 
 fn render_settings_modal(f: &mut Frame, app: &App) {
-    let area = popup_rect(76, 25, f.area());
+    let area = popup_rect(76, 27, f.area());
     f.render_widget(Clear, area);
 
     let items = settings_items(app);
@@ -981,6 +1014,8 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
     let editing = &app.settings_editing;
     let buffered_value = app.settings_text_input.as_deref();
     let results_per_page = app.config.results_per_page.to_string();
+    let seek_step = app.config.seek_step.to_string();
+    let seek_step_large = app.config.seek_step_large.to_string();
     let download_dir = if editing == &Some(SettingsField::DownloadDir) {
         buffered_value.unwrap_or(&app.config.download_dir)
     } else {
@@ -995,6 +1030,16 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
         buffered_value.unwrap_or(&app.config.custom_format)
     } else {
         &app.config.custom_format
+    };
+    let seek_step = if editing == &Some(SettingsField::SeekStep) {
+        buffered_value.unwrap_or(&seek_step)
+    } else {
+        &seek_step
+    };
+    let seek_step_large = if editing == &Some(SettingsField::SeekStepLarge) {
+        buffered_value.unwrap_or(&seek_step_large)
+    } else {
+        &seek_step_large
     };
 
     vec![
@@ -1015,17 +1060,33 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
             selected,
         ),
         checkbox_item(6, "Auto Play Queue", app.config.auto_play_queue, selected),
+        text_field_item(
+            7,
+            "Seek step (s)",
+            seek_step,
+            selected,
+            editing,
+            SettingsField::SeekStep,
+        ),
+        text_field_item(
+            8,
+            "Large seek step (s)",
+            seek_step_large,
+            selected,
+            editing,
+            SettingsField::SeekStepLarge,
+        ),
         ListItem::new(""),
         section_header("  Downloads"),
         section_rule(),
         checkbox_item(
-            10,
+            12,
             "Download Mode (save permanently)",
             app.config.download_mode,
             selected,
         ),
         text_field_item(
-            11,
+            13,
             "Download Directory",
             download_dir,
             selected,
@@ -1036,7 +1097,7 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
         section_header("  Display"),
         section_rule(),
         text_field_item(
-            15,
+            17,
             "Results Per Page",
             results_per_page,
             selected,
@@ -1047,7 +1108,7 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
         section_header("  Advanced"),
         section_rule(),
         text_field_item(
-            19,
+            21,
             "Custom Format",
             custom_format,
             selected,
@@ -1231,7 +1292,7 @@ mod tests {
 
         app.input_mode = InputMode::Browse;
         app.settings_open = true;
-        app.settings_selected_index = 19;
+        app.settings_selected_index = 21;
         terminal.draw(|frame| render_ui(frame, &app)).unwrap();
     }
 

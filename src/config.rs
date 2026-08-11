@@ -10,9 +10,15 @@ pub(crate) const MIN_RESULTS_PER_PAGE: usize = 1;
 // YouTube searches are intentionally capped at 500 entries. Keeping a page at
 // or below that ceiling avoids configurations that can never be filled.
 pub(crate) const MAX_RESULTS_PER_PAGE: usize = 500;
+pub(crate) const MIN_SEEK_STEP: u64 = 1;
+pub(crate) const MAX_SEEK_STEP: u64 = 3600;
 
 pub(crate) fn clamp_results_per_page(value: usize) -> usize {
     value.clamp(MIN_RESULTS_PER_PAGE, MAX_RESULTS_PER_PAGE)
+}
+
+pub(crate) fn clamp_seek_step(value: u64) -> u64 {
+    value.clamp(MIN_SEEK_STEP, MAX_SEEK_STEP)
 }
 
 fn default_auto_play_queue() -> bool {
@@ -32,6 +38,8 @@ pub struct Config {
     pub download_mode: bool,
     pub download_dir: String,
     pub results_per_page: usize,
+    pub seek_step: u64,
+    pub seek_step_large: u64,
     pub custom_format: String,
     #[serde(default = "default_auto_play_queue")]
     pub auto_play_queue: bool,
@@ -42,18 +50,21 @@ impl Config {
         let config_path = Self::config_path()?;
 
         if config_path.exists() {
-            let contents =
-                fs::read_to_string(&config_path).context("Failed to read config file")?;
-            let mut config: Config =
-                toml::from_str(&contents).context("Failed to parse config file")?;
-            config.normalize();
-            config.player = PlayerType::Mpv; // Placeholder, set in main
-            Ok(config)
+            Self::load_from_path(&config_path)
         } else {
             let config = Self::default();
             config.save()?;
             Ok(config)
         }
+    }
+
+    fn load_from_path(config_path: &std::path::Path) -> Result<Self> {
+        let contents = fs::read_to_string(config_path).context("Failed to read config file")?;
+        let mut config: Config =
+            toml::from_str(&contents).context("Failed to parse config file")?;
+        config.normalize();
+        config.player = PlayerType::Mpv; // Placeholder, set in main
+        Ok(config)
     }
 
     #[cfg(not(test))]
@@ -142,6 +153,8 @@ impl Config {
 
     fn normalize(&mut self) {
         self.results_per_page = clamp_results_per_page(self.results_per_page);
+        self.seek_step = clamp_seek_step(self.seek_step);
+        self.seek_step_large = clamp_seek_step(self.seek_step_large);
 
         if self.download_dir.trim().is_empty() {
             self.download_dir = Self::default().download_dir;
@@ -164,6 +177,8 @@ impl Default for Config {
                 .to_string_lossy()
                 .to_string(),
             results_per_page: 20,
+            seek_step: 5,
+            seek_step_large: 60,
             custom_format: String::new(),
             auto_play_queue: true,
         }
@@ -190,6 +205,8 @@ mod tests {
         assert!(!config.audio_only);
         assert!(!config.bandwidth_limit);
         assert_eq!(config.results_per_page, 20);
+        assert_eq!(config.seek_step, 5);
+        assert_eq!(config.seek_step_large, 60);
         assert!(config.download_dir.ends_with("Downloads"));
         assert!(config.custom_format.is_empty());
     }
@@ -200,6 +217,8 @@ mod tests {
 
         assert!(config.audio_only);
         assert_eq!(config.results_per_page, 20);
+        assert_eq!(config.seek_step, 5);
+        assert_eq!(config.seek_step_large, 60);
         assert!(config.auto_play_queue);
         assert!(!config.download_dir.is_empty());
     }
@@ -240,6 +259,52 @@ mod tests {
         config.save_to_path(&path).unwrap();
         let second: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(second.results_per_page, MAX_RESULTS_PER_PAGE);
+    }
+
+    #[test]
+    fn seek_steps_round_trip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let config = Config {
+            seek_step: 15,
+            seek_step_large: 120,
+            ..Config::default()
+        };
+
+        config.save_to_path(&path).unwrap();
+        let saved = Config::load_from_path(&path).unwrap();
+
+        assert_eq!(saved.seek_step, 15);
+        assert_eq!(saved.seek_step_large, 120);
+    }
+
+    #[test]
+    fn seek_steps_are_clamped_when_saved() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let config = Config {
+            seek_step: 0,
+            seek_step_large: u64::MAX,
+            ..Config::default()
+        };
+
+        config.save_to_path(&path).unwrap();
+        let saved: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(saved.seek_step, MIN_SEEK_STEP);
+        assert_eq!(saved.seek_step_large, MAX_SEEK_STEP);
+    }
+
+    #[test]
+    fn seek_steps_are_clamped_when_loaded() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        fs::write(&path, "seek_step = 0\nseek_step_large = 3601\n").unwrap();
+
+        let config = Config::load_from_path(&path).unwrap();
+
+        assert_eq!(config.seek_step, MIN_SEEK_STEP);
+        assert_eq!(config.seek_step_large, MAX_SEEK_STEP);
     }
 
     #[test]
