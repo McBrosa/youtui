@@ -25,6 +25,36 @@ fn default_auto_play_queue() -> bool {
     true
 }
 
+/// How the terminal video view draws frames. `Auto` picks `Pixels` when the
+/// terminal supports a graphics protocol (Kitty/iTerm2/Sixel), otherwise
+/// falls back to half-block cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoRenderMode {
+    #[default]
+    Auto,
+    Pixels,
+    Blocks,
+}
+
+impl VideoRenderMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::Pixels,
+            Self::Pixels => Self::Blocks,
+            Self::Blocks => Self::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Pixels => "pixels",
+            Self::Blocks => "blocks",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -43,6 +73,8 @@ pub struct Config {
     pub custom_format: String,
     #[serde(default = "default_auto_play_queue")]
     pub auto_play_queue: bool,
+    #[serde(default)]
+    pub video_render: VideoRenderMode,
 }
 
 impl Config {
@@ -143,6 +175,11 @@ impl Config {
         self.save()
     }
 
+    pub fn cycle_video_render(&mut self) -> Result<()> {
+        self.video_render = self.video_render.cycle();
+        self.save()
+    }
+
     pub fn format(&self) -> String {
         if !self.custom_format.is_empty() {
             self.custom_format.clone()
@@ -181,6 +218,7 @@ impl Default for Config {
             seek_step_large: 60,
             custom_format: String::new(),
             auto_play_queue: true,
+            video_render: VideoRenderMode::Auto,
         }
     }
 }
@@ -305,6 +343,19 @@ mod tests {
 
         assert_eq!(config.seek_step, MIN_SEEK_STEP);
         assert_eq!(config.seek_step_large, MAX_SEEK_STEP);
+    }
+
+    #[test]
+    fn video_render_mode_cycles_and_round_trips() {
+        assert_eq!(VideoRenderMode::Auto.cycle(), VideoRenderMode::Pixels);
+        assert_eq!(VideoRenderMode::Pixels.cycle(), VideoRenderMode::Blocks);
+        assert_eq!(VideoRenderMode::Blocks.cycle(), VideoRenderMode::Auto);
+
+        let config: Config = toml::from_str("video_render = \"blocks\"").unwrap();
+        assert_eq!(config.video_render, VideoRenderMode::Blocks);
+        // Older configs without the field default to auto.
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.video_render, VideoRenderMode::Auto);
     }
 
     #[test]

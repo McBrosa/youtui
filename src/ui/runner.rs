@@ -19,8 +19,6 @@ use crate::ui::app::{AppAction, SearchPhase};
 use crate::ui::{App, handle_key_event, layout::render_ui, terminal::Tui};
 
 const TICK_RATE: Duration = Duration::from_millis(250);
-/// Tick while the video view is active: ~12fps to match the frame pipeline.
-const VIDEO_TICK_RATE: Duration = Duration::from_millis(83);
 const SEARCH_POLL_RATE: Duration = Duration::from_millis(50);
 const SEARCH_CACHE_CAPACITY: usize = 8;
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -209,9 +207,9 @@ pub fn run_app(
         }
 
         // The video view repaints on the tick, so 250ms would cap it at 4fps;
-        // tighten the tick to keep frame delivery close to the 12fps pipeline.
+        // tighten the tick to keep frame delivery close to the pipeline rate.
         let tick_rate = if app.video_view {
-            VIDEO_TICK_RATE
+            app.video.tick_rate()
         } else {
             TICK_RATE
         };
@@ -667,8 +665,15 @@ fn sync_video(app: &mut App, (width, height): (u16, u16)) {
     };
     let has_player = app.player_manager.is_some();
     let (cols, rows) = crate::ui::layout::video_pane_size(has_player, width, height);
-    app.video
-        .sync(playing, paused, video_id.as_deref(), time_pos, cols, rows);
+    app.video.sync(
+        playing,
+        paused,
+        video_id.as_deref(),
+        time_pos,
+        cols,
+        rows,
+        app.config.video_render,
+    );
 }
 
 fn sync_runtime_settings(

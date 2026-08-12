@@ -12,6 +12,30 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use image::{DynamicImage, RgbImage};
+use ratatui::layout::Size;
+use ratatui_image::Resize;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::Protocol;
+
+use crate::config::VideoRenderMode;
+use crate::kitty_shm::{ShmKittyTransport, shm_supported};
+
+/// Decode-size ceiling for the pixel renderer. Panes larger than this are
+/// upscaled by the terminal-side image resize instead of pushing more raw
+/// RGB through the ffmpeg pipe and graphics protocol.
+/// ponytail: fixed 720p ceiling; make it configurable if 4K terminals care.
+const MAX_PIXEL_WIDTH: u32 = 1280;
+const MAX_PIXEL_HEIGHT: u32 = 720;
+
+/// Pipeline frame rate over the pty (base64 `t=d` and half-block paths):
+/// full frame data flows through the terminal parser, so stay conservative.
+pub const PTY_FPS: f64 = 24.0;
+/// Pipeline frame rate with the kitty shared-memory transport: only ~100
+/// escape bytes per frame cross the pty, so the ceiling is ffmpeg + memcpy.
+/// ponytail: fixed rate duplicates frames for <60fps sources; probe source
+/// fps via yt-dlp if that overhead ever matters.
+pub const SHM_FPS: f64 = 60.0;
 
 /// One decoded RGB24 frame, `width` columns by `height_px` pixel rows (twice
 /// the terminal row count, since each cell renders two stacked pixels).
@@ -21,11 +45,79 @@ pub struct Frame {
     pub rgb: Vec<u8>,
 }
 
+/// Pure function: the pixel size ffmpeg should decode to for a pane of
+/// `cols` x `rows` cells. Half-block cells pack 2 pixels per cell; the pixel
+/// renderer uses the terminal's font size, capped at 720p so huge panes
+/// don't balloon the raw RGB pipe (the image resize upscales the rest).
+pub fn decode_size(cols: u16, rows: u16, font_size: Option<(u16, u16)>) -> (u16, u16) {
+    let Some((font_w, font_h)) = font_size else {
+        return (cols, rows.saturating_mul(2));
+    };
+    let w = cols as u32 * font_w as u32;
+    let h = rows as u32 * font_h as u32;
+    if w <= MAX_PIXEL_WIDTH && h <= MAX_PIXEL_HEIGHT {
+        return (w as u16, h as u16);
+    }
+    let scale = (MAX_PIXEL_WIDTH as f64 / w as f64).min(MAX_PIXEL_HEIGHT as f64 / h as f64);
+    ((w as f64 * scale) as u16, (h as f64 * scale) as u16)
+}
+
+/// Detect terminal graphics support without touching stdin. The protocol is
+/// guessed from environment variables and the cell pixel size read via
+/// `TIOCGWINSZ`; `ratatui-image`'s stdio query would be more thorough, but
+/// its response-reader thread races the TUI's own input loop for keystrokes.
+/// `None` means half-block rendering only.
+/// ponytail: env guess misses sixel-only terminals; they get blocks.
+pub fn detect_picker() -> Option<Picker> {
+    let protocol = protocol_from_env(
+        &std::env::var("TERM").unwrap_or_default(),
+        &std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        std::env::var_os("KITTY_WINDOW_ID").is_some(),
+    )?;
+    let font_size = font_size_from_winsize()?;
+    // from_fontsize is deprecated in favor of the stdio query, which is
+    // exactly what this function exists to avoid.
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(font_size.into());
+    picker.set_protocol_type(protocol);
+    Some(picker)
+}
+
+/// Pure function: which graphics protocol the environment advertises.
+fn protocol_from_env(term: &str, term_program: &str, kitty_window: bool) -> Option<ProtocolType> {
+    if kitty_window || term.contains("kitty") || term.contains("ghostty") {
+        return Some(ProtocolType::Kitty);
+    }
+    if matches!(term_program, "iTerm.app" | "WezTerm" | "mintty" | "vscode") {
+        return Some(ProtocolType::Iterm2);
+    }
+    None
+}
+
+/// Cell pixel size from the tty, or `None` when the terminal doesn't report
+/// pixel dimensions (then pixel rendering can't be sized and blocks are used).
+fn font_size_from_winsize() -> Option<(u16, u16)> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCGWINSZ only writes into the winsize struct provided.
+    let result = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
+    if result != 0 || size.ws_col == 0 || size.ws_row == 0 {
+        return None;
+    }
+    let font_w = size.ws_xpixel / size.ws_col;
+    let font_h = size.ws_ypixel / size.ws_row;
+    (font_w > 0 && font_h > 0).then_some((font_w, font_h))
+}
+
 /// Pure function: the ffmpeg argv used to decode `url` starting at `position`
-/// seconds, scaled to `w_px` x `h_px` pixels, at 12 fps, as raw RGB24 on
+/// seconds, scaled to `w_px` x `h_px` pixels, at `fps`, as raw RGB24 on
 /// stdout. Kept separate from `VideoSession::start` so it is testable without
 /// spawning a process.
-pub fn ffmpeg_args(url: &str, position: f64, w_px: u16, h_px: u16) -> Vec<String> {
+pub fn ffmpeg_args(url: &str, position: f64, w_px: u16, h_px: u16, fps: f64) -> Vec<String> {
     vec![
         // Read the input at its native frame rate. Without this ffmpeg
         // decodes as fast as the network allows and the pipeline races far
@@ -40,9 +132,11 @@ pub fn ffmpeg_args(url: &str, position: f64, w_px: u16, h_px: u16) -> Vec<String
         // black bars to the exact pane size so every frame is the same
         // byte length. Grid pixels are ~square (2 stacked per ~1:2 cell),
         // so no cell-aspect correction is needed.
+        // lanczos: noticeably sharper than the default bicubic at the small
+        // sizes this pipeline scales to.
         format!(
-            "scale={w_px}:{h_px}:force_original_aspect_ratio=decrease,\
-             pad={w_px}:{h_px}:(ow-iw)/2:(oh-ih)/2,fps=12"
+            "scale={w_px}:{h_px}:force_original_aspect_ratio=decrease:flags=lanczos,\
+             pad={w_px}:{h_px}:(ow-iw)/2:(oh-ih)/2,fps={fps}"
         ),
         "-f".to_string(),
         "rawvideo".to_string(),
@@ -70,11 +164,12 @@ pub struct VideoSession {
     latest: Arc<Mutex<Option<Frame>>>,
     /// Frames the reader thread has decoded so far — the pipeline clock.
     /// Counting consumed frames instead would undercount (the UI polls
-    /// slower than 12 fps) and make `expected_position` lag mpv until the
+    /// slower than the pipeline) and make `expected_position` lag mpv until the
     /// drift check killed a perfectly healthy session.
     frames_read: Arc<AtomicU64>,
-    cols: u16,
-    rows: u16,
+    w_px: u16,
+    h_px: u16,
+    fps: f64,
     start_pos: f64,
     started_at: Instant,
     /// Whether `start_pos` has been rebased onto mpv's clock after the first
@@ -91,10 +186,16 @@ pub struct VideoSession {
 
 impl VideoSession {
     /// Spawn ffmpeg at `position` seconds for `stream_url`, scaled to
-    /// `cols` x `rows*2` pixels. Non-blocking; returns Err on spawn failure.
-    pub fn start(stream_url: &str, position: f64, cols: u16, rows: u16) -> Result<VideoSession> {
-        let h_px = rows.saturating_mul(2);
-        let args = ffmpeg_args(stream_url, position, cols, h_px);
+    /// `w_px` x `h_px` pixels at `fps`. Non-blocking; returns Err on spawn
+    /// failure.
+    pub fn start(
+        stream_url: &str,
+        position: f64,
+        w_px: u16,
+        h_px: u16,
+        fps: f64,
+    ) -> Result<VideoSession> {
+        let args = ffmpeg_args(stream_url, position, w_px, h_px, fps);
 
         let mut child = Command::new("ffmpeg")
             .args(&args)
@@ -110,7 +211,7 @@ impl VideoSession {
             .stdout
             .take()
             .context("ffmpeg stdout pipe unavailable")?;
-        let frame_size = cols as usize * h_px as usize * 3;
+        let frame_size = w_px as usize * h_px as usize * 3;
         let latest = Arc::new(Mutex::new(None::<Frame>));
         let frames_read = Arc::new(AtomicU64::new(0));
 
@@ -127,7 +228,7 @@ impl VideoSession {
                             break;
                         }
                         let frame = Frame {
-                            width: cols,
+                            width: w_px,
                             height_px: h_px,
                             rgb: buf,
                         };
@@ -143,8 +244,9 @@ impl VideoSession {
             reader: Some(reader),
             latest,
             frames_read,
-            cols,
-            rows,
+            w_px,
+            h_px,
+            fps,
             start_pos: position,
             started_at: Instant::now(),
             rebased: false,
@@ -164,9 +266,9 @@ impl VideoSession {
         self.frames_read.load(Ordering::Relaxed)
     }
 
-    /// Position ffmpeg is expected to be at: start_pos + frames_read / 12.0
+    /// Position ffmpeg is expected to be at: start_pos + frames_read / fps.
     pub fn expected_position(&self) -> f64 {
-        self.start_pos + self.frames_read() as f64 / 12.0
+        self.start_pos + self.frames_read() as f64 / self.fps
     }
 
     /// Absorb ffmpeg's startup latency (network open + seek): once the first
@@ -174,7 +276,7 @@ impl VideoSession {
     /// pipeline clock started. Without this the constant startup lag reads as
     /// drift and can kill a healthy session on slow connections.
     fn rebase(&mut self, mpv_pos: f64) {
-        self.start_pos = mpv_pos - self.frames_read() as f64 / 12.0;
+        self.start_pos = mpv_pos - self.frames_read() as f64 / self.fps;
     }
 
     /// Has the ffmpeg process exited (crashed, killed, or reached EOF)?
@@ -209,6 +311,8 @@ pub enum VideoDisplay<'a> {
     Error(&'a str),
     Loading,
     Frame(&'a Frame, bool),
+    Pixels(&'a Protocol, bool),
+    Shm(&'a ShmKittyTransport, bool),
     Placeholder,
 }
 
@@ -227,6 +331,15 @@ pub struct VideoState {
     resolving: Option<PendingResolve>,
     current_video_id: Option<String>,
     last_frame: Option<Frame>,
+    /// Last frame encoded for the terminal's graphics protocol (pixel
+    /// renderer). Mutually exclusive with `last_frame`.
+    last_protocol: Option<Protocol>,
+    /// Detected terminal graphics support, set once at startup. `None` means
+    /// the terminal only does half-block cells.
+    picker: Option<Picker>,
+    /// Kitty shared-memory frame transport, present only for local kitty
+    /// terminals. Preferred over `last_protocol` when set.
+    shm: Option<ShmKittyTransport>,
     error: Option<String>,
     paused: bool,
     last_die: Option<Instant>,
@@ -248,12 +361,46 @@ impl VideoState {
             resolving: None,
             current_video_id: None,
             last_frame: None,
+            last_protocol: None,
+            picker: None,
+            shm: None,
             error: None,
             paused: false,
             last_die: None,
             give_up: false,
             retried_after_evict: false,
         }
+    }
+
+    /// Store the terminal graphics capability detected at startup. Only
+    /// called when the terminal supports a real pixel protocol. Local kitty
+    /// terminals additionally get the shared-memory frame transport.
+    pub fn set_picker(&mut self, picker: Picker) {
+        let use_shm = shm_supported(
+            picker.protocol_type() == ProtocolType::Kitty,
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some(),
+            std::env::var_os("TMUX").is_some(),
+        );
+        if use_shm {
+            self.shm = Some(ShmKittyTransport::new());
+        }
+        self.picker = Some(picker);
+    }
+
+    /// Whether the pixel renderer is in effect for the given mode: `Blocks`
+    /// never, `Pixels`/`Auto` whenever the terminal supports it.
+    pub fn pixels_active(&self, mode: VideoRenderMode) -> bool {
+        mode != VideoRenderMode::Blocks && self.picker.is_some()
+    }
+
+    /// Pipeline frame rate for new sessions, by transport.
+    fn fps(&self) -> f64 {
+        if self.shm.is_some() { SHM_FPS } else { PTY_FPS }
+    }
+
+    /// How often the UI should tick while the video view is active.
+    pub fn tick_rate(&self) -> Duration {
+        Duration::from_millis((1000.0 / self.fps()) as u64)
     }
 
     /// Stop any session and discard in-flight resolution work. Called both
@@ -263,6 +410,14 @@ impl VideoState {
         self.session = None;
         self.resolving = None; // a late result is simply never read
         self.last_frame = None;
+        self.last_protocol = None;
+        if self.shm.is_some() {
+            // Fresh transport: drops any pending escapes and clears the
+            // has-frame state. The last transmitted image's data stays in
+            // the terminal until the next session retransmits (and thereby
+            // replaces) the shared image id.
+            self.shm = Some(ShmKittyTransport::new());
+        }
         self.error = None;
         self.current_video_id = None;
         self.paused = false;
@@ -296,10 +451,17 @@ impl VideoState {
         if let Some(error) = &self.error {
             return VideoDisplay::Error(error);
         }
-        let loading =
-            self.resolving.is_some() || (self.session.is_some() && self.last_frame.is_none());
-        if loading {
+        let shm_frame = self.shm.as_ref().is_some_and(ShmKittyTransport::has_frame);
+        let has_output = self.last_frame.is_some() || self.last_protocol.is_some() || shm_frame;
+        if self.resolving.is_some() || (self.session.is_some() && !has_output) {
             return VideoDisplay::Loading;
+        }
+        if shm_frame {
+            let transport = self.shm.as_ref().expect("shm_frame checked");
+            return VideoDisplay::Shm(transport, self.paused);
+        }
+        if let Some(protocol) = &self.last_protocol {
+            return VideoDisplay::Pixels(protocol, self.paused);
         }
         if let Some(frame) = &self.last_frame {
             return VideoDisplay::Frame(frame, self.paused);
@@ -309,6 +471,7 @@ impl VideoState {
 
     /// Drive the pipeline from the latest mpv status. Called once per
     /// status-poll tick while the video view is active.
+    #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &mut self,
         playing: bool,
@@ -317,6 +480,7 @@ impl VideoState {
         time_pos: f64,
         cols: u16,
         rows: u16,
+        mode: VideoRenderMode,
     ) {
         let Some(video_id) = video_id.filter(|_| playing || paused) else {
             self.stop();
@@ -340,17 +504,28 @@ impl VideoState {
             return; // pane not usable yet (e.g. mid-resize)
         }
 
-        self.restart_if_stale(time_pos, cols, rows);
+        let pixels = self.pixels_active(mode);
+        let font_size = pixels.then(|| {
+            let size = self
+                .picker
+                .as_ref()
+                .expect("pixels_active checked")
+                .font_size();
+            (size.width, size.height)
+        });
+        let (w_px, h_px) = decode_size(cols, rows, font_size);
+
+        self.restart_if_stale(time_pos, w_px, h_px);
         self.handle_session_death(video_id);
 
         if self.give_up {
             return;
         }
 
+        if let Some(frame) = self.session.as_mut().and_then(VideoSession::poll_frame) {
+            self.store_frame(frame, pixels, cols, rows);
+        }
         if let Some(session) = self.session.as_mut() {
-            if let Some(frame) = session.poll_frame() {
-                self.last_frame = Some(frame);
-            }
             if !session.rebased && session.frames_read() > 0 {
                 session.rebase(time_pos);
                 session.rebased = true;
@@ -361,16 +536,58 @@ impl VideoState {
         if self.resolving.is_none()
             && let Some(url) = self.cache.get(video_id).cloned()
         {
-            self.start_session(&url, time_pos, cols, rows, true);
+            self.start_session(&url, time_pos, w_px, h_px, true);
             return;
         }
 
-        self.poll_resolve(video_id, time_pos, cols, rows);
+        self.poll_resolve(video_id, time_pos, w_px, h_px);
     }
 
-    fn restart_if_stale(&mut self, time_pos: f64, cols: u16, rows: u16) {
+    /// Store a decoded frame in the form the renderer needs: encoded for the
+    /// terminal's graphics protocol when the pixel renderer is active,
+    /// otherwise raw for the half-block path.
+    fn store_frame(&mut self, frame: Frame, pixels: bool, cols: u16, rows: u16) {
+        if !pixels {
+            self.last_frame = Some(frame);
+            self.last_protocol = None;
+            return;
+        }
+        if let Some(transport) = self.shm.as_mut() {
+            match transport.push_frame(&frame, cols, rows) {
+                Ok(()) => {
+                    self.last_frame = None;
+                    self.last_protocol = None;
+                    return;
+                }
+                Err(_error) => {
+                    // shm turned out not to work here; downgrade to the
+                    // crate's base64 path for the rest of the session.
+                    self.shm = None;
+                }
+            }
+        }
+        let Some(image) = RgbImage::from_raw(frame.width as u32, frame.height_px as u32, frame.rgb)
+        else {
+            return; // impossible: buffer size is derived from these dims
+        };
+        let picker = self.picker.as_ref().expect("pixels_active checked");
+        let size = Size::new(cols, rows);
+        // Scale (not Fit): the decode size is capped at 720p, so panes larger
+        // than that need the image upscaled to fill the cell area.
+        match picker.new_protocol(DynamicImage::ImageRgb8(image), size, Resize::Scale(None)) {
+            Ok(protocol) => {
+                self.last_protocol = Some(protocol);
+                self.last_frame = None;
+            }
+            Err(_) => {
+                // Keep showing the previous frame rather than flickering.
+            }
+        }
+    }
+
+    fn restart_if_stale(&mut self, time_pos: f64, w_px: u16, h_px: u16) {
         let stale = self.session.as_ref().is_some_and(|session| {
-            if session.cols != cols || session.rows != rows {
+            if session.w_px != w_px || session.h_px != h_px {
                 return true;
             }
             // No drift verdict until the first frame arrives — startup
@@ -421,12 +638,12 @@ impl VideoState {
         self.last_die = Some(now);
     }
 
-    fn start_session(&mut self, url: &str, position: f64, cols: u16, rows: u16, from_cache: bool) {
+    fn start_session(&mut self, url: &str, position: f64, w_px: u16, h_px: u16, from_cache: bool) {
         if which::which("ffmpeg").is_err() {
             self.error = Some("video unavailable: ffmpeg not found".to_string());
             return;
         }
-        match VideoSession::start(url, position, cols, rows) {
+        match VideoSession::start(url, position, w_px, h_px, self.fps()) {
             Ok(mut session) => {
                 session.from_cache = from_cache;
                 self.session = Some(session);
@@ -438,7 +655,7 @@ impl VideoState {
         }
     }
 
-    fn poll_resolve(&mut self, video_id: &str, position: f64, cols: u16, rows: u16) {
+    fn poll_resolve(&mut self, video_id: &str, position: f64, w_px: u16, h_px: u16) {
         let needs_new_request = match &self.resolving {
             Some(pending) => pending.video_id != video_id,
             None => true,
@@ -458,7 +675,7 @@ impl VideoState {
             Ok(Ok(url)) => {
                 self.cache.insert(video_id.to_string(), url.clone());
                 self.resolving = None;
-                self.start_session(&url, position, cols, rows, false);
+                self.start_session(&url, position, w_px, h_px, false);
             }
             Ok(Err(_message)) => {
                 self.resolving = None;
@@ -489,7 +706,10 @@ fn resolve_stream_url(watch_url: &str) -> Result<String, String> {
         .args([
             "-g",
             "-f",
-            "bestvideo[height<=144]/best[height<=144]/best",
+            // 480p: enough detail for both renderers (the pixel renderer
+            // caps at 720p pane size, the block renderer downscales), without
+            // pulling a full-quality stream twice alongside mpv's.
+            "bestvideo[height<=480]/best[height<=480]/best",
             watch_url,
         ])
         .output()
@@ -513,7 +733,7 @@ mod tests {
 
     #[test]
     fn ffmpeg_args_builds_the_exact_expected_argv() {
-        let args = ffmpeg_args("https://example.com/stream", 42.5, 80, 48);
+        let args = ffmpeg_args("https://example.com/stream", 42.5, 80, 48, 24.0);
         assert_eq!(
             args,
             vec![
@@ -523,7 +743,7 @@ mod tests {
                 "-i",
                 "https://example.com/stream",
                 "-vf",
-                "scale=80:48:force_original_aspect_ratio=decrease,pad=80:48:(ow-iw)/2:(oh-ih)/2,fps=12",
+                "scale=80:48:force_original_aspect_ratio=decrease:flags=lanczos,pad=80:48:(ow-iw)/2:(oh-ih)/2,fps=24",
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
@@ -533,6 +753,65 @@ mod tests {
                 "-",
             ]
         );
+    }
+
+    #[test]
+    fn protocol_from_env_recognizes_kitty_and_iterm2_terminals() {
+        use ratatui_image::picker::ProtocolType;
+        assert_eq!(
+            protocol_from_env("xterm-ghostty", "", false),
+            Some(ProtocolType::Kitty)
+        );
+        assert_eq!(
+            protocol_from_env("xterm-kitty", "", false),
+            Some(ProtocolType::Kitty)
+        );
+        assert_eq!(
+            protocol_from_env("xterm-256color", "", true),
+            Some(ProtocolType::Kitty)
+        );
+        assert_eq!(
+            protocol_from_env("xterm-256color", "iTerm.app", false),
+            Some(ProtocolType::Iterm2)
+        );
+        assert_eq!(
+            protocol_from_env("xterm-256color", "WezTerm", false),
+            Some(ProtocolType::Iterm2)
+        );
+        assert_eq!(protocol_from_env("xterm-256color", "", false), None);
+        assert_eq!(protocol_from_env("dumb", "Apple_Terminal", false), None);
+    }
+
+    #[test]
+    fn decode_size_uses_half_block_grid_without_a_font_size() {
+        assert_eq!(decode_size(80, 24, None), (80, 48));
+    }
+
+    #[test]
+    fn decode_size_uses_font_pixels_and_caps_at_720p() {
+        // 100x40 cells at 8x16px = 800x640, under the cap: exact.
+        assert_eq!(decode_size(100, 40, Some((8, 16))), (800, 640));
+        // 200x50 cells at 10x20px = 2000x1000, over the cap: scaled to fit
+        // 1280x720 preserving aspect (limited by width: 1280x640).
+        assert_eq!(decode_size(200, 50, Some((10, 20))), (1280, 640));
+        // Height-limited: 100x100 at 10x20 = 1000x2000 -> 360x720.
+        assert_eq!(decode_size(100, 100, Some((10, 20))), (360, 720));
+    }
+
+    #[test]
+    fn pixels_active_respects_mode_and_detected_support() {
+        let state = VideoState::new();
+        // No picker: every mode falls back to blocks.
+        assert!(!state.pixels_active(VideoRenderMode::Auto));
+        assert!(!state.pixels_active(VideoRenderMode::Pixels));
+        assert!(!state.pixels_active(VideoRenderMode::Blocks));
+
+        let mut state = VideoState::new();
+        #[allow(deprecated)] // test-only picker construction without a tty
+        state.set_picker(Picker::from_fontsize((8, 16).into()));
+        assert!(state.pixels_active(VideoRenderMode::Auto));
+        assert!(state.pixels_active(VideoRenderMode::Pixels));
+        assert!(!state.pixels_active(VideoRenderMode::Blocks));
     }
 
     #[test]
@@ -581,7 +860,7 @@ mod tests {
             rgb: vec![0; 6],
         });
 
-        state.sync(false, false, None, 0.0, 80, 24);
+        state.sync(false, false, None, 0.0, 80, 24, VideoRenderMode::Auto);
 
         assert!(state.current_video_id.is_none());
         assert!(matches!(state.render_state(), VideoDisplay::Placeholder));
@@ -597,7 +876,7 @@ mod tests {
             rgb: vec![9, 9, 9, 1, 1, 1],
         });
 
-        state.sync(true, true, Some("abc"), 5.0, 80, 24);
+        state.sync(true, true, Some("abc"), 5.0, 80, 24, VideoRenderMode::Auto);
 
         assert!(state.session.is_none());
         assert!(state.paused);

@@ -3,6 +3,7 @@ mod config;
 mod deps;
 mod display;
 mod ipc;
+mod kitty_shm;
 mod player;
 mod player_manager;
 mod queue;
@@ -52,12 +53,19 @@ fn main() -> Result<()> {
     let terminal = ui::init_terminal()?;
     let mut terminal_guard = ui::TerminalGuard::new(terminal);
 
+    // Detect terminal graphics support (Kitty/iTerm2) for the video view's
+    // pixel renderer. Env/ioctl only — never reads stdin (see detect_picker).
+    let picker = video::detect_picker();
+
     // Search manager with no initial query
     let mut search = PaginatedSearch::new("", config.results_per_page, !config.include_shorts);
 
     // App is the sole runtime owner of configuration.
     let mut app = ui::App::new(String::new(), config.results_per_page, config);
     app.focused_panel = FocusedPanel::SearchBar;
+    if let Some(picker) = picker {
+        app.video.set_picker(picker);
+    }
 
     // Run TUI loop
     let result = ui::run_app(terminal_guard.get_mut(), app, &mut search, &mut temp_dir);

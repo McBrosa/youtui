@@ -178,6 +178,18 @@ fn render_video_view(f: &mut Frame, app: &App, area: Rect) {
                 render_pause_overlay(f, area);
             }
         }
+        VideoDisplay::Pixels(protocol, paused) => {
+            f.render_widget(ratatui_image::Image::new(protocol), area);
+            if paused {
+                render_pause_overlay(f, area);
+            }
+        }
+        VideoDisplay::Shm(transport, paused) => {
+            transport.render(area, f.buffer_mut());
+            if paused {
+                render_pause_overlay(f, area);
+            }
+        }
     }
 }
 
@@ -1228,11 +1240,17 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
             editing,
             SettingsField::ResultsPerPage,
         ),
+        cycle_item(
+            18,
+            "Video Renderer (auto/pixels/blocks)",
+            app.config.video_render.label(),
+            selected,
+        ),
         ListItem::new(""),
         section_header("  Advanced"),
         section_rule(),
         text_field_item(
-            21,
+            22,
             "Custom Format",
             custom_format,
             selected,
@@ -1336,6 +1354,41 @@ fn text_field_item(
     let value_owned = format!("[{}{}]", value, cursor);
 
     let line = if is_selected {
+        Line::from(vec![
+            Span::styled("  ", Style::default().bg(Color::Blue)),
+            Span::styled(
+                format!("{}: ", label),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                value_owned,
+                Style::default().fg(Color::White).bg(Color::Blue),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{}: ", label), Style::default().fg(Color::Cyan)),
+            Span::styled(value_owned, Style::default().fg(Color::White)),
+        ])
+    };
+
+    ListItem::new(line)
+}
+
+/// A settings row whose value cycles through fixed choices on Enter, styled
+/// like `text_field_item` but with `‹ value ›` instead of an edit box.
+fn cycle_item(
+    idx: usize,
+    label: &'static str,
+    value: &'static str,
+    selected: usize,
+) -> ListItem<'static> {
+    let value_owned = format!("‹ {value} ›");
+    let line = if idx == selected {
         Line::from(vec![
             Span::styled("  ", Style::default().bg(Color::Blue)),
             Span::styled(

@@ -642,7 +642,7 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
     }
 
     // Define selectable indices (skip section headers)
-    const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 6, 7, 8, 12, 13, 17, 21];
+    const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 6, 7, 8, 12, 13, 17, 18, 22];
 
     match key.code {
         KeyCode::Esc => {
@@ -723,7 +723,12 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
                     app.settings_editing = Some(SettingsField::ResultsPerPage);
                     app.settings_text_input = Some(app.config.results_per_page.to_string());
                 }
-                21 => {
+                18 => {
+                    // Video Renderer cycle: auto → pixels → blocks
+                    let result = app.config.cycle_video_render();
+                    record_settings_save_result(app, result);
+                }
+                22 => {
                     // Custom Format text field - enter edit mode
                     app.settings_editing = Some(SettingsField::CustomFormat);
                     app.settings_text_input = Some(app.config.custom_format.clone());
