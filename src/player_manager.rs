@@ -1,19 +1,307 @@
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use crate::{config::Config, ipc::IpcClient};
+use crate::{config::Config, ipc::IpcClient, video::MpvKittyGeometry};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const STATUS_PROPERTIES: [&str; 5] = ["time-pos", "duration", "pause", "volume", "eof-reached"];
+const KITTY_APC_START: &[u8] = b"\x1b_G";
+const KITTY_APC_END: &[u8] = b"\x1b\\";
+
+const DIRECT_KITTY_MAX_WIDTH: u32 = 480;
+const DIRECT_KITTY_MAX_HEIGHT: u32 = 270;
+
+/// Capture mpv's Kitty stream and retain only the newest complete video frame.
+/// This gives Ratatui sole ownership of stdout and bounds memory when a 60fps
+/// producer temporarily outruns the TUI event loop.
+struct MpvKittyOutput {
+    latest_frame: Arc<Mutex<Option<Vec<u8>>>>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl MpvKittyOutput {
+    fn spawn(stdout: ChildStdout, use_shm: bool) -> Result<Self> {
+        let latest_frame = Arc::new(Mutex::new(None));
+        let reader_frame = Arc::clone(&latest_frame);
+        let reader = thread::Builder::new()
+            .name("youtui-mpv-kitty-output".to_string())
+            .spawn(move || pump_mpv_kitty_output(stdout, &reader_frame, use_shm))
+            .context("Failed to start mpv Kitty output reader")?;
+        Ok(Self {
+            latest_frame,
+            reader: Some(reader),
+        })
+    }
+
+    fn take_frame(&self) -> Option<Vec<u8>> {
+        self.latest_frame.lock().ok()?.take()
+    }
+
+    fn join(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn pump_mpv_kitty_output<R: Read>(
+    mut stdout: R,
+    latest_frame: &Arc<Mutex<Option<Vec<u8>>>>,
+    use_shm: bool,
+) {
+    let mut pending = Vec::with_capacity(512);
+    let mut direct_frame = Vec::new();
+    let mut buffer = [0_u8; 4096];
+
+    loop {
+        match stdout.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                pending.extend_from_slice(&buffer[..read]);
+                while let Some(end) = find_bytes(&pending, KITTY_APC_END) {
+                    let packet: Vec<u8> = pending.drain(..end + KITTY_APC_END.len()).collect();
+                    if use_shm {
+                        if let Some(frame) = extract_mpv_kitty_shm_frame(&packet)
+                            && !publish_latest_frame(latest_frame, frame)
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+
+                    let Some((apc_start, apc_end, controls)) = kitty_apc(&packet) else {
+                        continue;
+                    };
+                    let complete;
+                    if kitty_param(controls, b"a=T") && !kitty_param(controls, b"t=s") {
+                        let start = cursor_prefix_start(&packet, apc_start);
+                        direct_frame.clear();
+                        direct_frame.extend_from_slice(&packet[start..apc_end]);
+                        // `m=0` is the protocol default and mpv omits it when
+                        // the complete image fits in the first APC.
+                        complete = !kitty_param(controls, b"m=1");
+                    } else if !direct_frame.is_empty()
+                        && (kitty_param(controls, b"m=1") || kitty_param(controls, b"m=0"))
+                    {
+                        direct_frame.extend_from_slice(&packet[apc_start..apc_end]);
+                        complete = !kitty_param(controls, b"m=1");
+                    } else {
+                        continue;
+                    }
+
+                    if complete
+                        && !publish_latest_frame(latest_frame, std::mem::take(&mut direct_frame))
+                    {
+                        return;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn publish_latest_frame(latest_frame: &Arc<Mutex<Option<Vec<u8>>>>, frame: Vec<u8>) -> bool {
+    let Ok(mut latest) = latest_frame.lock() else {
+        return false;
+    };
+    *latest = Some(frame);
+    true
+}
+
+/// Accept only mpv's complete shared-memory frame packet. In particular, do
+/// not forward its cursor/mouse setup or cleanup bytes: mpv 0.41's Kitty VO
+/// emits an unterminated delete APC on shutdown, which can leave Ghostty's
+/// parser consuming subsequent TUI styling. youtui owns all non-frame terminal
+/// state and clears graphics during the view transition itself.
+fn extract_mpv_kitty_shm_frame(packet: &[u8]) -> Option<Vec<u8>> {
+    let (apc_start, apc_end, controls) = kitty_apc(packet)?;
+    if !is_mpv_kitty_frame(packet) || !kitty_param(controls, b"t=s") {
+        return None;
+    }
+    let start = cursor_prefix_start(packet, apc_start);
+    Some(repair_mpv_shm_name(packet[start..apc_end].to_vec()))
+}
+
+fn kitty_apc(packet: &[u8]) -> Option<(usize, usize, &[u8])> {
+    let apc_start = find_bytes(packet, KITTY_APC_START)?;
+    let controls_start = apc_start + KITTY_APC_START.len();
+    let semicolon_offset = packet[controls_start..]
+        .iter()
+        .position(|byte| *byte == b';')?;
+    let end_offset = find_bytes(&packet[controls_start..], KITTY_APC_END)?;
+    let apc_end = controls_start + end_offset + KITTY_APC_END.len();
+    Some((
+        apc_start,
+        apc_end,
+        &packet[controls_start..controls_start + semicolon_offset],
+    ))
+}
+
+fn cursor_prefix_start(packet: &[u8], apc_start: usize) -> usize {
+    rfind_bytes(&packet[..apc_start], b"\x1b[")
+        .filter(|start| is_cursor_position(&packet[*start..apc_start]))
+        .unwrap_or(apc_start)
+}
+
+fn is_cursor_position(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x1b[")
+        && bytes.ends_with(b"f")
+        && bytes[2..bytes.len() - 1]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';')
+}
+
+fn repair_mpv_shm_name(packet: Vec<u8>) -> Vec<u8> {
+    let Some(apc_start) = find_bytes(&packet, KITTY_APC_START) else {
+        return packet;
+    };
+    let controls_start = apc_start + KITTY_APC_START.len();
+    let Some(semicolon_offset) = packet[controls_start..]
+        .iter()
+        .position(|byte| *byte == b';')
+    else {
+        return packet;
+    };
+    let payload_start = controls_start + semicolon_offset + 1;
+    let controls = &packet[controls_start..payload_start - 1];
+    if !kitty_param(controls, b"t=s") {
+        return packet;
+    }
+    let Some(payload_end_offset) = find_bytes(&packet[payload_start..], KITTY_APC_END) else {
+        return packet;
+    };
+    let payload_end = payload_start + payload_end_offset;
+    let Ok(name) = base64_simd::STANDARD.decode_to_vec(&packet[payload_start..payload_end]) else {
+        return packet;
+    };
+    if name.starts_with(b"/") || !name.starts_with(b"mpv-kitty-") {
+        return packet;
+    }
+
+    let mut repaired_name = Vec::with_capacity(name.len() + 1);
+    repaired_name.push(b'/');
+    repaired_name.extend_from_slice(&name);
+    let repaired_payload = base64_simd::STANDARD.encode_to_string(&repaired_name);
+
+    let mut repaired = Vec::with_capacity(packet.len() + repaired_payload.len());
+    repaired.extend_from_slice(&packet[..payload_start]);
+    repaired.extend_from_slice(repaired_payload.as_bytes());
+    repaired.extend_from_slice(&packet[payload_end..]);
+    repaired
+}
+
+fn is_mpv_kitty_frame(packet: &[u8]) -> bool {
+    kitty_apc(packet).is_some_and(|(_, _, controls)| kitty_param(controls, b"a=T"))
+}
+
+fn add_direct_kitty_placement(packet: Vec<u8>, geometry: MpvKittyGeometry) -> Vec<u8> {
+    let Some((apc_start, _, controls)) = kitty_apc(&packet) else {
+        return packet;
+    };
+    if !kitty_param(controls, b"a=T")
+        || kitty_param(controls, b"t=s")
+        || kitty_param_prefix(controls, b"c=").is_some()
+        || kitty_param_prefix(controls, b"r=").is_some()
+    {
+        return packet;
+    }
+    let Some(source_width) = kitty_param_u32(controls, b"s=") else {
+        return packet;
+    };
+    let Some(source_height) = kitty_param_u32(controls, b"v=") else {
+        return packet;
+    };
+    if geometry.width_px == 0 || geometry.height_px == 0 {
+        return packet;
+    }
+
+    let cols = scaled_cells(source_width, geometry.width_px, geometry.cols);
+    let rows = scaled_cells(source_height, geometry.height_px, geometry.rows);
+    let placement = format!(",c={cols},r={rows}");
+    let controls_end = apc_start + KITTY_APC_START.len() + controls.len();
+    let mut repaired = Vec::with_capacity(packet.len() + placement.len());
+    repaired.extend_from_slice(&packet[..controls_end]);
+    repaired.extend_from_slice(placement.as_bytes());
+    repaired.extend_from_slice(&packet[controls_end..]);
+    repaired
+}
+
+fn scaled_cells(source_px: u32, available_px: u32, available_cells: u16) -> u16 {
+    let scaled = (u64::from(source_px) * u64::from(available_cells) + u64::from(available_px) / 2)
+        / u64::from(available_px);
+    u16::try_from(scaled)
+        .unwrap_or(u16::MAX)
+        .clamp(1, available_cells.max(1))
+}
+
+fn bounded_direct_geometry(geometry: MpvKittyGeometry) -> MpvKittyGeometry {
+    if geometry.width_px <= DIRECT_KITTY_MAX_WIDTH && geometry.height_px <= DIRECT_KITTY_MAX_HEIGHT
+    {
+        return geometry;
+    }
+    let scale = (f64::from(DIRECT_KITTY_MAX_WIDTH) / f64::from(geometry.width_px))
+        .min(f64::from(DIRECT_KITTY_MAX_HEIGHT) / f64::from(geometry.height_px));
+    MpvKittyGeometry {
+        cols: geometry.cols,
+        rows: geometry.rows,
+        width_px: (f64::from(geometry.width_px) * scale).round().max(1.0) as u32,
+        height_px: (f64::from(geometry.height_px) * scale).round().max(1.0) as u32,
+    }
+}
+
+fn kitty_param(controls: &[u8], expected: &[u8]) -> bool {
+    controls
+        .split(|byte| *byte == b',')
+        .any(|parameter| parameter == expected)
+}
+
+fn kitty_param_prefix<'a>(controls: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    controls
+        .split(|byte| *byte == b',')
+        .find_map(|parameter| parameter.strip_prefix(prefix))
+}
+
+fn kitty_param_u32(controls: &[u8], prefix: &[u8]) -> Option<u32> {
+    std::str::from_utf8(kitty_param_prefix(controls, prefix)?)
+        .ok()?
+        .parse()
+        .ok()
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|part| part == needle)
+}
+
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|part| part == needle)
+}
 
 pub struct PlayerManager {
     process: Child,
+    kitty_output: Option<MpvKittyOutput>,
     _socket_dir: TempDir,
     socket_path: PathBuf,
     ipc: Option<IpcClient>,
@@ -21,24 +309,39 @@ pub struct PlayerManager {
     pub status: PlaybackStatus,
     pub current_video_id: Option<String>,
     current_playlist_entry_id: Option<i64>,
+    kitty_video: bool,
+    kitty_geometry: Option<MpvKittyGeometry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PlaybackOptions {
     audio_only: bool,
     format: String,
+    native_kitty: bool,
+    kitty_shm: bool,
 }
 
 impl From<&Config> for PlaybackOptions {
     fn from(config: &Config) -> Self {
+        // Audio owns the durable playback clock. Video is always handled by
+        // VideoState's independent yt-dlp/ffmpeg pipeline, including on local
+        // Kitty terminals, so a video format can never delay or break audio.
+        Self::from_config(config, false, false)
+    }
+}
+
+impl PlaybackOptions {
+    fn from_config(config: &Config, _native_kitty: bool, _kitty_shm: bool) -> Self {
         Self {
-            audio_only: config.audio_only,
-            format: config.format(),
+            audio_only: true,
+            format: config.queue_audio_format(),
+            native_kitty: false,
+            kitty_shm: false,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct PlaybackStatus {
     pub playing: bool,
     pub paused: bool,
@@ -131,19 +434,38 @@ impl PlayerManager {
             .context("Failed to create mpv IPC directory")?;
         let socket_path = socket_dir.path().join("mpv.sock");
 
-        let mut cmd = build_mpv_command(&socket_path, config);
+        let options = PlaybackOptions::from(config);
+        let mut cmd = build_mpv_command(&socket_path, &options);
 
-        let process = cmd.spawn().context("Failed to spawn mpv process")?;
+        let mut process = cmd.spawn().context("Failed to spawn mpv process")?;
+        let kitty_output = if options.native_kitty {
+            let stdout = process
+                .stdout
+                .take()
+                .expect("native Kitty mpv stdout must be piped");
+            match MpvKittyOutput::spawn(stdout, options.kitty_shm) {
+                Ok(output) => Some(output),
+                Err(error) => {
+                    terminate_player(&mut process);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             process,
+            kitty_output,
             _socket_dir: socket_dir,
             socket_path,
             ipc: None,
-            options: PlaybackOptions::from(config),
+            options,
             status: PlaybackStatus::default(),
             current_video_id: None,
             current_playlist_entry_id: None,
+            kitty_video: false,
+            kitty_geometry: None,
         })
     }
 
@@ -153,6 +475,7 @@ impl PlayerManager {
         let config = Config::default();
         Self {
             process: Command::new("sleep").arg("5").spawn().unwrap(),
+            kitty_output: None,
             socket_path: socket_dir.path().join("mpv.sock"),
             _socket_dir: socket_dir,
             ipc: Some(IpcClient::from_stream(stream).unwrap()),
@@ -163,6 +486,8 @@ impl PlayerManager {
             },
             current_video_id: Some("video-id".to_string()),
             current_playlist_entry_id: Some(1),
+            kitty_video: false,
+            kitty_geometry: None,
         }
     }
 
@@ -319,6 +644,81 @@ impl PlayerManager {
         Ok(())
     }
 
+    pub fn native_kitty_enabled(&self) -> bool {
+        self.options.native_kitty
+    }
+
+    /// Return the newest complete mpv terminal frame. Stale frames are
+    /// replaced by the reader thread so neither direct packets nor reusable
+    /// shared-memory references can build up behind the TUI.
+    pub fn take_kitty_output(&mut self) -> Vec<u8> {
+        let Some(frame) = self
+            .kitty_output
+            .as_ref()
+            .and_then(MpvKittyOutput::take_frame)
+        else {
+            return Vec::new();
+        };
+        if self.options.kitty_shm {
+            frame
+        } else if let Some(geometry) = self.kitty_geometry {
+            add_direct_kitty_placement(frame, geometry)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Switch the existing mpv process between its warm, hidden `null` output
+    /// and the Kitty graphics output. mpv remains the audio clock and
+    /// decoder in both states, so toggling does not open or seek a second
+    /// YouTube stream.
+    pub fn set_kitty_video(&mut self, visible: bool, geometry: MpvKittyGeometry) -> Result<()> {
+        if visible && !self.options.native_kitty {
+            bail!("native Kitty video output is unavailable for this player");
+        }
+        self.reconnect_for_active_track()?;
+        let Some(ipc) = self.ipc.as_mut() else {
+            return Ok(());
+        };
+
+        if visible {
+            let geometry = if self.options.kitty_shm {
+                geometry
+            } else {
+                bounded_direct_geometry(geometry)
+            };
+            let geometry_changed = self.kitty_geometry != Some(geometry);
+            if geometry_changed && self.kitty_video {
+                // Kitty VO reads geometry during initialization. Recreate it
+                // only on an actual pane resize so ordinary status updates do
+                // not disturb playback.
+                ipc.send_command(&["set_property", "vo", "null"])?;
+                self.kitty_video = false;
+            }
+            if geometry_changed {
+                let cols = geometry.cols.to_string();
+                let rows = geometry.rows.to_string();
+                let width = geometry.width_px.to_string();
+                let height = geometry.height_px.to_string();
+                ipc.send_commands(&[
+                    &["set_property", "vo-kitty-cols", &cols],
+                    &["set_property", "vo-kitty-rows", &rows],
+                    &["set_property", "vo-kitty-width", &width],
+                    &["set_property", "vo-kitty-height", &height],
+                ])?;
+                self.kitty_geometry = Some(geometry);
+            }
+            if !self.kitty_video {
+                ipc.send_command(&["set_property", "vo", "kitty"])?;
+                self.kitty_video = true;
+            }
+        } else if self.kitty_video {
+            ipc.send_command(&["set_property", "vo", "null"])?;
+            self.kitty_video = false;
+        }
+        Ok(())
+    }
+
     pub fn update_status(&mut self) -> Result<()> {
         if self.ipc.is_none()
             && self.current_video_id.is_some()
@@ -334,6 +734,16 @@ impl PlayerManager {
             let reached_eof = events
                 .iter()
                 .any(|event| is_current_eof_event(event, self.current_playlist_entry_id));
+            let load_error = events
+                .iter()
+                .find_map(|event| current_load_error(event, self.current_playlist_entry_id));
+
+            if let Some(error) = load_error {
+                self.status.mark_transport_error();
+                self.current_video_id = None;
+                self.current_playlist_entry_id = None;
+                bail!("mpv could not load the audio stream: {error}");
+            }
 
             match poll_result {
                 Ok(values) => {
@@ -380,22 +790,58 @@ impl PlayerManager {
     }
 }
 
-fn build_mpv_command(socket_path: &Path, config: &Config) -> Command {
+fn build_mpv_command(socket_path: &Path, options: &PlaybackOptions) -> Command {
     let mut command = Command::new("mpv");
+    #[cfg(unix)]
+    command.process_group(0);
+    if let Some(directory) = socket_path.parent() {
+        // Keep packaged yt-dlp extraction files inside the player's owned directory.
+        command
+            .env("TMPDIR", directory)
+            .env("TMP", directory)
+            .env("TEMP", directory);
+    }
     command
         .arg("--idle")
         .arg(format!("--input-ipc-server={}", socket_path.display()))
-        .arg(format!("--ytdl-format={}", config.format()));
+        .arg(format!("--ytdl-format={}", options.format))
+        .arg("--terminal=no")
+        .arg("--input-terminal=no");
 
-    // mpv is audio-only in every mode: video renders in the terminal (see
-    // src/video.rs), and an OS video window would steal keyboard focus from
-    // the TUI whenever playback starts.
-    command.arg("--no-video");
+    if options.native_kitty {
+        // Keep video decoded by the same player as audio, but render it to a
+        // sink until the user opens the video pane. Switching `vo` to Kitty is
+        // then immediate and never creates an OS window.
+        command
+            .arg("--vo=null")
+            .arg("--profile=sw-fast")
+            .arg("--osd-level=0")
+            .arg(format!(
+                "--vo-kitty-use-shm={}",
+                if options.kitty_shm { "yes" } else { "no" }
+            ))
+            .arg("--vo-kitty-alt-screen=no")
+            .arg("--vo-kitty-config-clear=no");
+        if !options.kitty_shm {
+            // Direct Kitty frames cross stdout as base64 RGB. Bound their
+            // cadence as well as their geometry, then let the terminal scale
+            // each placement to the full pane.
+            command.arg("--vf=fps=24");
+        }
+    } else {
+        // Portable video renderers use youtui's ffmpeg pipeline. Avoid warming
+        // a second copy of the video in mpv when its Kitty VO cannot be used.
+        command.arg("--no-video");
+    }
 
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.stdin(Stdio::null()).stderr(Stdio::null());
+    if options.native_kitty {
+        // Capture Kitty commands for frame coalescing and ordered writes
+        // through Ratatui's stdout owner.
+        command.stdout(Stdio::piped());
+    } else {
+        command.stdout(Stdio::null());
+    }
     command
 }
 
@@ -423,15 +869,44 @@ fn is_current_eof_event(event: &Value, current_playlist_entry_id: Option<i64>) -
         && event.get("playlist_entry_id").and_then(Value::as_i64) == Some(current_playlist_entry_id)
 }
 
+fn current_load_error(event: &Value, current_playlist_entry_id: Option<i64>) -> Option<String> {
+    let current_playlist_entry_id = current_playlist_entry_id?;
+    if event.get("event").and_then(Value::as_str) != Some("end-file")
+        || event.get("reason").and_then(Value::as_str) != Some("error")
+        || event.get("playlist_entry_id").and_then(Value::as_i64) != Some(current_playlist_entry_id)
+    {
+        return None;
+    }
+
+    Some(
+        event
+            .get("file_error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown media error")
+            .to_string(),
+    )
+}
+
+fn terminate_player(process: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(process_group) = i32::try_from(process.id()) {
+        // SAFETY: mpv runs in a fresh group whose ID is its PID. This also
+        // terminates any yt-dlp descendants before their temp directory drops.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    let _ = process.kill();
+    let _ = process.wait();
+}
 impl Drop for PlayerManager {
     fn drop(&mut self) {
         // Closing IPC before terminating mpv avoids keeping the socket alive.
         self.ipc.take();
-        if !matches!(self.process.try_wait(), Ok(Some(_))) {
-            let _ = self.process.kill();
+        terminate_player(&mut self.process);
+        if let Some(output) = self.kitty_output.as_mut() {
+            output.join();
         }
-        // Always reap the child so repeated player creation cannot accumulate zombies.
-        let _ = self.process.wait();
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
@@ -444,11 +919,159 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;
 
-    fn command_args(config: &Config) -> Vec<String> {
-        build_mpv_command(Path::new("/tmp/test.sock"), config)
+    fn command_args(config: &Config, native_kitty: bool, kitty_shm: bool) -> Vec<String> {
+        let options = PlaybackOptions::from_config(config, native_kitty, kitty_shm);
+        build_mpv_command(Path::new("/tmp/test.sock"), &options)
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn mpv_shm_packet_restores_the_posix_name_slash() {
+        let bare_name = b"mpv-kitty-0xa19d35cd0";
+        let bare_payload = base64_simd::STANDARD.encode_to_string(bare_name);
+        let packet =
+            format!("\x1b[0;4f\x1b_Ga=T,t=s,f=24,s=1877,v=1056,C=1,q=2,m=1;{bare_payload}\x1b\\")
+                .into_bytes();
+
+        let repaired = repair_mpv_shm_name(packet);
+        let expected_payload = base64_simd::STANDARD.encode_to_string(b"/mpv-kitty-0xa19d35cd0");
+
+        assert!(
+            repaired
+                .windows(expected_payload.len())
+                .any(|window| window == expected_payload.as_bytes())
+        );
+        assert!(is_mpv_kitty_frame(&repaired));
+    }
+
+    #[test]
+    fn kitty_packet_repair_ignores_direct_and_non_mpv_payloads() {
+        let direct = b"\x1b_Ga=T,t=d,f=24,s=1,v=1;AAAA\x1b\\".to_vec();
+        let other_shm = format!(
+            "\x1b_Ga=T,t=s,f=24,s=1,v=1;{}\x1b\\",
+            base64_simd::STANDARD.encode_to_string(b"other-client")
+        )
+        .into_bytes();
+
+        assert_eq!(repair_mpv_shm_name(direct.clone()), direct);
+        assert_eq!(repair_mpv_shm_name(other_shm.clone()), other_shm);
+    }
+
+    #[test]
+    fn kitty_output_retains_only_the_newest_complete_frame() {
+        let first = b"\x1b_Ga=T,t=s,f=24,s=1,v=1;Zmlyc3Q=\x1b\\".to_vec();
+        let second = b"\x1b_Ga=T,t=s,f=24,s=1,v=1;c2Vjb25k\x1b\\".to_vec();
+        let output = MpvKittyOutput {
+            latest_frame: Arc::new(Mutex::new(Some(first))),
+            reader: None,
+        };
+        publish_latest_frame(&output.latest_frame, second.clone());
+
+        assert_eq!(output.take_frame(), Some(second));
+        assert!(output.take_frame().is_none());
+    }
+
+    #[test]
+    fn direct_kitty_reader_publishes_one_complete_chunked_frame() {
+        let initial = b"\x1b[?25l\x1b[0;4f\x1b_Ga=T,t=d,f=24,s=2,v=2,m=1;AAAA\x1b\\";
+        let continuation = b"\x1b_Gm=0;BBBB\x1b\\";
+        let stream = [initial.as_slice(), continuation.as_slice()].concat();
+        let latest = Arc::new(Mutex::new(None));
+
+        pump_mpv_kitty_output(std::io::Cursor::new(stream), &latest, false);
+
+        let expected = [
+            b"\x1b[0;4f".as_slice(),
+            b"\x1b_Ga=T,t=d,f=24,s=2,v=2,m=1;AAAA\x1b\\".as_slice(),
+            continuation.as_slice(),
+        ]
+        .concat();
+        assert_eq!(latest.lock().unwrap().as_deref(), Some(expected.as_slice()));
+    }
+
+    #[test]
+    fn direct_kitty_reader_accepts_an_unchunked_frame_without_m_parameter() {
+        let frame = b"\x1b[0;0f\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\";
+        let latest = Arc::new(Mutex::new(None));
+
+        pump_mpv_kitty_output(std::io::Cursor::new(frame), &latest, false);
+
+        assert_eq!(latest.lock().unwrap().as_deref(), Some(frame.as_slice()));
+    }
+
+    #[test]
+    fn direct_kitty_frame_is_scaled_to_the_full_pane() {
+        let packet =
+            b"\x1b[0;4f\x1b_Ga=T,f=24,s=460,v=259,C=1,q=2,m=1;AAAA\x1b\\\x1b_Gm=0;BBBB\x1b\\"
+                .to_vec();
+        let geometry = MpvKittyGeometry {
+            cols: 196,
+            rows: 44,
+            width_px: 480,
+            height_px: 259,
+        };
+
+        let placed = add_direct_kitty_placement(packet, geometry);
+
+        assert!(placed.windows(11).any(|window| window == b",c=188,r=44"));
+    }
+
+    #[test]
+    fn direct_kitty_geometry_is_bounded_without_changing_cells() {
+        let geometry = MpvKittyGeometry {
+            cols: 196,
+            rows: 44,
+            width_px: 1_960,
+            height_px: 1_056,
+        };
+
+        assert_eq!(
+            bounded_direct_geometry(geometry),
+            MpvKittyGeometry {
+                cols: 196,
+                rows: 44,
+                width_px: 480,
+                height_px: 259,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn player_shutdown_terminates_extractor_descendants() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ready = fixture.path().join("ready");
+        let escaped = fixture.path().join("escaped");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                r#"printf ready > "$1"
+(sleep 1; printf escaped > "$2") &
+wait"#,
+                "player-fixture",
+            ])
+            .arg(&ready)
+            .arg(&escaped)
+            .process_group(0);
+        let mut process = command.spawn().unwrap();
+        let started = Instant::now();
+        while !ready.exists() {
+            if started.elapsed() >= Duration::from_secs(3) {
+                terminate_player(&mut process);
+                panic!("player fixture did not start");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        terminate_player(&mut process);
+        assert!(process.try_wait().unwrap().is_some());
+        thread::sleep(Duration::from_millis(1100));
+        assert!(
+            !escaped.exists(),
+            "audio extractor survived player shutdown"
+        );
     }
 
     #[test]
@@ -478,29 +1101,108 @@ mod tests {
     }
 
     #[test]
-    fn mpv_command_respects_video_and_format_configuration() {
+    fn kitty_video_switch_batches_geometry_then_changes_the_live_vo() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server_reader = server_stream.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let mut reader = BufReader::new(server_reader);
+            let mut commands = Vec::new();
+
+            // Geometry is one IPC batch, so read all four requests before
+            // replying just as a real mpv command loop may do.
+            let mut geometry_requests = Vec::new();
+            for _ in 0..4 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                commands.push(request["command"].clone());
+                geometry_requests.push(request);
+            }
+            for request in geometry_requests {
+                writeln!(
+                    server_stream,
+                    "{}",
+                    json!({
+                        "request_id": request["request_id"],
+                        "error": "success",
+                    })
+                )
+                .unwrap();
+            }
+
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                commands.push(request["command"].clone());
+                writeln!(
+                    server_stream,
+                    "{}",
+                    json!({
+                        "request_id": request["request_id"],
+                        "error": "success",
+                    })
+                )
+                .unwrap();
+            }
+            commands
+        });
+
+        let mut manager = PlayerManager::from_test_stream(client_stream);
+        manager.options.native_kitty = true;
+        manager.options.kitty_shm = true;
+        let geometry = MpvKittyGeometry {
+            cols: 100,
+            rows: 30,
+            width_px: 800,
+            height_px: 480,
+        };
+
+        manager.set_kitty_video(true, geometry).unwrap();
+        manager.set_kitty_video(false, geometry).unwrap();
+
+        assert_eq!(
+            server.join().unwrap(),
+            vec![
+                json!(["set_property", "vo-kitty-cols", "100"]),
+                json!(["set_property", "vo-kitty-rows", "30"]),
+                json!(["set_property", "vo-kitty-width", "800"]),
+                json!(["set_property", "vo-kitty-height", "480"]),
+                json!(["set_property", "vo", "kitty"]),
+                json!(["set_property", "vo", "null"]),
+            ]
+        );
+        assert!(!manager.kitty_video);
+        assert_eq!(manager.kitty_geometry, Some(geometry));
+    }
+
+    #[test]
+    fn queue_mpv_is_audio_only_regardless_of_video_configuration() {
         let video = Config {
             bandwidth_limit: true,
             ..Config::default()
         };
-        let args = command_args(&video);
-        // mpv never decodes video; frames come from the terminal pipeline.
+        let args = command_args(&video, true, true);
         assert!(args.iter().any(|arg| arg == "--no-video"));
-        assert!(args.iter().any(|arg| {
-            arg == "--ytdl-format=bestvideo[height<=360]+bestaudio/best[height<=360]/best"
-        }));
+        assert!(!args.iter().any(|arg| arg == "--vo=null"));
+        assert!(!args.iter().any(|arg| arg.starts_with("--vo-kitty")));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--ytdl-format=bestaudio[abr<=128]/bestaudio/best")
+        );
+
+        let direct_args = command_args(&video, true, false);
+        assert!(direct_args.iter().any(|arg| arg == "--no-video"));
+        assert!(!direct_args.iter().any(|arg| arg == "--vf=fps=24"));
 
         let audio = Config {
             audio_only: true,
             custom_format: "custom-audio-format".to_string(),
             ..Config::default()
         };
-        let args = command_args(&audio);
+        let args = command_args(&audio, false, false);
         assert!(args.iter().any(|arg| arg == "--no-video"));
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--ytdl-format=custom-audio-format")
-        );
+        assert!(args.iter().any(|arg| arg == "--ytdl-format=bestaudio/best"));
     }
 
     #[test]
@@ -515,8 +1217,14 @@ mod tests {
             ..Config::default()
         });
 
-        assert_ne!(initial, audio);
-        assert_ne!(initial, custom);
+        let limited = PlaybackOptions::from(&Config {
+            bandwidth_limit: true,
+            ..Config::default()
+        });
+
+        assert_eq!(initial, audio);
+        assert_eq!(initial, custom);
+        assert_ne!(initial, limited);
     }
 
     #[test]
@@ -610,6 +1318,23 @@ mod tests {
     }
 
     #[test]
+    fn media_errors_are_correlated_and_expose_mpv_details() {
+        let current_error = json!({
+            "event": "end-file",
+            "reason": "error",
+            "file_error": "HTTP 403",
+            "playlist_entry_id": 42,
+        });
+
+        assert_eq!(
+            current_load_error(&current_error, Some(42)).as_deref(),
+            Some("HTTP 403")
+        );
+        assert!(current_load_error(&current_error, Some(41)).is_none());
+        assert!(current_load_error(&current_error, None).is_none());
+    }
+
+    #[test]
     fn loadfile_response_exposes_playlist_entry_identity() {
         let response = json!({ "playlist_entry_id": 17 });
         assert_eq!(playlist_entry_id(Some(&response)), Some(17));
@@ -675,6 +1400,7 @@ mod tests {
         let config = Config::default();
         let mut manager = PlayerManager {
             process: Command::new("sleep").arg("5").spawn().unwrap(),
+            kitty_output: None,
             _socket_dir: socket_dir,
             socket_path,
             ipc: Some(IpcClient::from_stream(client_stream).unwrap()),
@@ -686,6 +1412,8 @@ mod tests {
             },
             current_video_id: Some("video-id".to_string()),
             current_playlist_entry_id: Some(7),
+            kitty_video: false,
+            kitty_geometry: None,
         };
 
         manager.update_status().unwrap();

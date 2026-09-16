@@ -1,7 +1,13 @@
 # Kitty Shared-Memory Frame Transfer — Design Spec
 
+> Update (2026-08-13): the normal local Kitty path now delegates shared-memory
+> transfer to mpv's native `vo=kitty` driver. A live Ghostty 1.3.1/macOS probe
+> accepted direct `t=d` packets but returned `EINVAL` for `t=s` with both bare
+> and slash-prefixed POSIX names. Ghostty therefore uses bounded direct mpv
+> frames, and the custom SHM transport is disabled there.
+
 **Date:** 2026-08-12
-**Status:** Implemented — Phase 0 answered from Ghostty source (readSharedMemory: shm_open + unlink-after-read) instead of a live bench; the standalone bench example was skipped, youtui itself is the manual test.
+**Status:** Implemented for compatible Kitty terminals; Ghostty uses the direct fallback selected by the Phase 0 gate.
 
 ## Summary
 
@@ -20,8 +26,8 @@ grid) can copy the crate's proven approach.
 
 ## Goals
 
-- 60 fps pixel rendering in kitty-protocol terminals on the local machine
-  (Ghostty, kitty).
+- 60 fps pixel rendering through SHM on compatible local Kitty terminals.
+- Automatic bounded `t=d` fallback on Ghostty.
 - Zero regression for every other path: t=d fallback, iTerm2, blocks, SSH.
 - Fallback is automatic and silent; no new user-facing configuration.
 
@@ -63,6 +69,9 @@ Answers required before Phase 1:
 3. Real fps ceiling at 720p/60 — confirms the effort is worth it.
 
 If Ghostty lacks `t=s`, stop: file upstream issue, keep 24 fps t=d.
+
+Result (2026-08-13): Ghostty 1.3.1 returned `OK` for `t=d` and `EINVAL` for
+`t=s`, so the implementation follows that fallback branch.
 
 ### Phase 1 — Encoder module `src/kitty_shm.rs`
 

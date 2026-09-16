@@ -22,7 +22,16 @@ const VIDEO_ID: &str = "integration-audio-id";
 
 #[test]
 fn audio_only_playback_survives_a_partial_ipc_timeout() {
-    let fixture = SmokeFixture::new();
+    check_playback(true);
+}
+
+#[test]
+fn video_extraction_is_lazy_and_failures_require_an_explicit_retry() {
+    check_playback(false);
+}
+
+fn check_playback(audio_only: bool) {
+    let fixture = SmokeFixture::new(audio_only);
     let mut youtui = fixture.spawn_youtui();
 
     youtui.wait_for_screen("Search", WAIT_TIMEOUT);
@@ -73,6 +82,34 @@ fn audio_only_playback_survives_a_partial_ipc_timeout() {
         "{transcript}"
     );
 
+    // Observe several player ticks: the hidden video pane must not start yt-dlp.
+    thread::sleep(Duration::from_millis(750));
+    let video_calls = fixture.root.join("video.calls");
+    assert!(
+        !video_calls.exists(),
+        "hidden video pane started extraction"
+    );
+    if !audio_only {
+        youtui.write_all(b"v");
+        youtui.wait_for_screen("fixture extraction failure", WAIT_TIMEOUT);
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(fs::read_to_string(&video_calls).unwrap().lines().count(), 1);
+        youtui.write_all(b"v");
+        youtui.wait_for_screen("Results", WAIT_TIMEOUT);
+        youtui.write_all(b"v");
+        let started = Instant::now();
+        while fs::read_to_string(&video_calls).unwrap().lines().count() < 2 {
+            assert!(
+                started.elapsed() < WAIT_TIMEOUT,
+                "video did not retry on reopen"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        youtui.wait_for_screen("fixture extraction failure", WAIT_TIMEOUT);
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(fs::read_to_string(&video_calls).unwrap().lines().count(), 2);
+    }
+
     youtui.write_all(b"q");
     let status = youtui.wait_for_exit(WAIT_TIMEOUT);
     assert!(status.success(), "youtui exited with {status}");
@@ -106,7 +143,7 @@ struct SmokeFixture {
 }
 
 impl SmokeFixture {
-    fn new() -> Self {
+    fn new(audio_only: bool) -> Self {
         // Keep executable shims off /tmp because hardened Linux systems may
         // mount it noexec. The compiled binary already proves target is executable.
         let fixture_parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -133,7 +170,11 @@ impl SmokeFixture {
             fs::create_dir_all(directory).expect("failed to create fixture directory");
         }
 
-        let config = "audio_only = true\n";
+        let config = if audio_only {
+            "audio_only = true\n"
+        } else {
+            "audio_only = false\nvideo_render = \"blocks\"\n"
+        };
         write_config(&xdg_config.join("youtui/config.toml"), config);
         write_config(
             &home.join("Library/Application Support/youtui/config.toml"),
@@ -144,6 +185,13 @@ impl SmokeFixture {
             &fake_bin.join("yt-dlp"),
             r#"#!/bin/sh
 set -eu
+case " $* " in
+    *" --skip-download "*)
+        printf '%s\n' call >> video.calls
+        printf '%s\n' 'fixture extraction failure' >&2
+        exit 1
+        ;;
+esac
 tmp="${YOUTUI_SMOKE_YTDLP_ARGS}.tmp.$$"
 printf '%s\n' "$@" > "$tmp"
 mv "$tmp" "$YOUTUI_SMOKE_YTDLP_ARGS"

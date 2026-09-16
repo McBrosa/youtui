@@ -1,9 +1,8 @@
 use std::borrow::Cow;
 
-use crate::ui::app::{App, FocusedPanel, InputMode, SearchPhase, SettingsField};
-use crate::video::{Frame as VideoFrame, VideoDisplay};
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -12,6 +11,9 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState,
     },
 };
+
+use crate::ui::app::{App, FocusedPanel, InputMode, SearchPhase, SettingsField};
+use crate::video::{Frame as VideoFrame, VideoDisplay};
 
 const MIN_USABLE_WIDTH: u16 = 24;
 const MIN_USABLE_HEIGHT: u16 = 8;
@@ -34,7 +36,14 @@ pub fn render_ui(f: &mut Frame, app: &App) {
             .constraints([Constraint::Min(0), Constraint::Length(footer_height)])
             .split(area);
 
-        render_video_view(f, app, chunks[0]);
+        if app.native_kitty_video_active() {
+            // mpv paints this rectangle independently through the Kitty
+            // protocol. Keep Ratatui's pane cells stable so its diff never
+            // overwrites the image; the footer remains a normal TUI surface.
+            render_mpv_kitty_pane(f, chunks[0]);
+        } else {
+            render_video_view(f, app, chunks[0]);
+        }
         render_footer(f, app, chunks[1]);
     } else {
         let chunks = Layout::default()
@@ -57,6 +66,16 @@ pub fn render_ui(f: &mut Frame, app: &App) {
 
     if app.settings_open {
         render_settings_modal(f, app);
+    }
+}
+
+fn render_mpv_kitty_pane(f: &mut Frame, area: Rect) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = f.buffer_mut().cell_mut((x, y)) {
+                cell.set_diff_option(ratatui::buffer::CellDiffOption::Skip);
+            }
+        }
     }
 }
 
@@ -172,8 +191,7 @@ fn render_video_view(f: &mut Frame, app: &App, area: Rect) {
             render_video_message(f, area, "no video playing", Color::DarkGray)
         }
         VideoDisplay::Frame(frame, paused) => {
-            let lines = frame_to_lines(frame);
-            f.render_widget(Paragraph::new(lines), area);
+            render_half_block_frame(frame, area, f.buffer_mut());
             if paused {
                 render_pause_overlay(f, area);
             }
@@ -184,7 +202,7 @@ fn render_video_view(f: &mut Frame, app: &App, area: Rect) {
                 render_pause_overlay(f, area);
             }
         }
-        VideoDisplay::Shm(transport, paused) => {
+        VideoDisplay::Kitty(transport, paused) => {
             transport.render(area, f.buffer_mut());
             if paused {
                 render_pause_overlay(f, area);
@@ -228,35 +246,50 @@ fn render_pause_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(paragraph, overlay);
 }
 
-/// Pure mapping from a decoded frame to the `▀` cell lines used to render
-/// it: each cell's foreground is the top pixel, background the bottom pixel,
-/// giving 2x vertical resolution. Kept separate from rendering so it is
-/// testable without a `Frame`/`Terminal`.
-fn frame_to_lines(frame: &VideoFrame) -> Vec<Line<'static>> {
-    let width = frame.width as usize;
-    let rows = (frame.height_px / 2) as usize;
-    (0..rows)
-        .map(|row| {
-            let spans: Vec<Span<'static>> = (0..width)
-                .map(|col| {
-                    let (fr, fg_g, fb) = video_pixel_at(frame, col, row * 2);
-                    let (br, bg_g, bb) = video_pixel_at(frame, col, row * 2 + 1);
-                    Span::styled(
-                        "▀",
-                        Style::default()
-                            .fg(Color::Rgb(fr, fg_g, fb))
-                            .bg(Color::Rgb(br, bg_g, bb)),
-                    )
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect()
-}
+/// Render RGB24 directly into Ratatui's flat cell buffer. Each `▀` cell uses
+/// the top pixel as foreground and the bottom pixel as background, giving 2x
+/// vertical resolution without allocating an intermediate `Vec<Line>` and a
+/// `Span` for every cell on every video frame.
+fn render_half_block_frame(frame: &VideoFrame, area: Rect, buf: &mut Buffer) {
+    let frame_width = usize::from(frame.width);
+    let frame_height = usize::from(frame.height_px);
+    let Some(expected_len) = frame_width
+        .checked_mul(frame_height)
+        .and_then(|pixels| pixels.checked_mul(3))
+    else {
+        return;
+    };
+    if frame_width == 0 || frame_height < 2 || frame.rgb.len() != expected_len {
+        return;
+    }
 
-fn video_pixel_at(frame: &VideoFrame, x: usize, y: usize) -> (u8, u8, u8) {
-    let idx = (y * frame.width as usize + x) * 3;
-    (frame.rgb[idx], frame.rgb[idx + 1], frame.rgb[idx + 2])
+    let visible_width = usize::from(frame.width.min(area.width));
+    let visible_rows = usize::from((frame.height_px / 2).min(area.height));
+    let row_stride = frame_width * 3;
+    let visible_row_bytes = visible_width * 3;
+
+    for row in 0..visible_rows {
+        let top_start = row * 2 * row_stride;
+        let bottom_start = top_start + row_stride;
+        let top = &frame.rgb[top_start..top_start + visible_row_bytes];
+        let bottom = &frame.rgb[bottom_start..bottom_start + visible_row_bytes];
+
+        for (col, (top_pixel, bottom_pixel)) in
+            top.chunks_exact(3).zip(bottom.chunks_exact(3)).enumerate()
+        {
+            let x = area.x.saturating_add(col as u16);
+            let y = area.y.saturating_add(row as u16);
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_char('▀')
+                    .set_fg(Color::Rgb(top_pixel[0], top_pixel[1], top_pixel[2]))
+                    .set_bg(Color::Rgb(
+                        bottom_pixel[0],
+                        bottom_pixel[1],
+                        bottom_pixel[2],
+                    ));
+            }
+        }
+    }
 }
 
 /// Keep the edit cursor visible without slicing through a UTF-8 code point.
@@ -643,17 +676,17 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
             .split(area);
 
         // Line 1: play/pause icon + title
-        let play_icon = if status.paused { "⏸" } else { "▶" };
+        let play_icon = if status.paused { " ⏸ " } else { " ▶ " };
         let title_line = Line::from(vec![
             Span::styled(
-                format!(" {} ", play_icon),
+                play_icon,
                 Style::default()
                     .fg(Color::Green)
                     .bg(Color::Black)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                status.title.clone(),
+                status.title.as_str(),
                 Style::default()
                     .fg(Color::White)
                     .bg(Color::Black)
@@ -1246,11 +1279,22 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
             app.config.video_render.label(),
             selected,
         ),
-        ListItem::new(""),
+        cycle_item(
+            19,
+            "Pixel Video Quality (speed/detail)",
+            app.config.pixel_video_quality.label(),
+            selected,
+        ),
+        checkbox_item(
+            20,
+            "Sort Results by Upload Date",
+            app.config.sort_by_date,
+            selected,
+        ),
         section_header("  Advanced"),
         section_rule(),
         text_field_item(
-            22,
+            23,
             "Custom Format",
             custom_format,
             selected,
@@ -1439,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_to_lines_maps_top_pixel_to_fg_and_bottom_pixel_to_bg() {
+    fn half_block_renderer_maps_top_pixel_to_fg_and_bottom_pixel_to_bg() {
         // 2x4 pixel frame -> 2 columns, 2 cell rows of half-block glyphs.
         #[rustfmt::skip]
         let rgb = vec![
@@ -1454,25 +1498,66 @@ mod tests {
             rgb,
         };
 
-        let lines = frame_to_lines(&frame);
-        assert_eq!(lines.len(), 2);
+        let area = Rect::new(0, 0, 2, 2);
+        let mut buffer = Buffer::empty(area);
+        render_half_block_frame(&frame, area, &mut buffer);
 
-        let top_left = &lines[0].spans[0];
-        assert_eq!(top_left.content, "▀");
-        assert_eq!(top_left.style.fg, Some(Color::Rgb(255, 0, 0)));
-        assert_eq!(top_left.style.bg, Some(Color::Rgb(0, 0, 255)));
+        let top_left = buffer.cell((0, 0)).unwrap();
+        assert_eq!(top_left.symbol(), "▀");
+        assert_eq!(top_left.fg, Color::Rgb(255, 0, 0));
+        assert_eq!(top_left.bg, Color::Rgb(0, 0, 255));
 
-        let top_right = &lines[0].spans[1];
-        assert_eq!(top_right.style.fg, Some(Color::Rgb(0, 255, 0)));
-        assert_eq!(top_right.style.bg, Some(Color::Rgb(255, 255, 0)));
+        let top_right = buffer.cell((1, 0)).unwrap();
+        assert_eq!(top_right.fg, Color::Rgb(0, 255, 0));
+        assert_eq!(top_right.bg, Color::Rgb(255, 255, 0));
 
-        let bottom_left = &lines[1].spans[0];
-        assert_eq!(bottom_left.style.fg, Some(Color::Rgb(10, 20, 30)));
-        assert_eq!(bottom_left.style.bg, Some(Color::Rgb(70, 80, 90)));
+        let bottom_left = buffer.cell((0, 1)).unwrap();
+        assert_eq!(bottom_left.fg, Color::Rgb(10, 20, 30));
+        assert_eq!(bottom_left.bg, Color::Rgb(70, 80, 90));
 
-        let bottom_right = &lines[1].spans[1];
-        assert_eq!(bottom_right.style.fg, Some(Color::Rgb(40, 50, 60)));
-        assert_eq!(bottom_right.style.bg, Some(Color::Rgb(100, 110, 120)));
+        let bottom_right = buffer.cell((1, 1)).unwrap();
+        assert_eq!(bottom_right.fg, Color::Rgb(40, 50, 60));
+        assert_eq!(bottom_right.bg, Color::Rgb(100, 110, 120));
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance benchmark"]
+    fn benchmark_half_block_frame_rendering() {
+        use std::time::Instant;
+
+        const WIDTH: u16 = 160;
+        const ROWS: u16 = 48;
+        const ITERATIONS: usize = 500;
+
+        let rgb = (0..usize::from(WIDTH) * usize::from(ROWS) * 2 * 3)
+            .map(|index| index.wrapping_mul(31) as u8)
+            .collect();
+        let frame = VideoFrame {
+            width: WIDTH,
+            height_px: ROWS * 2,
+            rgb,
+        };
+        let backend = TestBackend::new(WIDTH, ROWS);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            terminal
+                .draw(|terminal_frame| {
+                    render_half_block_frame(
+                        std::hint::black_box(&frame),
+                        terminal_frame.area(),
+                        terminal_frame.buffer_mut(),
+                    );
+                })
+                .unwrap();
+        }
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "half-block render: {ITERATIONS} frames in {elapsed:?} ({:.3} ms/frame)",
+            elapsed.as_secs_f64() * 1_000.0 / ITERATIONS as f64
+        );
     }
 
     #[test]
@@ -1483,6 +1568,27 @@ mod tests {
         app.video_view = true;
 
         terminal.draw(|frame| render_ui(frame, &app)).unwrap();
+    }
+
+    #[test]
+    fn settings_modal_shows_pixel_video_quality() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_unicode_content();
+        app.settings_open = true;
+        app.settings_selected_index = 19;
+
+        terminal.draw(|frame| render_ui(frame, &app)).unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Pixel Video Quality"));
+        assert!(screen.contains("144p"));
     }
 
     #[test]

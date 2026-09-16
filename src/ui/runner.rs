@@ -23,20 +23,22 @@ const SEARCH_POLL_RATE: Duration = Duration::from_millis(50);
 const SEARCH_CACHE_CAPACITY: usize = 8;
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SearchCacheKey {
     query: String,
     page_size: usize,
     filter_shorts: bool,
+    sort_by_date: bool,
 }
 
 impl SearchCacheKey {
-    fn new(query: &str, page_size: usize, filter_shorts: bool) -> Self {
+    fn new(query: &str, page_size: usize, filter_shorts: bool, sort_by_date: bool) -> Self {
         Self {
             // Preserve case: a search can be a case-sensitive video/channel ID.
             query: query.trim().to_string(),
             page_size: clamp_results_per_page(page_size),
             filter_shorts,
+            sort_by_date,
         }
     }
 }
@@ -61,7 +63,12 @@ impl SearchCache {
         }
 
         self.remove_expired();
-        let key = SearchCacheKey::new(state.query(), state.page_size, state.filter_shorts);
+        let key = SearchCacheKey::new(
+            state.query(),
+            state.page_size,
+            state.filter_shorts,
+            state.sort_by_date,
+        );
         let now = Instant::now();
         let fetched_at = self
             .entries
@@ -90,9 +97,10 @@ impl SearchCache {
         query: &str,
         page_size: usize,
         filter_shorts: bool,
+        sort_by_date: bool,
     ) -> Option<PaginatedSearch> {
         self.remove_expired();
-        let key = SearchCacheKey::new(query, page_size, filter_shorts);
+        let key = SearchCacheKey::new(query, page_size, filter_shorts, sort_by_date);
         let index = self.entries.iter().position(|entry| entry.key == key)?;
         let entry = self.entries.remove(index)?;
         let state = entry.state.clone();
@@ -106,7 +114,7 @@ impl SearchCache {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SearchRequest {
     New,
     NextPage { target_page: usize },
@@ -169,7 +177,9 @@ pub fn run_app(
     let (search_tx, search_rx) = mpsc::channel();
     let mut search_runtime = SearchRuntime::default();
     let mut last_tick = Instant::now();
+    let mut last_player_poll = Instant::now();
     let mut dirty = true;
+    let mut native_video_visible = false;
 
     loop {
         if app.should_quit || INTERRUPTED.load(Ordering::SeqCst) {
@@ -202,14 +212,47 @@ pub fn run_app(
         }
 
         if dirty {
+            // Clear the old text before mpv places its image. Kitty graphics
+            // are an overlay and do not erase the underlying Ratatui cells,
+            // which otherwise makes a failed/late first frame look as though
+            // the toggle did nothing.
+            let entering_native =
+                app.video_view && app.native_kitty_video_active() && !native_video_visible;
+            if entering_native {
+                if let Some(player) = app.player_manager.as_mut() {
+                    let _ = player.take_kitty_output();
+                }
+                terminal.clear()?;
+            }
+
+            // Apply a video-mode toggle before drawing either surface.
+            let terminal_size = terminal.size()?;
+            sync_video(&mut app, (terminal_size.width, terminal_size.height));
+            let native_video_active = app.video_view && app.native_kitty_video_active();
+            if native_video_visible && !native_video_active {
+                // Clearing after `vo=null` removes the last Kitty placement
+                // and forces Ratatui to restore every underlying TUI cell.
+                terminal.clear()?;
+            }
+            crate::ui::terminal::resync_cursor(terminal)?;
             terminal.draw(|frame| render_ui(frame, &app))?;
+
+            let kitty_output = app
+                .player_manager
+                .as_mut()
+                .map_or_else(Vec::new, PlayerManager::take_kitty_output);
+            if native_video_active && !kitty_output.is_empty() {
+                crate::ui::terminal::write_raw(terminal, &kitty_output)?;
+            }
+            native_video_visible = native_video_active;
             dirty = false;
         }
 
         // The video view repaints on the tick, so 250ms would cap it at 4fps;
         // tighten the tick to keep frame delivery close to the pipeline rate.
         let tick_rate = if app.video_view {
-            app.video.tick_rate()
+            app.video
+                .tick_rate(app.config.video_render, app.native_kitty_video_active())
         } else {
             TICK_RATE
         };
@@ -228,8 +271,16 @@ pub fn run_app(
 
         if last_tick.elapsed() >= tick_rate {
             let terminal_size = terminal.size()?;
-            if poll_player(&mut app, (terminal_size.width, terminal_size.height)) {
+            let poll_status = last_player_poll.elapsed() >= TICK_RATE;
+            if poll_player(
+                &mut app,
+                (terminal_size.width, terminal_size.height),
+                poll_status,
+            ) {
                 dirty = true;
+            }
+            if poll_status {
+                last_player_poll = Instant::now();
             }
             last_tick = Instant::now();
         }
@@ -271,11 +322,12 @@ fn process_pending_action(
             app.search_phase = Some(SearchPhase::Initial);
             app.status_message = None;
 
-            if let Some(cached) =
-                search_runtime
-                    .cache
-                    .get(&query, app.page_size, !app.config.include_shorts)
-            {
+            if let Some(cached) = search_runtime.cache.get(
+                &query,
+                app.page_size,
+                !app.config.include_shorts,
+                app.config.sort_by_date,
+            ) {
                 search_runtime.generation = search_runtime.generation.wrapping_add(1);
                 if let Some(worker) = search_runtime.worker.take() {
                     worker.cancel_and_join();
@@ -285,6 +337,7 @@ fn process_pending_action(
             }
 
             *search = PaginatedSearch::new(&query, app.page_size, !app.config.include_shorts);
+            search.sort_by_date = app.config.sort_by_date;
             spawn_search(
                 search.clone(),
                 0,
@@ -611,13 +664,17 @@ fn start_queue_if_idle(app: &mut App) {
     }
 }
 
-fn poll_player(app: &mut App, terminal_size: (u16, u16)) -> bool {
-    let Some(player) = app.player_manager.as_mut() else {
+fn poll_player(app: &mut App, terminal_size: (u16, u16), poll_status: bool) -> bool {
+    if app.player_manager.is_none() {
         return false;
-    };
+    }
 
-    let update_error = player.update_status().err();
-    let finished = player.is_eof();
+    let (update_error, finished) = if poll_status {
+        let player = app.player_manager.as_mut().expect("checked above");
+        (player.update_status().err(), player.is_eof())
+    } else {
+        (None, false)
+    };
 
     if let Some(error) = update_error {
         // Consume EOF before dropping the broken manager so the current queue
@@ -631,48 +688,66 @@ fn poll_player(app: &mut App, terminal_size: (u16, u16)) -> bool {
         app.handle_next_video(false);
     }
 
-    if app.video_view {
-        sync_video(app, terminal_size);
-    }
+    sync_video(app, terminal_size);
 
-    // Warm the stream-URL cache for the playing track so the first toggle
-    // into the video view doesn't wait on yt-dlp. No-op once cached/pending.
-    if !app.config.audio_only
-        && let Some(video_id) = app
-            .player_manager
-            .as_ref()
-            .and_then(|player| player.current_video_id.clone())
-    {
-        app.video.prefetch(&video_id);
-    }
-
-    true
+    poll_status || app.video_view
 }
 
-/// Drive the terminal video pipeline from the latest mpv status. Runs on the
-/// same tick as `poll_player` so it always sees fresh position/pause state.
+/// Drive the terminal video pipeline from the latest mpv status snapshot.
+/// Metadata is refreshed independently at `TICK_RATE`; frame delivery runs at
+/// the selected renderer's higher cadence.
 /// Video failures never touch `app.player_manager` or `app.status_message`;
 /// they are surfaced only inside the video pane (see `video::VideoState`).
 fn sync_video(app: &mut App, (width, height): (u16, u16)) {
+    let has_player = app.player_manager.is_some();
+    let (cols, rows) = crate::ui::layout::video_pane_size(has_player, width, height);
+
+    if app.native_kitty_video_active()
+        && let Some(geometry) = app.video.mpv_kitty_geometry(cols, rows)
+        && let Some(player) = app.player_manager.as_mut()
+    {
+        if let Err(error) = player.set_kitty_video(app.video_view, geometry) {
+            app.status_message = Some(format!("Could not switch terminal video: {error}"));
+            app.video_view = false;
+        }
+        app.video.stop();
+        return;
+    }
+
+    if let Some(player) = app.player_manager.as_mut()
+        && let Some(geometry) = app.video.mpv_kitty_geometry(cols, rows)
+    {
+        // Returning to Blocks or to the normal TUI must remove mpv's Kitty
+        // image before youtui's own renderer paints those cells.
+        if let Err(error) = player.set_kitty_video(false, geometry) {
+            app.status_message = Some(format!("Could not hide terminal video: {error}"));
+        }
+    }
+
+    if !app.video_view {
+        app.video.stop();
+        return;
+    }
+
     let (video_id, playing, paused, time_pos) = match app.player_manager.as_ref() {
         Some(player) => (
-            player.current_video_id.clone(),
+            player.current_video_id.as_deref(),
             player.status.playing,
             player.status.paused,
             player.status.time_pos,
         ),
         None => (None, false, false, 0.0),
     };
-    let has_player = app.player_manager.is_some();
-    let (cols, rows) = crate::ui::layout::video_pane_size(has_player, width, height);
+
     app.video.sync(
         playing,
         paused,
-        video_id.as_deref(),
+        video_id,
         time_pos,
         cols,
         rows,
         app.config.video_render,
+        app.config.pixel_video_quality,
     );
 }
 
@@ -688,7 +763,8 @@ fn sync_runtime_settings(
     let page_size_changed = app.page_size != page_size || search.page_size != page_size;
     let shorts_filter = !app.config.include_shorts;
     let filter_changed = search.filter_shorts != shorts_filter;
-    if !page_size_changed && !filter_changed {
+    let sort_changed = search.sort_by_date != app.config.sort_by_date;
+    if !page_size_changed && !filter_changed && !sort_changed {
         return false;
     }
 
@@ -706,6 +782,7 @@ fn sync_runtime_settings(
     } else {
         search.page_size = page_size;
         search.filter_shorts = shorts_filter;
+        search.sort_by_date = app.config.sort_by_date;
     }
     true
 }
@@ -977,12 +1054,12 @@ mod tests {
         state.results = vec![result("1"), result("2")];
         cache.insert(&state);
 
-        let cached = cache.get("Jubal SHOW", 2, true).unwrap();
+        let cached = cache.get("Jubal SHOW", 2, true, false).unwrap();
         assert_eq!(cached.results.len(), 2);
         assert_eq!(cached.query(), "  Jubal SHOW ");
-        assert!(cache.get("jubal show", 2, true).is_none());
-        assert!(cache.get("Jubal SHOW", 2, false).is_none());
-        assert!(cache.get("Jubal SHOW", 3, true).is_none());
+        assert!(cache.get("jubal show", 2, true, false).is_none());
+        assert!(cache.get("Jubal SHOW", 2, false, false).is_none());
+        assert!(cache.get("Jubal SHOW", 3, true, false).is_none());
     }
 
     #[test]
@@ -1001,8 +1078,8 @@ mod tests {
         }
 
         assert_eq!(cache.entries.len(), SEARCH_CACHE_CAPACITY);
-        assert!(cache.get("query 0", 1, false).is_none());
-        let cached = cache.get("query 8", 1, false).unwrap();
+        assert!(cache.get("query 0", 1, false, false).is_none());
+        let cached = cache.get("query 8", 1, false, false).unwrap();
 
         let original_fetch = Instant::now() - Duration::from_secs(60);
         cache.entries.front_mut().unwrap().fetched_at = original_fetch;
@@ -1011,7 +1088,7 @@ mod tests {
 
         cache.entries.front_mut().unwrap().fetched_at =
             Instant::now() - SEARCH_CACHE_TTL - Duration::from_secs(1);
-        assert!(cache.get("query 8", 1, false).is_none());
+        assert!(cache.get("query 8", 1, false, false).is_none());
     }
 
     #[test]

@@ -1,7 +1,8 @@
-use std::io;
+use std::io::{self, Write};
 
 use anyhow::Result;
 use crossterm::{
+    cursor::{Hide, MoveTo},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -32,6 +33,23 @@ pub fn init_terminal() -> Result<Tui> {
     }
 }
 
+/// mpv's Kitty output repositions the real terminal cursor for each frame.
+/// Ratatui normally assumes nobody else touched it, so force a known origin
+/// before every TUI diff while that output is active.
+pub fn resync_cursor(terminal: &mut Tui) -> Result<()> {
+    execute!(terminal.backend_mut(), MoveTo(0, 0), Hide)?;
+    Ok(())
+}
+
+/// Write an already complete terminal-protocol packet through the same
+/// stdout owner Ratatui uses. Native mpv output is captured and forwarded
+/// here so its cursor and Kitty escapes cannot interleave with a TUI diff.
+pub fn write_raw(terminal: &mut Tui, bytes: &[u8]) -> Result<()> {
+    terminal.backend_mut().write_all(bytes)?;
+    terminal.backend_mut().flush()?;
+    Ok(())
+}
+
 pub fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     // Evaluate every cleanup operation before propagating the first error. A
     // failed raw-mode call must not prevent us from restoring the screen and
@@ -47,25 +65,21 @@ pub fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 }
 
 pub struct TerminalGuard {
-    terminal: Option<Tui>,
+    terminal: Tui,
 }
 
 impl TerminalGuard {
     pub fn new(terminal: Tui) -> Self {
-        Self {
-            terminal: Some(terminal),
-        }
+        Self { terminal }
     }
 
     pub fn get_mut(&mut self) -> &mut Tui {
-        self.terminal.as_mut().unwrap()
+        &mut self.terminal
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if let Some(mut terminal) = self.terminal.take() {
-            let _ = restore_terminal(&mut terminal);
-        }
+        let _ = restore_terminal(&mut self.terminal);
     }
 }

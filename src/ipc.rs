@@ -56,6 +56,16 @@ impl IpcClient {
         Ok(response.get("data").cloned())
     }
 
+    /// Send several mutating commands in one IPC batch, preserving their
+    /// order while avoiding a round trip per property.
+    pub fn send_commands(&mut self, commands: &[&[&str]]) -> Result<()> {
+        self.set_read_timeout(COMMAND_REPLY_TIMEOUT)?;
+        for response in self.execute_commands(commands)? {
+            ensure_success(&response)?;
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn get_property(&mut self, property: &str) -> Result<Value> {
         let values = self.get_properties(&[property])?;
@@ -291,6 +301,38 @@ mod tests {
         let values = client.get_properties(&["duration", "pause"]).unwrap();
         assert_eq!(values, vec![Some(json!(42.0)), Some(json!(true))]);
         assert_eq!(client.take_events(), vec![json!({ "event": "idle" })]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn batched_mutating_commands_require_every_reply_to_succeed() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server_reader = server_stream.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let mut reader = BufReader::new(server_reader);
+            let first = read_request(&mut reader);
+            let second = read_request(&mut reader);
+            reply(
+                &mut server_stream,
+                second["request_id"].as_u64().unwrap(),
+                "success",
+                Value::Null,
+            );
+            reply(
+                &mut server_stream,
+                first["request_id"].as_u64().unwrap(),
+                "success",
+                Value::Null,
+            );
+        });
+
+        let mut client = IpcClient::from_stream(client_stream).unwrap();
+        client
+            .send_commands(&[
+                &["set_property", "vo-kitty-cols", "80"],
+                &["set_property", "vo-kitty-rows", "24"],
+            ])
+            .unwrap();
         server.join().unwrap();
     }
 

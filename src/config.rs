@@ -28,7 +28,7 @@ fn default_auto_play_queue() -> bool {
 /// How the terminal video view draws frames. `Auto` picks `Pixels` when the
 /// terminal supports a graphics protocol (Kitty/iTerm2/Sixel), otherwise
 /// falls back to half-block cells.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoRenderMode {
     #[default]
@@ -55,7 +55,56 @@ impl VideoRenderMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Maximum source height used by the terminal video pipeline. Lower values
+/// start and seek faster; higher values retain more detail when scaled up.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Deserialize, Serialize)]
+pub enum PixelVideoQuality {
+    #[default]
+    #[serde(rename = "144p")]
+    P144,
+    #[serde(rename = "240p")]
+    P240,
+    #[serde(rename = "360p")]
+    P360,
+    #[serde(rename = "480p")]
+    P480,
+    #[serde(rename = "720p")]
+    P720,
+}
+
+impl PixelVideoQuality {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::P144 => Self::P240,
+            Self::P240 => Self::P360,
+            Self::P360 => Self::P480,
+            Self::P480 => Self::P720,
+            Self::P720 => Self::P144,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::P144 => "144p",
+            Self::P240 => "240p",
+            Self::P360 => "360p",
+            Self::P480 => "480p",
+            Self::P720 => "720p",
+        }
+    }
+
+    pub fn height(self) -> u16 {
+        match self {
+            Self::P144 => 144,
+            Self::P240 => 240,
+            Self::P360 => 360,
+            Self::P480 => 480,
+            Self::P720 => 720,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     #[serde(skip)]
@@ -65,6 +114,8 @@ pub struct Config {
     pub bandwidth_limit: bool,
     pub keep_temp: bool,
     pub include_shorts: bool,
+    #[serde(default)]
+    pub sort_by_date: bool,
     pub download_mode: bool,
     pub download_dir: String,
     pub results_per_page: usize,
@@ -75,6 +126,8 @@ pub struct Config {
     pub auto_play_queue: bool,
     #[serde(default)]
     pub video_render: VideoRenderMode,
+    #[serde(default)]
+    pub pixel_video_quality: PixelVideoQuality,
 }
 
 impl Config {
@@ -165,6 +218,11 @@ impl Config {
         self.save()
     }
 
+    pub fn toggle_sort_by_date(&mut self) -> Result<()> {
+        self.sort_by_date = !self.sort_by_date;
+        self.save()
+    }
+
     pub fn toggle_download_mode(&mut self) -> Result<()> {
         self.download_mode = !self.download_mode;
         self.save()
@@ -180,11 +238,27 @@ impl Config {
         self.save()
     }
 
+    pub fn cycle_pixel_video_quality(&mut self) -> Result<()> {
+        self.pixel_video_quality = self.pixel_video_quality.cycle();
+        self.save()
+    }
+
     pub fn format(&self) -> String {
         if !self.custom_format.is_empty() {
             self.custom_format.clone()
         } else {
             resolve_format(self.audio_only, self.bandwidth_limit)
+        }
+    }
+
+    /// Format for the long-lived queue player. Queue playback is always audio
+    /// first: terminal video has its own resolver/decoder and must never make
+    /// audio wait for, or fail with, a video stream.
+    pub fn queue_audio_format(&self) -> String {
+        if self.bandwidth_limit {
+            "bestaudio[abr<=128]/bestaudio/best".to_string()
+        } else {
+            "bestaudio/best".to_string()
         }
     }
 
@@ -207,6 +281,7 @@ impl Default for Config {
             bandwidth_limit: false,
             keep_temp: false,
             include_shorts: false,
+            sort_by_date: false,
             download_mode: false,
             download_dir: dirs::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -219,6 +294,7 @@ impl Default for Config {
             custom_format: String::new(),
             auto_play_queue: true,
             video_render: VideoRenderMode::Auto,
+            pixel_video_quality: PixelVideoQuality::P144,
         }
     }
 }
@@ -356,6 +432,39 @@ mod tests {
         // Older configs without the field default to auto.
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.video_render, VideoRenderMode::Auto);
+    }
+
+    #[test]
+    fn pixel_video_quality_cycles_and_round_trips() {
+        assert_eq!(PixelVideoQuality::P144.cycle(), PixelVideoQuality::P240);
+        assert_eq!(PixelVideoQuality::P240.cycle(), PixelVideoQuality::P360);
+        assert_eq!(PixelVideoQuality::P360.cycle(), PixelVideoQuality::P480);
+        assert_eq!(PixelVideoQuality::P480.cycle(), PixelVideoQuality::P720);
+        assert_eq!(PixelVideoQuality::P720.cycle(), PixelVideoQuality::P144);
+
+        let config: Config = toml::from_str("pixel_video_quality = \"480p\"").unwrap();
+        assert_eq!(config.pixel_video_quality, PixelVideoQuality::P480);
+        assert_eq!(config.pixel_video_quality.height(), 480);
+
+        // Older configs retain the fast source quality used before this setting.
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.pixel_video_quality, PixelVideoQuality::P144);
+    }
+
+    #[test]
+    fn queue_audio_format_never_selects_video() {
+        let video_enabled = Config::default();
+        assert_eq!(video_enabled.queue_audio_format(), "bestaudio/best");
+
+        let limited = Config {
+            bandwidth_limit: true,
+            pixel_video_quality: PixelVideoQuality::P720,
+            ..Config::default()
+        };
+        assert_eq!(
+            limited.queue_audio_format(),
+            "bestaudio[abr<=128]/bestaudio/best"
+        );
     }
 
     #[test]

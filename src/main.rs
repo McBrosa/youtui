@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CliAction {
     Run,
     Help,

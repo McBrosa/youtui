@@ -14,7 +14,7 @@ use crate::config::Config;
 const MAX_DOWNLOAD_BASE_BYTES: usize = 250;
 const MAX_VIDEO_ID_BYTES: usize = 64;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum PlayerType {
     #[default]
     Mpv,

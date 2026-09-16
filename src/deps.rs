@@ -1,14 +1,15 @@
-use anyhow::{Context, Result, bail};
 use std::io::{self, Write};
 use std::process::Command;
 
-#[derive(Debug, Clone, PartialEq)]
+use anyhow::{Context, Result, bail};
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Platform {
     MacOS,
     Linux(LinuxDistro),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LinuxDistro {
     Debian, // apt-based (Ubuntu, Debian, Mint)
     RedHat, // dnf-based (RHEL, Fedora, CentOS)

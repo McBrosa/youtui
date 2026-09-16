@@ -1,11 +1,6 @@
-//! Kitty graphics via POSIX shared memory (`t=s`): the escape sequence sent
-//! through the pty carries only a base64 shm object *name*; the terminal
-//! mmaps, reads, and unlinks the object itself. This replaces the
-//! `ratatui-image` `t=d` path (full base64 RGBA per frame through the pty)
-//! for local kitty-protocol terminals, cutting per-frame pty traffic from
-//! megabytes to ~100 bytes. Placement uses the same Unicode-placeholder
-//! (`U=1`) scheme as `ratatui-image`, so it composes with ratatui's cell
-//! diffing. See docs/superpowers/specs/2026-08-12-kitty-shm-transfer-design.md.
+//! Kitty graphics with explicit cell-based placement. Local Kitty uses POSIX
+//! shared memory; Ghostty and remote terminals receive chunked RGB24 data.
+//! Both use Unicode placeholders so images compose with Ratatui's cell diff.
 
 use std::cell::Cell;
 use std::ffi::CString;
@@ -25,7 +20,7 @@ use crate::video::Frame;
 /// flicker sources), and no delete escape is ever needed mid-stream.
 /// Value is arbitrary but fixed; `ratatui-image` uses random ids, so a
 /// collision with a concurrent crate-path image is effectively impossible.
-const IMAGE_ID: u32 = 0x00A0_A001;
+const IMAGE_ID: u32 = 0x00a0_a001;
 
 /// Pure function: should the shm transport be used? Kitty protocol only, and
 /// only when the terminal is on this machine (shm cannot cross an SSH
@@ -34,8 +29,10 @@ pub fn shm_supported(kitty: bool, ssh: bool, tmux: bool) -> bool {
     kitty && !ssh && !tmux
 }
 
-/// Kitty shared-memory frame transport for one app session.
-pub struct ShmKittyTransport {
+/// Kitty frame transport with explicit terminal-cell placement.
+pub struct KittyTransport {
+    use_shm: bool,
+    placement: Cell<(u16, u16)>,
     /// Frame counter; selects the shm name slot.
     seq: u64,
     /// Transmit escape for the newest frame, to prepend to the first
@@ -44,30 +41,46 @@ pub struct ShmKittyTransport {
     pending: Cell<Option<String>>,
 }
 
-impl ShmKittyTransport {
-    pub fn new() -> Self {
+impl KittyTransport {
+    pub fn new(use_shm: bool) -> Self {
         Self {
+            use_shm,
+            placement: Cell::new((0, 0)),
             seq: 0,
             pending: Cell::new(None),
         }
     }
 
-    /// Publish a decoded frame: copy it into a fresh shm object and queue
-    /// the transmit escape for the next render. `cols` x `rows` is the pane
-    /// the terminal scales the image onto (the `c`/`r` placement grid).
-    pub fn push_frame(&mut self, frame: &Frame, cols: u16, rows: u16) -> Result<()> {
-        self.seq += 1;
-        let name = shm_name(self.seq);
-        shm_write(&name, &frame.rgb)?;
+    pub fn reset(&mut self) {
+        self.seq = 0;
+        self.pending.set(None);
+    }
 
-        let escapes = transmit_escape(
-            &name,
-            frame.width as u32,
-            frame.height_px as u32,
-            cols,
-            rows,
-        );
+    pub fn uses_shared_memory(&self) -> bool {
+        self.use_shm
+    }
+
+    /// Queue a frame scaled to the pane's cell grid, regardless of pixel density.
+    pub fn push_frame(&mut self, frame: &Frame, cols: u16, rows: u16) -> Result<()> {
+        if cols == 0 || rows == 0 || frame.width == 0 || frame.height_px == 0 {
+            return Ok(());
+        }
+        self.seq += 1;
+        let escapes = if self.use_shm {
+            let name = shm_name(self.seq);
+            shm_write(&name, &frame.rgb)?;
+            transmit_escape(
+                &name,
+                u32::from(frame.width),
+                u32::from(frame.height_px),
+                cols,
+                rows,
+            )
+        } else {
+            transmit_direct(frame, cols, rows)
+        };
         self.pending.set(Some(escapes));
+        self.placement.set((cols, rows));
         Ok(())
     }
 
@@ -89,13 +102,26 @@ impl ShmKittyTransport {
 
         let width = usize::from(area.width);
         let row_tail: String = std::iter::repeat_n('\u{10EEEE}', width - 1).collect();
-        // Restore the saved cursor, then step to the end of the row so the
-        // terminal's cursor bookkeeping matches the cell the buffer thinks
-        // was written last.
+        // Restore the saved cursor, then step to the pane's bottom-right so
+        // the real terminal cursor matches Ratatui's position after it skips
+        // the placeholder-covered cells. Moving only to the row end leaves
+        // subsequent diffs vertically desynchronized.
         let right = area.width - 1;
-        let restore_cursor = format!("\x1b[u\x1b[{right}C");
+        let down = area.height - 1;
+        let restore_cursor = format!("\x1b[u\x1b[{right}C\x1b[{down}B");
 
         let mut pending = self.pending.take();
+        if self.placement.replace((area.width, area.height)) != (area.width, area.height) {
+            // A paused frame still needs to fill the pane after a window resize.
+            let mut escapes = pending.take().unwrap_or_default();
+            write!(
+                escapes,
+                "\x1b_Gq=2,i={IMAGE_ID},a=p,U=1,c={},r={};\x1b\\",
+                area.width, area.height,
+            )
+            .expect("internal error: writing to a String cannot fail");
+            pending = Some(escapes);
+        }
         // The placeholder row/column diacritic table has 297 entries; panes
         // are far shorter in practice.
         let height = area.height.min(DIACRITICS.len() as u16);
@@ -112,7 +138,7 @@ impl ShmKittyTransport {
                 "\x1b[s{id_color}\u{10EEEE}{}{}{}",
                 DIACRITICS[y as usize], DIACRITICS[0], DIACRITICS[id_extra as usize],
             )
-            .unwrap();
+            .expect("internal error: writing to a String cannot fail");
             symbol.push_str(&row_tail);
             symbol.push_str(&restore_cursor);
 
@@ -125,7 +151,7 @@ impl ShmKittyTransport {
             }
             if let Some(cell) = buf.cell_mut((area.left(), area.top() + y)) {
                 cell.set_symbol(&symbol)
-                    .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap()));
+                    .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
             }
         }
     }
@@ -135,7 +161,7 @@ impl ShmKittyTransport {
 /// that stops reading can strand at most 8 objects; each write unlinks the
 /// slot first. Kept short: macOS caps shm names at 31 characters.
 fn shm_name(seq: u64) -> String {
-    format!("/yt{:04x}.{}", std::process::id() & 0xFFFF, seq % 8)
+    format!("/yt{:04x}.{}", std::process::id() & 0xffff, seq % 8)
 }
 
 /// Pure function: kitty transmit-and-virtual-place escape for an shm object
@@ -148,6 +174,33 @@ fn transmit_escape(shm_name: &str, w: u32, h: u32, cols: u16, rows: u16) -> Stri
     format!(
         "\x1b_Gq=2,i={IMAGE_ID},a=T,U=1,f=24,t=s,s={w},v={h},c={cols},r={rows};{name_b64}\x1b\\"
     )
+}
+
+/// Send RGB24 at decode resolution and let the terminal scale to the pane.
+/// Explicit c/r also avoids native-pixel sizing differences on HiDPI terminals.
+fn transmit_direct(frame: &Frame, cols: u16, rows: u16) -> String {
+    const CHUNK_BYTES: usize = 3072; // At most 4096 base64 bytes per packet.
+    let mut chunks = frame.rgb.chunks(CHUNK_BYTES).peekable();
+    let mut escape = String::new();
+    let mut first = true;
+    while let Some(chunk) = chunks.next() {
+        if first {
+            write!(
+                escape,
+                "\x1b_Gq=2,i={IMAGE_ID},a=T,U=1,f=24,t=d,s={},v={},c={cols},r={rows},",
+                frame.width, frame.height_px,
+            )
+            .expect("internal error: writing to a String cannot fail");
+            first = false;
+        } else {
+            escape.push_str("\x1b_Gq=2,");
+        }
+        let more = u8::from(chunks.peek().is_some());
+        write!(escape, "m={more};").expect("internal error: writing to a String cannot fail");
+        base64_simd::STANDARD.encode_append(chunk, &mut escape);
+        escape.push_str("\x1b\\");
+    }
+    escape
 }
 
 /// Copy `data` into a fresh shm object named `name`. The terminal unlinks
@@ -185,8 +238,10 @@ fn shm_write(name: &str, data: &[u8]) -> Result<()> {
 
 fn write_via_mmap(fd: i32, data: &[u8]) -> Result<()> {
     let len = data.len();
-    // SAFETY: fd is a valid open shm descriptor.
-    if unsafe { libc::ftruncate(fd, len as libc::off_t) } != 0 {
+    let object_size = libc::off_t::try_from(len).context("shared-memory frame is too large")?;
+    // SAFETY: fd is a valid open shm descriptor and object_size is a
+    // representable, non-negative off_t value.
+    if unsafe { libc::ftruncate(fd, object_size) } != 0 {
         return Err(anyhow!(
             "Failed to size shm object: {}",
             std::io::Error::last_os_error()
@@ -211,7 +266,7 @@ fn write_via_mmap(fd: i32, data: &[u8]) -> Result<()> {
     }
     // SAFETY: ptr maps exactly `len` writable bytes and data is `len` long;
     // the regions cannot overlap (one is a fresh shm mapping).
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, len) };
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>(), len) };
     // SAFETY: ptr is a live mapping of exactly `len` bytes, unmapped once.
     unsafe { libc::munmap(ptr, len) };
     Ok(())
@@ -542,6 +597,94 @@ mod tests {
     }
 
     #[test]
+    fn direct_frames_fill_the_pane_without_upscaling_the_pixel_payload() {
+        let frame = Frame {
+            width: 4,
+            height_px: 2,
+            rgb: (0..24).collect(),
+        };
+        let mut transport = KittyTransport::new(false);
+        transport.push_frame(&frame, 188, 51).unwrap();
+        let area = Rect::new(0, 0, 188, 51);
+        let mut buffer = Buffer::empty(area);
+        transport.render(area, &mut buffer);
+        let first = buffer.cell((0, 0)).unwrap().symbol();
+        assert!(first.starts_with("\x1b_Gq=2,i=10526721,a=T,U=1,f=24,t=d,s=4,v=2,c=188,r=51,m=0;"));
+        let payload = first
+            .split_once(';')
+            .unwrap()
+            .1
+            .split("\x1b\\")
+            .next()
+            .unwrap();
+        assert_eq!(
+            base64_simd::STANDARD.decode_to_vec(payload).unwrap(),
+            frame.rgb
+        );
+        for row in 0..area.height {
+            assert_eq!(
+                buffer
+                    .cell((0, row))
+                    .unwrap()
+                    .symbol()
+                    .matches('\u{10EEEE}')
+                    .count(),
+                188
+            );
+        }
+    }
+
+    #[test]
+    fn direct_transfer_chunks_preserve_all_rgb_data() {
+        for bytes in [3072, 3075, 6144] {
+            let frame = Frame {
+                width: (bytes / 3) as u16,
+                height_px: 1,
+                rgb: vec![91; bytes],
+            };
+            let escape = transmit_direct(&frame, 100, 30);
+            let packets: Vec<_> = escape.split("\x1b\\").filter(|s| !s.is_empty()).collect();
+            let mut decoded = Vec::new();
+            for (index, packet) in packets.iter().enumerate() {
+                let (control, payload) = packet.split_once(';').unwrap();
+                assert!(payload.len() <= 4096);
+                let more = u8::from(index + 1 < packets.len());
+                assert!(control.ends_with(&format!("m={more}")));
+                if index > 0 {
+                    assert!(!control.contains("a=T"));
+                    assert!(!control.contains("c="));
+                }
+                decoded.extend(base64_simd::STANDARD.decode_to_vec(payload).unwrap());
+            }
+            assert_eq!(decoded, frame.rgb);
+        }
+    }
+
+    #[test]
+    fn resizing_a_paused_frame_updates_placement_without_retransmitting_pixels() {
+        let frame = Frame {
+            width: 2,
+            height_px: 2,
+            rgb: vec![255; 12],
+        };
+        let mut transport = KittyTransport::new(false);
+        transport.push_frame(&frame, 80, 24).unwrap();
+        let initial = Rect::new(0, 0, 80, 24);
+        transport.render(initial, &mut Buffer::empty(initial));
+
+        let resized = Rect::new(0, 0, 188, 51);
+        let mut buffer = Buffer::empty(resized);
+        transport.render(resized, &mut buffer);
+        let first = buffer.cell((0, 0)).unwrap().symbol();
+        assert!(first.starts_with("\x1b_Gq=2,i=10526721,a=p,U=1,c=188,r=51;\x1b\\"));
+        assert!(!first.contains("a=T"));
+
+        transport.reset();
+        assert!(!transport.has_frame());
+        assert!(!transport.use_shm);
+    }
+
+    #[test]
     fn shm_names_stay_within_macos_31_char_limit_and_rotate() {
         let name = shm_name(1);
         assert!(name.len() <= 31);
@@ -587,7 +730,7 @@ mod tests {
 
     #[test]
     fn push_frame_queues_a_transmit_escape_with_the_pane_grid() {
-        let mut transport = ShmKittyTransport::new();
+        let mut transport = KittyTransport::new(true);
         let frame = Frame {
             width: 2,
             height_px: 2,
@@ -607,7 +750,7 @@ mod tests {
 
     #[test]
     fn render_paints_placeholders_with_pending_escapes_in_first_row() {
-        let mut transport = ShmKittyTransport::new();
+        let mut transport = KittyTransport::new(true);
         transport.seq = 1;
         transport.pending.set(Some("ESCAPES".to_string()));
 
@@ -618,8 +761,10 @@ mod tests {
         let first = buf.cell((0, 0)).unwrap().symbol();
         assert!(first.starts_with("ESCAPES"));
         assert!(first.contains('\u{10EEEE}'));
+        assert!(first.ends_with("\x1b[u\x1b[3C\x1b[1B"));
         let second_row = buf.cell((0, 1)).unwrap().symbol();
         assert!(!second_row.contains("ESCAPES"));
         assert!(second_row.contains('\u{10EEEE}'));
+        assert!(second_row.ends_with("\x1b[u\x1b[3C\x1b[1B"));
     }
 }

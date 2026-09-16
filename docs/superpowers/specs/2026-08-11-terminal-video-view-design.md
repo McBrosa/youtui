@@ -1,5 +1,13 @@
 # Terminal Video View — Design Spec
 
+> Update (2026-08-13): local Kitty-protocol terminals now use mpv's native
+> Superseded 2026-08-19: queue playback is always audio-only. Terminal video
+> now uses the independent yt-dlp/FFmpeg renderer on every terminal so video
+> startup or failure cannot affect audio. Kitty uses shared memory when
+> available; Ghostty uses bounded direct frames because Ghostty 1.3.1 on
+> macOS rejects `t=s`. The separate FFmpeg pipeline described below remains
+> the Blocks/non-Kitty fallback.
+
 **Date:** 2026-08-11
 **Status:** Approved
 

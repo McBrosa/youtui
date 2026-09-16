@@ -1,5 +1,6 @@
-use crate::search::SearchResult;
 use std::collections::VecDeque;
+
+use crate::search::SearchResult;
 
 pub struct Queue {
     tracks: VecDeque<SearchResult>,

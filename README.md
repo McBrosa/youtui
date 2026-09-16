@@ -9,6 +9,8 @@ A responsive terminal interface for searching, queueing, streaming, and download
   adaptive Shorts filtering
 - Keyboard-first results and queue navigation
 - Integrated mpv playback controls, progress, and automatic queue playback
+- Independent in-terminal video on Kitty-protocol terminals (including
+  Ghostty), without delaying or interrupting the audio player
 - VLC and mplayer fallback support
 - Audio-only, bandwidth-limited, and permanent-download modes
 - Responsive layouts for wide, narrow, and small terminals
@@ -16,10 +18,10 @@ A responsive terminal interface for searching, queueing, streaming, and download
 
 ## Requirements
 
-- Rust 1.88 or newer
+- Rust 1.90 or newer
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
 - One supported player: [`mpv`](https://mpv.io/) (recommended), VLC, or mplayer
-- `ffmpeg` when merging downloaded video/audio streams or extracting audio
+- `ffmpeg` when merging/extracting downloads or using the portable block/non-Kitty video renderer
 
 mpv provides the full in-TUI queue and playback experience. VLC and mplayer use a foreground fallback that downloads media to a temporary directory before playback.
 
@@ -83,6 +85,7 @@ Type a query in the search bar and press Enter. The footer always shows the shor
 | Playback | `<` / `>` | Seek backward / forward 10 seconds |
 | Playback | `+` / `-` | Raise / lower volume |
 | Playback | `m` | Mute or restore volume |
+| Playback | `v` | Toggle the in-terminal video pane |
 
 ## Settings
 
@@ -95,6 +98,10 @@ Press `F2` (or uppercase `S` outside the search bar) to configure:
 - Automatic queue playback
 - Permanent-download mode and destination
 - Results per page (default: 20, valid range: 1–500)
+- Terminal video renderer and pixel-video source quality (144p–720p). Video
+  resolves and decodes independently from the audio-only queue player, so a
+  slow or unavailable video stream cannot block audio. Kitty uses shared
+  memory when available; other transports use bounded direct or block frames.
 - An advanced custom yt-dlp format selector
 
 Changes are persisted automatically. Configuration is stored at:

@@ -2,7 +2,7 @@
 name = "youtui"
 version = "2.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "A fast terminal interface for searching, queueing, and playing YouTube videos"
 license = "MIT"
 repository = "https://github.com/McBrosa/youtui"

@@ -231,11 +231,9 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Toggle the terminal video view on/off. Turning it on requires an active,
-/// non-audio-only track; turning it off always works and always stops any
-/// in-flight video session. Also flips mpv's own `vid` property so its
-/// redundant OS window/decode gets out of the way (best-effort: failure is
-/// reported but never blocks the toggle).
+/// Toggle the terminal video pane. The runner performs the corresponding mpv
+/// output switch once it knows the exact pane geometry; portable renderers are
+/// stopped immediately when leaving the pane.
 fn toggle_video_view(app: &mut App) {
     if app.video_view {
         app.video_view = false;
@@ -642,7 +640,7 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
     }
 
     // Define selectable indices (skip section headers)
-    const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 6, 7, 8, 12, 13, 17, 18, 22];
+    const SELECTABLE_INDICES: &[usize] = &[2, 3, 4, 5, 6, 7, 8, 12, 13, 17, 18, 19, 20, 23];
 
     match key.code {
         KeyCode::Esc => {
@@ -728,7 +726,17 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
                     let result = app.config.cycle_video_render();
                     record_settings_save_result(app, result);
                 }
-                22 => {
+                19 => {
+                    // Pixel quality cycle: 144p → 240p → 360p → 480p → 720p
+                    let result = app.config.cycle_pixel_video_quality();
+                    record_settings_save_result(app, result);
+                }
+                20 => {
+                    // Sort by upload date checkbox
+                    let result = app.config.toggle_sort_by_date();
+                    record_settings_save_result(app, result);
+                }
+                23 => {
                     // Custom Format text field - enter edit mode
                     app.settings_editing = Some(SettingsField::CustomFormat);
                     app.settings_text_input = Some(app.config.custom_format.clone());
@@ -783,7 +791,7 @@ fn finish_settings_edit(app: &mut App, field: SettingsField) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, PixelVideoQuality};
     use crate::player_manager::PlayerManager;
     use crate::search::SearchResult;
     use serde_json::{Value, json};
@@ -1296,8 +1304,7 @@ mod tests {
 
     #[test]
     fn video_view_toggles_on_and_off_while_a_track_is_playing() {
-        // Toggling touches no mpv IPC: mpv always runs --no-video, so there
-        // is no window/track to switch.
+        // The runner applies the mpv output switch once pane geometry is known.
         let (client_stream, _server_stream) = UnixStream::pair().unwrap();
         let mut app = App::new("test".to_string(), 10, Config::default());
         let mut player = PlayerManager::from_test_stream(client_stream);
@@ -1484,6 +1491,17 @@ mod tests {
         handle_browse_keys(&mut app, key);
 
         assert!(app.config.audio_only);
+    }
+
+    #[test]
+    fn settings_cycles_pixel_video_quality() {
+        let mut app = App::new("test query".to_string(), 10, Config::default());
+        app.settings_open = true;
+        app.settings_selected_index = 19;
+
+        handle_browse_keys(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(app.config.pixel_video_quality, PixelVideoQuality::P240);
     }
 
     #[test]

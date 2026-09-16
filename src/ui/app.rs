@@ -3,20 +3,20 @@ use crate::player_manager::PlayerManager;
 use crate::queue::Queue;
 use crate::search::SearchResult;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputMode {
     Browse,
     Help,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FocusedPanel {
     SearchBar,
     Results,
     Queue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SettingsField {
     DownloadDir,
     ResultsPerPage,
@@ -25,7 +25,7 @@ pub enum SettingsField {
     CustomFormat,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AppAction {
     None,
     Play(usize),
@@ -35,7 +35,7 @@ pub enum AppAction {
     CancelSearch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchPhase {
     Initial,
     RequestedPage { target_page: usize },
@@ -118,6 +118,14 @@ impl App {
         &self.results[start..end]
     }
 
+    pub fn native_kitty_video_active(&self) -> bool {
+        self.video.mpv_kitty_active(self.config.video_render)
+            && self
+                .player_manager
+                .as_ref()
+                .is_some_and(PlayerManager::native_kitty_enabled)
+    }
+
     pub fn has_next_page(&self) -> bool {
         let end = self
             .page
@@ -184,7 +192,6 @@ impl App {
                     }
                 } else {
                     // Create player manager if it doesn't exist
-                    use crate::player_manager::PlayerManager;
                     match PlayerManager::new(&self.config) {
                         Ok(mut pm) => {
                             let result = if should_auto_play {

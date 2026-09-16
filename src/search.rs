@@ -16,7 +16,7 @@ const SEARCH_CEILING: usize = 500;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchResult {
     pub title: String,
     pub duration: String,
@@ -63,6 +63,20 @@ impl SearchResult {
     }
 }
 
+fn url_encode_query(query: &str) -> String {
+    let mut encoded = String::with_capacity(query.len());
+    for byte in query.trim().bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 pub fn check_ytdlp() -> Result<()> {
     which::which("yt-dlp").map_err(|_| {
         anyhow::anyhow!("yt-dlp is not installed\nPlease install it with: pip install yt-dlp")
@@ -77,6 +91,8 @@ pub struct PaginatedSearch {
     query: String,
     pub page_size: usize,
     pub filter_shorts: bool,
+    /// Sort results by upload date (newest first) instead of relevance.
+    pub sort_by_date: bool,
     /// All results that have passed filtering so far.
     pub results: Vec<SearchResult>,
     /// How many raw yt-dlp playlist items we have consumed (1-indexed high-water mark).
@@ -91,6 +107,7 @@ impl PaginatedSearch {
             query: query.to_string(),
             page_size: clamp_results_per_page(page_size),
             filter_shorts,
+            sort_by_date: false,
             results: Vec::new(),
             raw_cursor: 0,
             exhausted: false,
@@ -149,7 +166,17 @@ impl PaginatedSearch {
             return Ok(self.results.len());
         }
 
-        let search_id = format!("ytsearch{}:{}", SEARCH_CEILING, self.query);
+        // YouTube ignores the bare date-sort param (and modern yt-dlp dropped
+        // `ytsearchdate`), but sort-by-upload-date still applies when combined
+        // with an upload-date filter. CAISBAgFEAE%3D = sort:date + past year.
+        let search_id = if self.sort_by_date {
+            format!(
+                "https://www.youtube.com/results?search_query={}&sp=CAISBAgFEAE%3D",
+                url_encode_query(&self.query)
+            )
+        } else {
+            format!("ytsearch{}:{}", SEARCH_CEILING, self.query)
+        };
         let range = format!("{start}:{SEARCH_CEILING}");
 
         let mut cmd = Command::new("yt-dlp");
@@ -280,7 +307,7 @@ impl PaginatedSearch {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConsumedLine {
     Accepted,
     Ignored,
@@ -554,6 +581,14 @@ fn format_view_count(count: u64) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn query_is_url_encoded_for_date_sorted_search() {
+        assert_eq!(
+            url_encode_query("  rock & roll / 100% \"live\" "),
+            "rock+%26+roll+%2F+100%25+%22live%22"
+        );
+    }
 
     #[test]
     fn parses_json_without_confusing_pipes_for_field_delimiters() {
