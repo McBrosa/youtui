@@ -82,6 +82,7 @@ defmodule Youtui.MixProject do
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.build": ["compile", "tailwind youtui_web", "esbuild youtui_web"],
       "assets.deploy": [
+        "compile",
         "tailwind youtui_web --minify",
         "esbuild youtui_web --minify",
         "phx.digest"
