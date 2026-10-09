@@ -1,0 +1,19 @@
+{
+  "target": ".impeccable/review/gold-rendered.html",
+  "mode": "one static HTML scan with actual production CSS inline",
+  "primaryCount": 7,
+  "advisoryCount": 1,
+  "findings": [
+    {"rule": "low-contrast", "count": 4, "line": 0, "detail": "Default flash error theme: #fceeef on #ea003e, 4.1:1."},
+    {"rule": "cramped-padding", "count": 2, "line": 0, "detail": "Default flash alert children without detected inset."},
+    {"rule": "flat-type-hierarchy", "count": 1, "line": 0, "detail": "Static role sizes 12.8px/14.1px/16.8px; responsive clamp h1 not included."},
+    {"rule": "repeating-stripes-gradient", "count": 1, "advisory": true, "line": 0, "detail": "Unused bundled daisyUI progress styling."}
+  ],
+  "resolution": {
+    "flashAlerts": "These nodes are hidden while connected, but their real disconnected states need readable styling. Added scoped palette and padding overrides for #client-error and #server-error.",
+    "typeHierarchy": "Render shows 44px desktop h1 and 31.2px mobile h1 versus 16px body. Static scanner omits clamp h1; pass to reviewer rather than flattening the approved utility scale.",
+    "gradient": "No gradient appears on this UI; declaration belongs to unused bundled plugin components. No detector ignore or plugin-wide cleanup added.",
+    "otherCaptureFixes": "Constrained result-art styling to its direct child so it no longer paints nested masked icons gold-on-gold. Stretched the settings card at narrow widths. Tinted error details from error foreground.",
+    "rerun": "No second detector run. Final screenshots and source go to a fresh finish reviewer."
+  }
+}

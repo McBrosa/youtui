@@ -18,8 +18,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@1.90.0
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libchafa-dev pkg-config
 
       - name: Check all targets
         run: cargo check --all-targets --all-features --locked
@@ -36,6 +39,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libchafa-dev pkg-config
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -60,5 +66,43 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install native dependencies
+        run: brew install chafa pkg-config
+
       - name: Run hermetic audio playback smoke test
         run: cargo test --test audio_only_playback_smoke --locked
+
+  web:
+    name: Phoenix interface
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Erlang and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '29.0'
+          elixir-version: '1.20.3'
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Compile without warnings
+        run: mix compile --warnings-as-errors
+
+      - name: Run Phoenix tests
+        run: mix test
+
+      - name: Build production assets
+        run: MIX_ENV=prod mix assets.deploy
+
+      - name: Build Phoenix release
+        run: MIX_ENV=prod mix release

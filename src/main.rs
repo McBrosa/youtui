@@ -10,6 +10,8 @@ mod queue;
 mod search;
 mod ui;
 mod video;
+mod web_backend;
+mod web_launcher;
 
 use std::ffi::OsString;
 
@@ -20,10 +22,13 @@ use config::Config;
 use player::detect_player;
 use search::{PaginatedSearch, check_ytdlp};
 use ui::FocusedPanel;
+use web_launcher::WebOptions;
 
 fn main() -> Result<()> {
     match parse_cli_args(std::env::args_os().skip(1))? {
         CliAction::Run => {}
+        CliAction::Web(options) => return web_launcher::run(options),
+        CliAction::Backend => return web_backend::run_stdio(),
         CliAction::Help => {
             print_help();
             return Ok(());
@@ -77,6 +82,8 @@ fn main() -> Result<()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CliAction {
     Run,
+    Web(WebOptions),
+    Backend,
     Help,
     Version,
 }
@@ -84,20 +91,50 @@ enum CliAction {
 fn parse_cli_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
     let args: Vec<OsString> = args.into_iter().collect();
     match args.as_slice() {
-        [] => Ok(CliAction::Run),
-        [arg] if arg == "-h" || arg == "--help" => Ok(CliAction::Help),
-        [arg] if arg == "-V" || arg == "--version" => Ok(CliAction::Version),
-        [arg] => bail!(
-            "unknown argument `{}`\n\nTry `youtui --help` for usage.",
-            arg.to_string_lossy()
-        ),
-        _ => bail!("youtui does not accept positional arguments\n\nTry `youtui --help` for usage."),
+        [] => return Ok(CliAction::Run),
+        [arg] if arg == "-h" || arg == "--help" => return Ok(CliAction::Help),
+        [arg] if arg == "-V" || arg == "--version" => return Ok(CliAction::Version),
+        [arg] if arg == "--backend-stdio" => return Ok(CliAction::Backend),
+        _ => {}
     }
+
+    let mut web = false;
+    let mut no_open = false;
+    let mut port = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--web") if !web => web = true,
+            Some("--no-open") if !no_open => no_open = true,
+            Some("--port") if port.is_none() => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--port requires a value"))?;
+                let number = value
+                    .to_str()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .filter(|number| *number > 0)
+                    .ok_or_else(|| anyhow::anyhow!("--port requires a number from 1 to 65535"))?;
+                port = Some(number);
+            }
+            _ => bail!(
+                "unknown or repeated argument `{}`\n\nTry `youtui --help` for usage.",
+                arg.to_string_lossy()
+            ),
+        }
+    }
+    if !web {
+        bail!("--port and --no-open require --web\n\nTry `youtui --help` for usage.");
+    }
+    Ok(CliAction::Web(WebOptions {
+        port: port.unwrap_or(4000),
+        open_browser: !no_open,
+    }))
 }
 
 fn print_help() {
     println!(
-        "youtui {version}\n{description}\n\nUsage: youtui\n\nOptions:\n  -h, --help       Print help\n  -V, --version    Print version",
+        "youtui {version}\n{description}\n\nUsage: youtui [--web [--port PORT] [--no-open]]\n\nOptions:\n      --web        Start the local browser interface\n      --port PORT  Set the web port (default: 4000)\n      --no-open    Print the web URL without opening a browser\n  -h, --help       Print help\n  -V, --version    Print version",
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
     );
@@ -128,5 +165,40 @@ mod tests {
     fn cli_rejects_unknown_and_extra_arguments() {
         assert!(parse_cli_args([OsString::from("--wat")]).is_err());
         assert!(parse_cli_args([OsString::from("--help"), OsString::from("extra")]).is_err());
+    }
+
+    #[test]
+    fn cli_selects_web_and_accepts_its_options() {
+        let args = ["--web", "--port", "4010", "--no-open"].map(OsString::from);
+        assert_eq!(
+            parse_cli_args(args).unwrap(),
+            CliAction::Web(WebOptions {
+                port: 4010,
+                open_browser: false,
+            })
+        );
+        assert_eq!(
+            parse_cli_args([OsString::from("--web")]).unwrap(),
+            CliAction::Web(WebOptions {
+                port: 4000,
+                open_browser: true
+            })
+        );
+    }
+
+    #[test]
+    fn cli_rejects_invalid_web_options() {
+        for args in [
+            vec!["--port", "4000"],
+            vec!["--no-open"],
+            vec!["--web", "--port"],
+            vec!["--web", "--port", "0"],
+            vec!["--web", "--port", "65536"],
+            vec!["--web", "--port", "abc"],
+            vec!["--web", "--web"],
+            vec!["--web", "--backend-stdio"],
+        ] {
+            assert!(parse_cli_args(args.into_iter().map(OsString::from)).is_err());
+        }
     }
 }

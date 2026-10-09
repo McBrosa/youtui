@@ -34,6 +34,64 @@ cargo install --path . --locked
 youtui
 ```
 
+### Browser interface
+
+The browser interface uses a local Phoenix LiveView application.
+Videos play in the browser. Rust supplies search, queues, settings, and media preparation.
+Web mode requires yt-dlp, ffmpeg, and ffprobe.
+Full YouTube extraction also requires a supported JavaScript runtime, such as Deno, and the yt-dlp EJS components.
+
+For source development, install Elixir and Erlang. Then prepare the Phoenix application:
+
+```bash
+cd web
+mix setup
+cd ..
+cargo build --locked
+cargo run --locked -- --web
+```
+
+After installation with Cargo, start the interface with:
+
+```bash
+youtui --web
+youtui --web --port 4010
+youtui --web --no-open
+```
+
+The launcher opens a local browser session and prints its URL.
+Press Ctrl+C in the terminal to stop the server and its background processes.
+The server binds to `127.0.0.1`.
+Web mode does not require mpv or a terminal with graphics support.
+
+The interface includes search, cancellation, pagination, video playback, queue controls, and shared settings.
+The browser supplies playback controls for pause, seeking, volume, and fullscreen.
+The first version prepares a complete MP4 before playback starts.
+Video preparation uses H.264 and AAC, with a source height limit of 720p.
+The page shows the preparation state. Temporary media files are removed when the background worker exits.
+
+One browser tab owns playback at a time.
+Searches remain independent between tabs.
+Starting playback in another tab transfers playback ownership.
+Queues remain in memory for the running web session.
+The web queue holds up to 100 upcoming videos.
+
+For a packaged Phoenix companion, build the release:
+
+```bash
+cd web
+MIX_ENV=prod mix assets.deploy
+MIX_ENV=prod mix release
+cd ..
+YOUTUI_WEB_RELEASE="$PWD/web/_build/prod/rel/youtui_web" youtui --web
+```
+
+The release includes the Erlang runtime and compiled web assets.
+Build a separate release for each supported operating system and architecture.
+The launcher also discovers a companion at `../lib/youtui/web` relative to the Rust executable directory.
+`YOUTUI_WEB_DIR` selects a Phoenix source project instead of the repository default.
+`YOUTUI_CONFIG_PATH` selects an alternate settings file for development or isolated tests.
+
 On startup, youtui offers to install a missing `yt-dlp` or media player with Homebrew, apt, dnf, or pacman when the platform is recognized. It never treats non-interactive input as permission to run a package manager.
 
 To install dependencies yourself:
@@ -116,6 +174,14 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
 cargo build --release --locked
+```
+
+Run the web checks from `web/`:
+
+```bash
+mix precommit
+MIX_ENV=prod mix assets.deploy
+MIX_ENV=prod mix release
 ```
 
 The test suite includes hermetic audio-only playback and streaming-search smoke

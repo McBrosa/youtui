@@ -83,22 +83,22 @@ fn pump_mpv_kitty_output<R: Read>(
                     let Some((apc_start, apc_end, controls)) = kitty_apc(&packet) else {
                         continue;
                     };
-                    let complete;
-                    if kitty_param(controls, b"a=T") && !kitty_param(controls, b"t=s") {
-                        let start = cursor_prefix_start(&packet, apc_start);
-                        direct_frame.clear();
-                        direct_frame.extend_from_slice(&packet[start..apc_end]);
-                        // `m=0` is the protocol default and mpv omits it when
-                        // the complete image fits in the first APC.
-                        complete = !kitty_param(controls, b"m=1");
-                    } else if !direct_frame.is_empty()
-                        && (kitty_param(controls, b"m=1") || kitty_param(controls, b"m=0"))
-                    {
-                        direct_frame.extend_from_slice(&packet[apc_start..apc_end]);
-                        complete = !kitty_param(controls, b"m=1");
-                    } else {
-                        continue;
-                    }
+                    let complete =
+                        if kitty_param(controls, b"a=T") && !kitty_param(controls, b"t=s") {
+                            let start = cursor_prefix_start(&packet, apc_start);
+                            direct_frame.clear();
+                            direct_frame.extend_from_slice(&packet[start..apc_end]);
+                            // `m=0` is the protocol default and mpv omits it when
+                            // the complete image fits in the first APC.
+                            !kitty_param(controls, b"m=1")
+                        } else if !direct_frame.is_empty()
+                            && (kitty_param(controls, b"m=1") || kitty_param(controls, b"m=0"))
+                        {
+                            direct_frame.extend_from_slice(&packet[apc_start..apc_end]);
+                            !kitty_param(controls, b"m=1")
+                        } else {
+                            continue;
+                        };
 
                     if complete
                         && !publish_latest_frame(latest_frame, std::mem::take(&mut direct_frame))

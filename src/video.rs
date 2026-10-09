@@ -1649,7 +1649,7 @@ mod tests {
                 "-c",
                 r#"mkdir "$TMPDIR/_MEI_fixture"
 printf '%s' "$TMPDIR" > "$1"
-(sleep 1; printf escaped > "$2") &
+(sleep 5; printf escaped > "$2") &
 wait"#,
                 "resolver-fixture",
             ])
@@ -1659,7 +1659,9 @@ wait"#,
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let deadline = if timeout {
-            Duration::from_millis(200)
+            // Allow the shell to start on a busy machine. The descendant
+            // still runs longer than this deadline, so timeout must kill it.
+            Duration::from_secs(2)
         } else {
             Duration::from_secs(5)
         };
@@ -1695,7 +1697,7 @@ wait"#,
         drop(pending);
         let temp_path = std::fs::read_to_string(&ready).unwrap();
         assert!(!std::path::Path::new(&temp_path).exists());
-        thread::sleep(Duration::from_millis(1100));
+        thread::sleep(Duration::from_millis(5100));
         assert!(
             !escaped.exists(),
             "resolver descendant survived cancellation"

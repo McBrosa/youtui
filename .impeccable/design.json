@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-01T21:09:09Z",
+  "title": "Design System: Youtui Web",
+  "extensions": {
+    "tonalRampNote": "These 8-step OKLCH ramps are synthesized documentation previews. They are not implemented theme variants.",
+    "colorMeta": {
+      "page": { "role": "neutral", "displayName": "Warm Page", "canonical": "#f7f7f2", "tonalRamp": ["oklch(15% 0.01 105)", "oklch(25% 0.01 105)", "oklch(35% 0.01 105)", "oklch(45% 0.01 105)", "oklch(55% 0.01 105)", "oklch(65% 0.01 105)", "oklch(80% 0.01 105)", "oklch(95% 0.01 105)"] },
+      "surface": { "role": "neutral", "displayName": "White Surface", "canonical": "#fff", "tonalRamp": ["oklch(15% 0 0)", "oklch(25% 0 0)", "oklch(35% 0 0)", "oklch(45% 0 0)", "oklch(55% 0 0)", "oklch(65% 0 0)", "oklch(80% 0 0)", "oklch(95% 0 0)"] },
+      "surface-soft": { "role": "neutral", "displayName": "Soft Surface", "canonical": "#f1f1eb", "tonalRamp": ["oklch(15% 0.005 105)", "oklch(25% 0.005 105)", "oklch(35% 0.005 105)", "oklch(45% 0.005 105)", "oklch(55% 0.005 105)", "oklch(65% 0.005 105)", "oklch(80% 0.005 105)", "oklch(95% 0.005 105)"] },
+      "ink": { "role": "neutral", "displayName": "Ink", "canonical": "#191a23", "tonalRamp": ["oklch(15% 0.02 275)", "oklch(25% 0.02 275)", "oklch(35% 0.02 275)", "oklch(45% 0.02 275)", "oklch(55% 0.02 275)", "oklch(65% 0.02 275)", "oklch(80% 0.02 275)", "oklch(95% 0.02 275)"] },
+      "text": { "role": "neutral", "displayName": "Body Text", "canonical": "#30313a", "tonalRamp": ["oklch(15% 0.015 275)", "oklch(25% 0.015 275)", "oklch(35% 0.015 275)", "oklch(45% 0.015 275)", "oklch(55% 0.015 275)", "oklch(65% 0.015 275)", "oklch(80% 0.015 275)", "oklch(95% 0.015 275)"] },
+      "muted": { "role": "neutral", "displayName": "Muted Text", "canonical": "#5c5d66", "tonalRamp": ["oklch(15% 0.01 275)", "oklch(25% 0.01 275)", "oklch(35% 0.01 275)", "oklch(45% 0.01 275)", "oklch(55% 0.01 275)", "oklch(65% 0.01 275)", "oklch(80% 0.01 275)", "oklch(95% 0.01 275)"] },
+      "subtle": { "role": "neutral", "displayName": "Subtle Text", "canonical": "#74757d", "tonalRamp": ["oklch(15% 0.008 275)", "oklch(25% 0.008 275)", "oklch(35% 0.008 275)", "oklch(45% 0.008 275)", "oklch(55% 0.008 275)", "oklch(65% 0.008 275)", "oklch(80% 0.008 275)", "oklch(95% 0.008 275)"] },
+      "line": { "role": "neutral", "displayName": "Divider", "canonical": "#c9c9c3", "tonalRamp": ["oklch(15% 0.005 105)", "oklch(25% 0.005 105)", "oklch(35% 0.005 105)", "oklch(45% 0.005 105)", "oklch(55% 0.005 105)", "oklch(65% 0.005 105)", "oklch(80% 0.005 105)", "oklch(95% 0.005 105)"] },
+      "gold": { "role": "primary", "displayName": "Workspace Gold", "canonical": "#e7bc45", "tonalRamp": ["oklch(15% 0.08 85)", "oklch(25% 0.08 85)", "oklch(35% 0.08 85)", "oklch(45% 0.08 85)", "oklch(55% 0.08 85)", "oklch(65% 0.08 85)", "oklch(80% 0.08 85)", "oklch(95% 0.08 85)"] },
+      "gold-soft": { "role": "primary", "displayName": "Gold Wash", "canonical": "#fff2c9", "tonalRamp": ["oklch(15% 0.04 85)", "oklch(25% 0.04 85)", "oklch(35% 0.04 85)", "oklch(45% 0.04 85)", "oklch(55% 0.04 85)", "oklch(65% 0.04 85)", "oklch(80% 0.04 85)", "oklch(95% 0.04 85)"] },
+      "gold-ink": { "role": "primary", "displayName": "Gold Ink", "canonical": "#654b05", "tonalRamp": ["oklch(15% 0.08 85)", "oklch(25% 0.08 85)", "oklch(35% 0.08 85)", "oklch(45% 0.08 85)", "oklch(55% 0.08 85)", "oklch(65% 0.08 85)", "oklch(80% 0.08 85)", "oklch(95% 0.08 85)"] },
+      "error": { "role": "tertiary", "displayName": "Error Red", "canonical": "#8f2d26", "tonalRamp": ["oklch(15% 0.12 25)", "oklch(25% 0.12 25)", "oklch(35% 0.12 25)", "oklch(45% 0.12 25)", "oklch(55% 0.12 25)", "oklch(65% 0.12 25)", "oklch(80% 0.12 25)", "oklch(95% 0.12 25)"] },
+      "error-bg": { "role": "tertiary", "displayName": "Error Wash", "canonical": "#fff0ed", "tonalRamp": ["oklch(15% 0.04 25)", "oklch(25% 0.04 25)", "oklch(35% 0.04 25)", "oklch(45% 0.04 25)", "oklch(55% 0.04 25)", "oklch(65% 0.04 25)", "oklch(80% 0.04 25)", "oklch(95% 0.04 25)"] }
+    },
+    "typographyMeta": {
+      "brand": { "displayName": "Brand", "purpose": "Top-bar product name in Manrope." },
+      "title": { "displayName": "Title", "purpose": "Section and card headings in Manrope." },
+      "body": { "displayName": "Body", "purpose": "Interface text and controls in DM Sans." }
+    },
+    "shadows": [
+      { "name": "panel", "value": "0 4px 12px #191a2310, 0 2px 0 #191a2310", "purpose": "Search and player-side panels." },
+      { "name": "result-rest", "value": "0 2px 7px #191a2309", "purpose": "Result cards at rest." },
+      { "name": "result-hover", "value": "0 4px 11px #191a2314, 0 2px 0 #191a230c", "purpose": "Result cards on hover." }
+    ],
+    "motion": [
+      { "name": "control-hover", "value": "transform .15s ease, background-color .15s ease", "purpose": "Gold action hover and lift." },
+      { "name": "switch-state", "value": ".18s ease", "purpose": "Switch track and thumb state changes." },
+      { "name": "spinner", "value": ".8s linear infinite", "purpose": "Preparation activity indicator." }
+    ],
+    "breakpoints": [
+      { "name": "workspace-columns", "value": "900px" },
+      { "name": "compact-mobile", "value": "620px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Action Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Gold button for search, play, retry, and other primary actions.",
+      "html": "<button class=\"ds-btn-primary\">Search</button>",
+      "css": ".ds-btn-primary { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: .55rem; padding: 0 1.1rem; border: 1px solid var(--yt-ink); border-radius: 8px; color: var(--yt-ink); background: var(--yt-gold); font: 700 .95rem/1.5 'DM Sans', sans-serif; cursor: pointer; transition: transform .15s ease, background-color .15s ease; } .ds-btn-primary:hover:not(:disabled) { transform: translateY(-1px); background: #f0cd67; } .ds-btn-primary:focus-visible { outline: 3px solid #9b7410; outline-offset: 3px; } .ds-btn-primary:disabled { opacity: .58; cursor: not-allowed; transform: none; } @media (prefers-reduced-motion: reduce) { .ds-btn-primary { transition-duration: .01ms; } }"
+    },
+    {
+      "name": "Icon Secondary Button",
+      "kind": "button",
+      "refersTo": "button-icon-secondary",
+      "description": "Square secondary action for add, skip, or remove controls.",
+      "html": "<button class=\"ds-btn-icon\" aria-label=\"Add to queue\"><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\"/></svg></button>",
+      "css": ".ds-btn-icon { display: grid; width: 44px; height: 44px; place-items: center; border: 1px solid var(--yt-ink); border-radius: 8px; color: var(--yt-ink); background: var(--yt-surface); cursor: pointer; transition: color .15s ease, border-color .15s ease, background-color .15s ease; } .ds-btn-icon:hover { background: var(--yt-gold-soft); } .ds-btn-icon:focus-visible { outline: 3px solid #9b7410; outline-offset: 3px; } @media (prefers-reduced-motion: reduce) { .ds-btn-icon { transition-duration: .01ms; } }"
+    },
+    {
+      "name": "Search Input",
+      "kind": "input",
+      "refersTo": "input-search",
+      "description": "Wide search field within the outlined search panel.",
+      "html": "<input class=\"ds-input-search\" type=\"search\" placeholder=\"Search songs, creators, and more\" aria-label=\"Search videos\" />",
+      "css": ".ds-input-search { width: 100%; min-width: 0; height: 52px; padding: 0 1rem; border: 1px solid transparent; border-radius: 8px; color: var(--yt-ink); background: var(--yt-surface); font: 400 1rem 'DM Sans', sans-serif; } .ds-input-search::placeholder { color: var(--yt-muted); opacity: 1; } .ds-input-search:focus-visible { outline: 3px solid #9b7410; outline-offset: 1px; }"
+    },
+    {
+      "name": "Brand Navigation",
+      "kind": "nav",
+      "description": "White top bar with gold play mark and local session status.",
+      "html": "<header class=\"ds-nav\"><a class=\"ds-brand\" href=\"#\"><span class=\"ds-brand-mark\"><svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M7 4.8c0-.8.9-1.3 1.6-.9l10 6.2a1 1 0 0 1 0 1.8l-10 6.2c-.7.4-1.6-.1-1.6-.9z\"/></svg></span><span>youtui</span></a><span class=\"ds-nav-status\"><i></i>Connected</span></header>",
+      "css": ".ds-nav { display: flex; min-height: 68px; align-items: center; justify-content: space-between; padding: 0 clamp(1rem, 5vw, 5rem); border-bottom: 1px solid var(--yt-line); background: var(--yt-surface); } .ds-brand { display: flex; align-items: center; gap: .65rem; color: var(--yt-ink); font: 800 1.2rem 'Manrope', sans-serif; letter-spacing: -.03em; text-decoration: none; } .ds-brand:focus-visible { outline: 3px solid #9b7410; outline-offset: 3px; } .ds-brand-mark { display: grid; width: 32px; height: 32px; place-items: center; border: 1px solid var(--yt-ink); border-radius: 9px; color: var(--yt-ink); background: var(--yt-gold); } .ds-nav-status { display: inline-flex; align-items: center; gap: .5rem; color: var(--yt-muted); font: 400 .875rem 'DM Sans', sans-serif; } .ds-nav-status i { width: 8px; height: 8px; border: 1px solid var(--yt-ink); border-radius: 50%; background: var(--yt-gold); }"
+    },
+    {
+      "name": "Queue Count Chip",
+      "kind": "chip",
+      "refersTo": "chip-count",
+      "description": "Inline gold count beside the queue heading.",
+      "html": "<span class=\"ds-chip-count\">3</span>",
+      "css": ".ds-chip-count { display: inline-grid; min-width: 24px; height: 24px; place-items: center; margin-left: .2rem; border: 1px solid var(--yt-ink); border-radius: 7px; color: var(--yt-ink); background: var(--yt-gold); font: 600 .75rem 'DM Sans', sans-serif; vertical-align: 2px; }"
+    },
+    {
+      "name": "Result Card",
+      "kind": "card",
+      "description": "Compact result row with clear outline and restrained hover lift in depth.",
+      "html": "<article class=\"ds-card-result\"><div class=\"ds-card-art\"><span><svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M7 4.8c0-.8.9-1.3 1.6-.9l10 6.2a1 1 0 0 1 0 1.8l-10 6.2c-.7.4-1.6-.1-1.6-.9z\"/></svg></span></div><div class=\"ds-card-copy\"><strong>Video title</strong><small>Channel name · 4:20</small></div><button class=\"ds-btn-icon\" aria-label=\"Add to queue\"><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\"/></svg></button></article>",
+      "css": ".ds-card-result { display: flex; min-height: 88px; align-items: center; gap: .8rem; padding: .65rem; border: 1px solid var(--yt-ink); border-radius: 11px; background: var(--yt-surface); box-shadow: 0 2px 7px #191a2309; transition: border-color .15s ease, background-color .15s ease, box-shadow .15s ease; } .ds-card-result:hover { background: #fffdf5; box-shadow: 0 4px 11px #191a2314, 0 2px 0 #191a230c; } .ds-card-art { display: grid; width: 76px; height: 58px; flex: 0 0 76px; place-items: center; border: 1px solid var(--yt-ink); border-radius: 7px; background: var(--yt-surface-soft); } .ds-card-art span { display: grid; width: 30px; height: 30px; place-items: center; border: 1px solid var(--yt-ink); border-radius: 50%; background: var(--yt-gold); } .ds-card-copy { display: grid; flex: 1; min-width: 0; gap: .2rem; color: var(--yt-ink); font: 400 .95rem 'DM Sans', sans-serif; } .ds-card-copy small { overflow: hidden; color: var(--yt-muted); text-overflow: ellipsis; white-space: nowrap; } .ds-btn-icon { display: grid; width: 44px; height: 44px; flex: 0 0 44px; place-items: center; border: 1px solid var(--yt-ink); border-radius: 8px; color: var(--yt-ink); background: var(--yt-surface); cursor: pointer; transition: color .15s ease, border-color .15s ease, background-color .15s ease; } .ds-btn-icon:hover { background: var(--yt-gold-soft); } .ds-btn-icon:focus-visible { outline: 3px solid #9b7410; outline-offset: 3px; } @media (prefers-reduced-motion: reduce) { .ds-card-result, .ds-btn-icon { transition-duration: .01ms; } }"
+    },
+    {
+      "name": "Settings Switch",
+      "kind": "custom",
+      "description": "Outlined pill switch with a gold enabled track and moving ink thumb.",
+      "html": "<button class=\"ds-switch-row\" role=\"switch\" aria-checked=\"true\"><span>Autoplay queue</span><span class=\"ds-switch ds-switch-on\"><i></i></span></button>",
+      "css": ".ds-switch-row { display: flex; width: 100%; min-height: 52px; align-items: center; justify-content: space-between; padding: .6rem 0; border: 0; border-bottom: 1px solid #e4e4de; color: var(--yt-ink); background: transparent; font: 600 .9rem 'DM Sans', sans-serif; text-align: left; cursor: pointer; } .ds-switch-row:focus-visible { outline: 3px solid #9b7410; outline-offset: 3px; } .ds-switch { display: flex; width: 40px; height: 24px; flex: 0 0 40px; align-items: center; padding: 3px; border: 1px solid var(--yt-ink); border-radius: 99px; background: #d7d7d0; transition: background-color .18s ease; } .ds-switch i { width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px #191a2340; transition: transform .18s ease; } .ds-switch-on { background: var(--yt-gold); } .ds-switch-on i { transform: translateX(15px); background: var(--yt-ink); } @media (prefers-reduced-motion: reduce) { .ds-switch, .ds-switch i { transition-duration: .01ms; } }"
+    },
+    {
+      "name": "Preparation State",
+      "kind": "custom",
+      "description": "Gold-tinted player status that names the selected video during preparation.",
+      "html": "<div class=\"ds-preparing\" role=\"status\"><strong>Selected video</strong><span>Preparing this video for playback.</span></div>",
+      "css": ".ds-preparing { display: grid; gap: .2rem; margin: .75rem 0 0; padding: .7rem .8rem; border: 1px solid var(--yt-ink); border-radius: 9px; color: var(--yt-gold-ink); background: var(--yt-gold-soft); font: 400 .95rem 'DM Sans', sans-serif; } .ds-preparing strong { color: var(--yt-ink); font-size: 1rem; font-weight: 700; } .ds-preparing span { font-size: .9rem; }"
+    },
+    {
+      "name": "Theater Toggle",
+      "kind": "button",
+      "description": "Player control for switching to the wide theater layout; this sample shows the pressed state.",
+      "html": "<button class=\"ds-theater-toggle\" type=\"button\" aria-pressed=\"true\">Theater mode</button>",
+      "css": ".ds-theater-toggle { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: .4rem; padding: .4rem .65rem; border: 1px solid var(--yt-ink); border-radius: 8px; color: var(--yt-ink); background: var(--yt-surface); font: 600 .85rem 'DM Sans', sans-serif; cursor: pointer; transition: background-color .15s ease; } .ds-theater-toggle:hover { background: var(--yt-gold-soft); } .ds-theater-toggle[aria-pressed=\"true\"] { background: var(--yt-gold); } .ds-theater-toggle:focus-visible { outline: 3px solid #9b7410; outline-offset: 3px; } @media (prefers-reduced-motion: reduce) { .ds-theater-toggle { transition-duration: .01ms; } }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Positivus-inspired light-and-gold workspace",
+    "overview": "Youtui is a local video workspace. Its browser interface keeps search, results, the player, and queue visible as parts of one utility. It adapts the user's Positivus reference with light surfaces, dark outlines, gold highlights, and restrained offset shadows. It is not a marketing landing page.\n\nDM Sans carries interface text and Manrope marks the brand and headings. The layout keeps the results beside the player on wide screens, then stacks the workspace on narrow screens. The interface names preparation and error states next to the player and keeps browser video controls native.",
+    "keyCharacteristics": [
+      "Light paper-like page with white work surfaces.",
+      "Dark outlines and gold controls provide clear boundaries and actions.",
+      "Search, results, playback, queue, and settings share one workspace."
+    ],
+    "rules": [
+      { "name": "The Result Containment Rule", "body": "The results list and each card can shrink within their grid tracks. Text truncates before the artwork or action buttons shrink.", "section": "layout" }
+    ],
+    "dos": [
+      "Do keep the interface light, with dark outlines and gold action emphasis.",
+      "Do retain DM Sans and Manrope for the existing interface roles.",
+      "Do keep visible keyboard focus and readable control targets.",
+      "Do show preparation and recovery state beside the player.",
+      "Do stack the workspace at narrow widths and preserve its search-to-play flow."
+    ],
+    "donts": [
+      "Don't turn the player into a marketing landing page.",
+      "Don't use green as the interface accent; the approved adaptation uses gold.",
+      "Don't replace the native browser video controls with a custom player skin."
+    ]
+  }
+}

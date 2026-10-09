@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::Write;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::player::PlayerType;
@@ -193,7 +193,18 @@ impl Config {
         Ok(())
     }
 
-    fn config_path() -> Result<std::path::PathBuf> {
+    pub(crate) fn config_path() -> Result<std::path::PathBuf> {
+        if let Some(path) = std::env::var_os("YOUTUI_CONFIG_PATH") {
+            if path.is_empty() {
+                bail!("YOUTUI_CONFIG_PATH cannot be empty");
+            }
+            let path = std::path::PathBuf::from(path);
+            return if path.is_absolute() {
+                Ok(path)
+            } else {
+                Ok(std::env::current_dir()?.join(path))
+            };
+        }
         let config_dir = dirs::config_dir().ok_or(anyhow::anyhow!("No config directory found"))?;
         Ok(config_dir.join("youtui/config.toml"))
     }

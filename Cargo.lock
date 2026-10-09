@@ -3032,7 +3032,7 @@ checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
 name = "youtui"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "base64-simd",

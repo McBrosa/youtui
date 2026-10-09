@@ -1,6 +1,6 @@
 [package]
 name = "youtui"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 rust-version = "1.90"
 description = "A fast terminal interface for searching, queueing, and playing YouTube videos"
@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "multimedia"]
 [dependencies]
 colored = "3"
 tempfile = "3"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 anyhow = "1"
 which = "8"
 ratatui = "0.30.2"

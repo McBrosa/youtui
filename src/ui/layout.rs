@@ -274,8 +274,12 @@ fn render_half_block_frame(frame: &VideoFrame, area: Rect, buf: &mut Buffer) {
         let top = &frame.rgb[top_start..top_start + visible_row_bytes];
         let bottom = &frame.rgb[bottom_start..bottom_start + visible_row_bytes];
 
-        for (col, (top_pixel, bottom_pixel)) in
-            top.chunks_exact(3).zip(bottom.chunks_exact(3)).enumerate()
+        for (col, (top_pixel, bottom_pixel)) in top
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(bottom.as_chunks::<3>().0.iter())
+            .enumerate()
         {
             let x = area.x.saturating_add(col as u16);
             let y = area.y.saturating_add(row as u16);
