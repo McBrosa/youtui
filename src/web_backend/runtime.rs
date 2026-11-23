@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -430,7 +431,13 @@ fn run_search(
             .lock()
             .map_err(|_| anyhow!("search state is unavailable"))?;
         search.sort_by_date = job.sort_by_date;
+        let mut visible_rows = 0;
         search.ensure_page_with_cancel_and_progress(job.page - 1, &job.cancelled, |progress| {
+            let count = search_page_range(progress, job.page).len();
+            if count == visible_rows {
+                return;
+            }
+            visible_rows = count;
             let snapshot =
                 search_snapshot(progress, &job.session, &job.query, job.page, job.generation);
             let event = json!({
@@ -551,7 +558,7 @@ fn prepare_or_reuse_media(
     let source_prefix = job_dir.path().join("source");
     let source_template = format!("{}.%(ext)s", source_prefix.display());
     let url = format!("https://www.youtube.com/watch?v={video_id}");
-    let mut download = Command::new("yt-dlp");
+    let mut download = crate::deps::ytdlp_command();
     download
         .args([
             "--no-playlist",
@@ -570,7 +577,7 @@ fn prepare_or_reuse_media(
         && let Ok(info) =
             extract_media_info(&url, &source_template, &info_path, cancelled, shutting_down)
     {
-        if let Some(mut source) = browser_source(&info, native_hls, MEDIA_FILE_LIMIT) {
+        if let Some(mut source) = browser_source(&info, native_hls) {
             let id = counter.fetch_add(1, Ordering::Relaxed);
             source["media_id"] = json!(format!("s{id:016x}"));
             return Ok(source);
@@ -691,7 +698,7 @@ fn extract_media_info(
     shutting_down: &AtomicBool,
 ) -> Result<Value> {
     run_checked_process(
-        Command::new("yt-dlp").args([
+        crate::deps::ytdlp_command().args([
             "--no-playlist",
             "--no-warnings",
             "--skip-download",
@@ -1035,6 +1042,14 @@ fn required_bool_value(value: &Value, key: &str) -> Result<bool> {
         .ok_or_else(|| anyhow!("{key} must be a boolean"))
 }
 
+fn search_page_range(search: &PaginatedSearch, page: usize) -> Range<usize> {
+    let start = page.saturating_sub(1).saturating_mul(search.page_size);
+    let end = start
+        .saturating_add(search.page_size)
+        .min(search.results.len());
+    start.min(end)..end
+}
+
 fn search_snapshot(
     search: &PaginatedSearch,
     session: &str,
@@ -1042,15 +1057,12 @@ fn search_snapshot(
     page: usize,
     generation: u64,
 ) -> Value {
-    let start = page.saturating_sub(1).saturating_mul(search.page_size);
-    let end = start
-        .saturating_add(search.page_size)
-        .min(search.results.len());
-    let results = search.results[start.min(end)..end]
+    let range = search_page_range(search, page);
+    let has_more = range.end < search.results.len() || !search.exhausted;
+    let results = search.results[range]
         .iter()
         .map(track_value)
         .collect::<Vec<_>>();
-    let has_more = end < search.results.len() || !search.exhausted;
     json!({"session": session, "query": query, "page": page, "generation": generation, "results": results, "has_more": has_more})
 }
 

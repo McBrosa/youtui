@@ -173,13 +173,18 @@ fn eof_cancels_an_active_media_process_tree() {
 }
 
 #[test]
-fn search_progress_and_final_result_echo_generation() {
+fn search_progress_reports_visible_rows_and_skips_prefetch_duplicates() {
     let config_dir = TempDir::new().unwrap();
+    fs::write(
+        config_dir.path().join("config.toml"),
+        "results_per_page = 1\n",
+    )
+    .unwrap();
     let fake_bin = TempDir::new().unwrap();
     install_executable(
         fake_bin.path(),
         "yt-dlp",
-        "#!/bin/sh\nprintf '%s\\n' '{\"id\":\"abcdefghijk\",\"title\":\"search result\",\"duration_string\":\"1:00\",\"channel\":\"channel\",\"view_count\":42}'\n",
+        "#!/bin/sh\nprintf '%s\\n' '{\"id\":\"abcdefghijk\",\"title\":\"search result\"}' '{\"id\":\"lmnopqrstuv\",\"title\":\"next page\"}'\n",
     );
     let (mut child, mut stdin, mut stdout) =
         start_backend(config_dir.path(), Some(fake_bin.path()));
@@ -195,8 +200,12 @@ fn search_progress_and_final_result_echo_generation() {
     assert_eq!(progress["request_id"], 12);
     assert_eq!(progress["result"]["generation"], 9);
     assert_eq!(progress["result"]["results"][0]["id"], VIDEO_A);
-    let completed = response(&mut stdout, 12)["result"].clone();
+    let frame = read_frame(&mut stdout);
+    assert_eq!(frame["id"], 12, "prefetch should not resend the same page");
+    assert_eq!(frame["ok"], true);
+    let completed = &frame["result"];
     assert_eq!(completed["generation"], 9);
+    assert_eq!(completed["has_more"], true);
     assert_eq!(completed["results"][0]["title"], "search result");
 
     send(&mut stdin, 13, "shutdown", json!({}));

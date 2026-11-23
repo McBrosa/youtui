@@ -275,6 +275,26 @@ defmodule YoutuiWeb.AuthMediaTest do
              |> response(416) == ""
     end
 
+    test "rewrites a three-hour rendition and preserves each signed segment URL", %{
+      authenticated: auth,
+      path: path
+    } do
+      prefix = "https://rr2.googlevideo.com/videoplayback/token/" <> :binary.copy("a", 1230)
+      url = fn index -> "#{prefix}/sq/#{index}?sig=test%2F#{index}&&part=one%2Btwo" end
+      entries = Enum.map(0..2077, fn index -> ["#EXTINF:5.2,\n", url.(index), "\n"] end)
+      body = IO.iodata_to_binary(["#EXTM3U\n", entries, "#EXT-X-ENDLIST\n"])
+      assert byte_size(body) > 2 * 1024 * 1024
+      stub_media(fn conn -> send_resp(conn, 200, body) end)
+
+      local = auth |> get(path <> "/video/index.m3u8") |> response(200)
+      assert local =~ "\n2077\n#EXT-X-ENDLIST"
+      refute local =~ "googlevideo"
+
+      for index <- [0, 700, 2077] do
+        assert Youtui.Media.asset("hls00002", "video", index) == {:ok, url.(index)}
+      end
+    end
+
     test "rejects malformed, untrusted and oversized playlists before registering assets", %{
       authenticated: auth,
       path: path
@@ -287,7 +307,8 @@ defmodule YoutuiWeb.AuthMediaTest do
             ~s(#EXT-X-KEY:METHOD=AES-128,URI="one",URI="two"),
             "#EXT-X-STREAM-INF:BANDWIDTH=1",
             "#EXTINF:4,\rhttps://outside.example/seg",
-            String.duplicate("seg\n", 4097)
+            String.duplicate("seg\n", 4097),
+            "#comment" <> :binary.copy("a", 8 * 1024 * 1024) <> "\nseg"
           ] do
         body = "#EXTM3U\n#EXTINF:4,\n" <> element <> "\n#EXT-X-ENDLIST\n"
         stub_media(fn conn -> send_resp(conn, 200, body) end)
@@ -297,6 +318,32 @@ defmodule YoutuiWeb.AuthMediaTest do
 
         assert auth |> get(path <> "/video/0") |> response(404) == "media not found"
       end
+    end
+
+    test "bounds the retained index when signed URLs have little common prefix", %{
+      authenticated: auth,
+      path: path
+    } do
+      signature = :binary.copy("a", 1200)
+
+      entries =
+        Enum.map(0..2077, fn index ->
+          [
+            "#EXTINF:5.2,\nhttps://rr2.googlevideo.com/sq/",
+            Integer.to_string(index),
+            "?sig=",
+            signature,
+            "\n"
+          ]
+        end)
+
+      body = IO.iodata_to_binary(["#EXTM3U\n", entries, "#EXT-X-ENDLIST\n"])
+      stub_media(fn conn -> send_resp(conn, 200, body) end)
+
+      assert auth |> get(path <> "/video/index.m3u8") |> response(502) ==
+               "media playlist unavailable"
+
+      assert :error = Youtui.Media.asset("hls00002", "video", 0)
     end
 
     test "handles expired segments, excessive responses and malformed partial responses", %{

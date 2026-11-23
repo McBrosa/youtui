@@ -77,9 +77,9 @@ fn url_encode_query(query: &str) -> String {
 }
 
 pub fn check_ytdlp() -> Result<()> {
-    which::which("yt-dlp").map_err(|_| {
-        anyhow::anyhow!("yt-dlp is not installed\nPlease install it with: pip install yt-dlp")
-    })?;
+    if !crate::deps::check_dependency("yt-dlp") {
+        bail!("yt-dlp is not installed\nPlease install it with: pip install yt-dlp");
+    }
     Ok(())
 }
 
@@ -198,7 +198,7 @@ impl PaginatedSearch {
         };
         let range = format!("{start}:{SEARCH_CEILING}");
 
-        let mut cmd = Command::new("yt-dlp");
+        let mut cmd = crate::deps::ytdlp_command();
         cmd.arg("--flat-playlist")
             .arg("--lazy-playlist")
             .arg("--no-warnings")
@@ -211,7 +211,8 @@ impl PaginatedSearch {
 
         let started = Instant::now();
         let progress_batch = page_size.clamp(1, 5);
-        let mut unreported = 0_usize;
+        let first_visible = page.saturating_mul(page_size).saturating_add(1);
+        let mut unreported = false;
         let mut valid_lines = 0_usize;
         let mut malformed_lines = 0_usize;
 
@@ -220,10 +221,14 @@ impl PaginatedSearch {
                 match self.consume_search_line(line) {
                     ConsumedLine::Accepted => {
                         valid_lines += 1;
-                        unreported += 1;
-                        if unreported >= progress_batch {
+                        unreported = true;
+                        let count = self.results.len();
+                        if count == first_visible
+                            || count == needed
+                            || count.is_multiple_of(progress_batch)
+                        {
                             on_progress(self);
-                            unreported = 0;
+                            unreported = false;
                         }
                     }
                     ConsumedLine::Ignored => valid_lines += 1,
@@ -232,7 +237,7 @@ impl PaginatedSearch {
                 self.results.len() >= target
             });
 
-        if unreported > 0 {
+        if unreported {
             on_progress(self);
         }
 
@@ -305,11 +310,7 @@ impl PaginatedSearch {
             .max(self.raw_cursor)
             .min(SEARCH_CEILING);
 
-        if self.filter_shorts
-            && parsed
-                .duration_seconds
-                .is_some_and(|seconds| seconds < MIN_DURATION as f64)
-        {
+        if self.filter_shorts && parsed.is_short {
             return ConsumedLine::Ignored;
         }
 
@@ -489,12 +490,24 @@ fn terminate_search_process(child: &mut std::process::Child) {
 
 struct ParsedSearchEntry {
     result: SearchResult,
-    duration_seconds: Option<f64>,
+    is_short: bool,
     playlist_index: Option<usize>,
 }
 
 fn parse_search_entry(line: &str) -> serde_json::Result<Option<ParsedSearchEntry>> {
     let entry: Value = serde_json::from_str(line)?;
+    // Flat search can include channel and playlist links. Only videos can be queued.
+    if entry
+        .get("ie_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| key != "Youtube")
+        || matches!(
+            entry.get("_type").and_then(Value::as_str),
+            Some("playlist" | "multi_video")
+        )
+    {
+        return Ok(None);
+    }
     let Some(id) = entry.get("id").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -535,7 +548,28 @@ fn parse_search_entry(line: &str) -> serde_json::Result<Option<ParsedSearchEntry
             }
         })
         .unwrap_or_default();
-    let duration_seconds = entry.get("duration").and_then(Value::as_f64);
+    // yt-dlp distinguishes Shorts from ordinary short videos in the result URL.
+    let is_short = ["url", "webpage_url"]
+        .into_iter()
+        .find_map(|field| {
+            let path = entry
+                .get(field)?
+                .as_str()?
+                .strip_prefix("https://www.youtube.com/")?;
+            if path.starts_with("shorts/") {
+                Some(true)
+            } else if path.starts_with("watch?") {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            entry
+                .get("duration")
+                .and_then(Value::as_f64)
+                .is_some_and(|seconds| seconds < f64::from(MIN_DURATION))
+        });
     let playlist_index = entry
         .get("playlist_index")
         .and_then(Value::as_u64)
@@ -545,7 +579,7 @@ fn parse_search_entry(line: &str) -> serde_json::Result<Option<ParsedSearchEntry
         SearchResult::from_line_parts(title, duration, channel, &views, &published, id).map(
             |result| ParsedSearchEntry {
                 result,
-                duration_seconds,
+                is_short,
                 playlist_index,
             },
         ),
@@ -629,7 +663,7 @@ mod tests {
         assert_eq!(parsed.result.channel, "A | B");
         assert_eq!(parsed.result.views, "1.2K views");
         assert_eq!(parsed.result.id, "correct-id");
-        assert_eq!(parsed.duration_seconds, Some(200.0));
+        assert!(!parsed.is_short);
     }
 
     #[test]
@@ -648,7 +682,7 @@ mod tests {
         assert_eq!(parsed.result.duration, "N/A");
         assert_eq!(parsed.result.channel, "Unknown");
         assert_eq!(parsed.result.views, "0 views");
-        assert_eq!(parsed.duration_seconds, None);
+        assert!(!parsed.is_short);
     }
 
     #[test]
@@ -817,7 +851,7 @@ extractor=$$
             command,
             &AtomicBool::new(false),
             started,
-            Duration::from_millis(300),
+            Duration::from_secs(1),
             |_| false,
         )
         .unwrap();
@@ -884,6 +918,24 @@ extractor=$$
                 .collect::<Vec<_>>(),
             ["unknown", "long"]
         );
+    }
+
+    #[test]
+    fn search_keeps_short_watch_videos_and_skips_channels_playlists_and_shorts() {
+        let mut search = PaginatedSearch::new("test", 10, true);
+        for row in [
+            r#"{"id":"channel","ie_key":"YoutubeTab"}"#,
+            r#"{"id":"list","_type":"playlist"}"#,
+            r#"{"id":"short","url":"https://www.youtube.com/shorts/short","duration":180}"#,
+            r#"{"id":"unknown","webpage_url":"https://www.youtube.com/shorts/unknown"}"#,
+        ] {
+            assert_eq!(search.consume_search_line(row), ConsumedLine::Ignored);
+        }
+        assert_eq!(search.consume_search_line(
+            r#"{"id":"clip","ie_key":"Youtube","url":"https://www.youtube.com/watch?v=clip","duration":19}"#
+        ), ConsumedLine::Accepted);
+        assert_eq!(search.raw_cursor, 5);
+        assert_eq!(search.results[0].id, "clip");
     }
 
     #[test]

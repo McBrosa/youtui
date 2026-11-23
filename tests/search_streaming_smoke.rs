@@ -16,19 +16,19 @@ const COLS: u16 = 120;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[test]
-fn first_page_is_visible_while_the_same_search_process_prefetches() {
+fn first_result_is_usable_while_the_same_search_process_fills_and_prefetches_pages() {
     let fixture = SearchFixture::new(20, false);
     let mut youtui = fixture.spawn_youtui();
 
     youtui.wait_for_screen("Search", WAIT_TIMEOUT);
     youtui.write_all(b"stream first page\r");
-    wait_for_path(&fixture.control.join("first-page-emitted"), WAIT_TIMEOUT);
-
-    // The fake remains blocked after writing the first page. Seeing a result
-    // here proves youtui consumes complete JSON lines instead of waiting for
-    // yt-dlp to exit and collecting its entire stdout.
+    // The extractor cannot write the second accepted result until released.
     youtui.wait_for_screen("Streaming Result 01", WAIT_TIMEOUT);
-    assert!(!fixture.control.join("released").exists());
+    youtui.write_all(b"\r");
+    youtui.wait_for_screen("Queue (1)", WAIT_TIMEOUT);
+
+    fixture.release("release-first-result");
+    youtui.wait_for_screen("Fetching page 2 · 0/20 results", WAIT_TIMEOUT);
     assert_eq!(fixture.invocations().len(), 1);
 
     let args = &fixture.invocations()[0];
@@ -42,11 +42,11 @@ fn first_page_is_visible_while_the_same_search_process_prefetches() {
     fixture.release("release-first-page");
     youtui.wait_for_screen("40+ loaded", WAIT_TIMEOUT);
 
-    // Repeating the same completed query is served by the bounded in-memory
-    // cache and should not launch another extractor.
+    youtui.write_all(b"/replacement query\r");
+    youtui.wait_for_screen("Replacement Result", WAIT_TIMEOUT);
     youtui.write_all(b"/stream first page\r");
-    youtui.wait_for_screen("Streaming Result 01", WAIT_TIMEOUT);
-    assert_eq!(fixture.invocations().len(), 1);
+    youtui.wait_for_screen("40+ loaded", WAIT_TIMEOUT);
+    assert_eq!(fixture.invocations().len(), 2);
 
     youtui.quit();
 }
@@ -259,12 +259,8 @@ impl SearchFixture {
             "audio_only = true\ninclude_shorts = {include_shorts}\nresults_per_page = {results_per_page}\n"
         );
         write_file(&xdg_config.join("youtui/config.toml"), &config);
-        write_file(
-            &home.join("Library/Application Support/youtui/config.toml"),
-            &config,
-        );
         write_executable(&fake_bin.join("yt-dlp"), FAKE_YT_DLP);
-        write_executable(&fake_bin.join("mpv"), "#!/bin/sh\nset -eu\nexec sleep 30\n");
+        write_executable(&fake_bin.join("mpv"), "#!/bin/sh\nexit 0\n");
 
         Self {
             _root: root,
@@ -292,6 +288,10 @@ impl SearchFixture {
             .env("PATH", path)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.xdg_config)
+            .env(
+                "YOUTUI_CONFIG_PATH",
+                self.xdg_config.join("youtui/config.toml"),
+            )
             .env("TMPDIR", &self.runtime_tmp)
             .env("TERM", "xterm-256color")
             .env("YOUTUI_SEARCH_CONTROL", &self.control)
@@ -382,11 +382,12 @@ def wait_for(name):
         time.sleep(0.01)
 
 if query == "stream first page":
-    for index in range(1, 21):
+    emit("short", "Filtered short", duration=10)
+    emit("stream-1", "Streaming Result 01")
+    wait_for("release-first-result")
+    for index in range(2, 21):
         emit(f"stream-{index}", f"Streaming Result {index:02d}")
-    (control / "first-page-emitted").touch()
     wait_for("release-first-page")
-    (control / "released").touch()
     for index in range(21, 41):
         emit(f"stream-{index}", f"Streaming Result {index:02d}")
 elif query == "rolling prefetch":

@@ -4,7 +4,7 @@ defmodule Youtui.MixProject do
   def project do
     [
       app: :youtui_web,
-      version: "2.2.0",
+      version: "2.2.1",
       elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,

@@ -98,7 +98,7 @@ fn download_permanently(config: &Config, video_title: &str, url: &str) -> Result
     })?;
     let output_template = Path::new(&config.download_dir).join("%(title)s.%(ext)s");
 
-    let mut cmd = Command::new("yt-dlp");
+    let mut cmd = crate::deps::ytdlp_command();
     cmd.arg("-f").arg(config.format());
 
     if config.audio_only {
@@ -128,7 +128,7 @@ fn play_with_mpv(config: &Config, url: &str, temp_dir: &Path) -> Result<()> {
     let input_conf = temp_dir.join("mpv-input.conf");
     fs::write(&input_conf, "r quit 42\n")?;
 
-    let mut cmd = Command::new("mpv");
+    let mut cmd = crate::deps::mpv_command();
 
     if config.audio_only {
         cmd.arg("--no-video");
@@ -175,7 +175,7 @@ fn play_with_download(
     let output_base = temporary_download_base(safe_title, video_id);
     let output_path = temp_dir.join(format!("{output_base}.{ext}"));
 
-    let mut cmd = Command::new("yt-dlp");
+    let mut cmd = crate::deps::ytdlp_command();
     cmd.arg("-f").arg(config.format());
 
     if config.audio_only {

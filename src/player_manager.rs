@@ -862,7 +862,7 @@ impl PlayerManager {
 }
 
 fn build_mpv_command(socket_path: &Path, options: &PlaybackOptions) -> Command {
-    let mut command = Command::new("mpv");
+    let mut command = crate::deps::mpv_command();
     #[cfg(unix)]
     command.process_group(0);
     if let Some(directory) = socket_path.parent() {

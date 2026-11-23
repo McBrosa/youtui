@@ -31,6 +31,36 @@ fn video_extraction_is_lazy_and_failures_require_an_explicit_retry() {
 }
 
 #[test]
+fn search_and_mpv_share_the_executable_next_to_the_config() {
+    for executable in [true, false] {
+        let fixture = SmokeFixture::new(true);
+        let config = fixture.root.join("custom config/settings.toml");
+        write_config(&config, "audio_only = true\n");
+        let local_bin = config.parent().unwrap().join("bin");
+        fs::create_dir(&local_bin).unwrap();
+        let local = local_bin.join("yt-dlp");
+        let fallback = fixture.fake_bin.join("yt-dlp");
+        fs::copy(&fallback, &local).unwrap();
+        let mode = if executable { 0o755 } else { 0o644 };
+        fs::set_permissions(&local, fs::Permissions::from_mode(mode)).unwrap();
+        let expected = if executable { &local } else { &fallback };
+
+        let mut command = fixture.youtui_command();
+        command.env("YOUTUI_CONFIG_PATH", &config);
+        let mut youtui = PtyProcess::spawn(command);
+        youtui.wait_for_screen("Search", WAIT_TIMEOUT);
+        youtui.write_all(b"configured extractor\r");
+        youtui.wait_for_screen(RESULT_TITLE, WAIT_TIMEOUT);
+        for log in ["search.extractor", "mpv.extractor"] {
+            let lines = wait_for_lines(&fixture.root.join(log), WAIT_TIMEOUT);
+            assert_eq!(Path::new(&lines[0]), expected);
+        }
+        youtui.write_all(b"q");
+        assert!(youtui.wait_for_exit(WAIT_TIMEOUT).success());
+    }
+}
+
+#[test]
 fn enter_resumes_the_selected_results_buffered_audio() -> Result<(), String> {
     let fixture = SmokeFixture::new(true);
     let mut youtui = fixture.spawn_youtui();
@@ -293,6 +323,7 @@ case " $* " in
         exit 1
         ;;
 esac
+printf '%s\n' "$0" > search.extractor
 tmp="${YOUTUI_SMOKE_YTDLP_ARGS}.tmp.$$"
 printf '%s\n' "$@" > "$tmp"
 mv "$tmp" "$YOUTUI_SMOKE_YTDLP_ARGS"
@@ -303,6 +334,7 @@ printf '%s\n' '{"id":"integration-audio-id","title":"Integration Audio Smoke Tra
             &fake_bin.join("mpv"),
             r#"#!/bin/sh
 set -eu
+command -v yt-dlp > mpv.extractor
 tmp="${YOUTUI_SMOKE_MPV_ARGS}.tmp.$$"
 printf '%s\n' "$@" > "$tmp"
 mv "$tmp" "$YOUTUI_SMOKE_MPV_ARGS"
@@ -324,6 +356,10 @@ exec sleep 30
     }
 
     fn spawn_youtui(&self) -> PtyProcess {
+        PtyProcess::spawn(self.youtui_command())
+    }
+
+    fn youtui_command(&self) -> Command {
         let inherited_path = std::env::var_os("PATH").unwrap_or_default();
         let path = std::env::join_paths(
             std::iter::once(self.fake_bin.clone()).chain(std::env::split_paths(&inherited_path)),
@@ -336,12 +372,13 @@ exec sleep 30
             .env("PATH", path)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.xdg_config)
+            .env_remove("YOUTUI_CONFIG_PATH")
             .env("TMPDIR", &self.runtime_tmp)
             .env("TERM", "xterm-256color")
             .env("YOUTUI_SMOKE_MPV_ARGS", &self.mpv_args)
             .env("YOUTUI_SMOKE_YTDLP_ARGS", &self.yt_dlp_args);
 
-        PtyProcess::spawn(command)
+        command
     }
 }
 
@@ -363,7 +400,9 @@ fn write_executable(path: &Path, contents: &str) {
 fn wait_for_lines(path: &Path, timeout: Duration) -> Vec<String> {
     let started = Instant::now();
     loop {
-        if let Ok(contents) = fs::read_to_string(path) {
+        if let Ok(contents) = fs::read_to_string(path)
+            && !contents.is_empty()
+        {
             return contents.lines().map(str::to_owned).collect();
         }
         assert!(

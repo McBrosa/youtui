@@ -3,7 +3,8 @@ defmodule Youtui.HLS do
 
   alias Youtui.{Media, MediaHTTP}
 
-  @playlist_bytes 2 * 1024 * 1024
+  @playlist_bytes 8 * 1024 * 1024
+  @retained_bytes 2 * 1024 * 1024
   @max_assets 4096
   @max_lines 32_768
   @plain_tags ~w(#EXTM3U #EXTINF #EXT-X-VERSION #EXT-X-TARGETDURATION #EXT-X-MEDIA-SEQUENCE
@@ -54,13 +55,23 @@ defmodule Youtui.HLS do
          false <- Regex.match?(~r/[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)/, body),
          ["#EXTM3U" | _] = lines <- String.split(body, ["\r\n", "\n"], parts: @max_lines + 1),
          true <- length(lines) <= @max_lines and "#EXT-X-ENDLIST" in lines,
-         {lines, assets, count, _bytes} when count > 0 <-
-           Enum.reduce_while(lines, {[], [], 0, 0}, &rewrite_line(&1, &2, base)) do
-      {:ok,
-       %{
-         playlist: lines |> Enum.reverse() |> Enum.join("\n"),
-         assets: assets |> Enum.reverse() |> List.to_tuple()
-       }}
+         {lines, [first | _] = assets, count, bytes} <-
+           Enum.reduce_while(lines, {[], [], 0, 0}, &rewrite_line(&1, &2, base)),
+         prefix_size = :binary.longest_common_prefix(assets),
+         true <- bytes - (count - 1) * prefix_size <= @retained_bytes,
+         playlist = lines |> Enum.reverse() |> Enum.join("\n"),
+         true <- byte_size(playlist) <= @retained_bytes do
+      # Signed segments often share a kilobyte of URL. Copy slices so the registry
+      # can release the original manifest while keeping each URL byte-for-byte exact.
+      prefix = :binary.copy(binary_part(first, 0, prefix_size))
+
+      suffixes =
+        Enum.reduce(assets, [], fn url, acc ->
+          suffix = binary_part(url, prefix_size, byte_size(url) - prefix_size)
+          [:binary.copy(suffix) | acc]
+        end)
+
+      {:ok, %{playlist: playlist, url_prefix: prefix, url_suffixes: List.to_tuple(suffixes)}}
     else
       _ -> :error
     end

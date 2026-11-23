@@ -2,7 +2,7 @@
 
 This Phoenix LiveView application supplies the browser interface for youtui.
 The Rust launcher supplies the worker executable, HTTP port, and browser session token.
-The browser plays completed MP4 files that the Rust worker prepares with yt-dlp and ffmpeg.
+The browser streams compatible MP4 or HLS sources as they arrive. If streaming fails, the Rust worker prepares a local MP4 with yt-dlp and ffmpeg.
 
 ## Development
 

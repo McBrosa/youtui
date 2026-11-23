@@ -1,7 +1,11 @@
+use std::env;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+
+use crate::config::Config;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Platform {
@@ -58,8 +62,31 @@ pub fn ensure_dependencies() -> Result<()> {
     Ok(())
 }
 
-fn check_dependency(name: &str) -> bool {
-    which::which(name).is_ok()
+fn local_ytdlp_bin() -> Option<PathBuf> {
+    let bin = Config::config_path().ok()?.parent()?.join("bin");
+    which::which(bin.join("yt-dlp")).ok().map(|_| bin)
+}
+
+pub(crate) fn ytdlp_command() -> Command {
+    Command::new(local_ytdlp_bin().map_or_else(|| "yt-dlp".into(), |bin| bin.join("yt-dlp")))
+}
+
+pub(crate) fn mpv_command() -> Command {
+    if let Some(bin) = local_ytdlp_bin()
+        && let Some(path) = env::var_os("PATH")
+        && let Ok(path) = env::join_paths(std::iter::once(bin).chain(env::split_paths(&path)))
+        && let Ok(mpv) = which::which("mpv")
+    {
+        // Resolve mpv on the caller's PATH before prioritizing yt-dlp for its hook.
+        let mut command = Command::new(mpv);
+        command.env("PATH", path);
+        return command;
+    }
+    Command::new("mpv")
+}
+
+pub(crate) fn check_dependency(name: &str) -> bool {
+    (name == "yt-dlp" && local_ytdlp_bin().is_some()) || which::which(name).is_ok()
 }
 
 fn missing_dependencies(mut is_available: impl FnMut(&str) -> bool) -> Vec<&'static str> {

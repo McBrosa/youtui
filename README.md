@@ -6,7 +6,7 @@ A responsive terminal interface for searching, queueing, streaming, and download
 
 - Streaming, cancellable search with incremental results, rolling page-ahead
   prefetch (viewing page N warms N+1), a short-lived repeated-query cache, and
-  adaptive Shorts filtering
+  Shorts filtering that preserves regular short videos when identified by YouTube
 - Keyboard-first results and queue navigation
 - Integrated mpv playback controls, progress, and automatic queue playback
 - Independent in-terminal video on Kitty-protocol terminals (including
@@ -101,6 +101,11 @@ The launcher also discovers a companion at `../lib/youtui/web` relative to the R
 `YOUTUI_WEB_DIR` selects a Phoenix source project instead of the repository default.
 `YOUTUI_CONFIG_PATH` selects an alternate settings file for development or isolated tests.
 
+If starting `yt-dlp` itself is slow, install its Python package in a virtual
+environment and link the environment’s `yt-dlp` executable at `bin/yt-dlp`
+beside the settings file. youtui and its mpv player use that copy for search
+and playback. By default they use the executable on your PATH.
+
 On startup, youtui offers to install a missing `yt-dlp` or media player with Homebrew, apt, dnf, or pacman when the platform is recognized. It never treats non-interactive input as permission to run a package manager.
 
 To install dependencies yourself:
@@ -128,6 +133,10 @@ youtui --version
 ```
 
 Type a query in the search bar and press Enter. The footer always shows the shortcuts relevant to the focused panel; press `?` for the complete in-app guide.
+
+Search uses YouTube’s relevance ranking by default. Turn off **Sort by newest**
+in Settings to include older matches. The first matching video is selectable
+while the rest of the page loads.
 
 ### Controls
 

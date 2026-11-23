@@ -103,10 +103,10 @@ defmodule Youtui.Media do
   end
 
   def handle_call({:asset, id, kind, index}, _from, state) do
-    case get_in(state.entries, [id, :sources, kind, :rendition, :assets]) do
-      assets
-      when is_tuple(assets) and is_integer(index) and index >= 0 and index < tuple_size(assets) ->
-        {:reply, {:ok, elem(assets, index)}, state}
+    case get_in(state.entries, [id, :sources, kind, :rendition]) do
+      %{url_prefix: prefix, url_suffixes: suffixes}
+      when is_integer(index) and index >= 0 and index < tuple_size(suffixes) ->
+        {:reply, {:ok, prefix <> elem(suffixes, index)}, state}
 
       _ ->
         {:reply, :error, state}

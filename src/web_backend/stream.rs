@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 /// Select a browser-playable source from yt-dlp's formats, ordered worst to best.
-pub(super) fn browser_source(info: &Value, native_hls: bool, size_limit: u64) -> Option<Value> {
+pub(super) fn browser_source(info: &Value, native_hls: bool) -> Option<Value> {
     if info["is_live"] == true {
         return None;
     }
@@ -15,10 +15,6 @@ pub(super) fn browser_source(info: &Value, native_hls: bool, size_limit: u64) ->
             && format["height"]
                 .as_u64()
                 .is_some_and(|height| (1..=720).contains(&height))
-            && format["filesize"]
-                .as_u64()
-                .or_else(|| format["filesize_approx"].as_u64())
-                .is_none_or(|bytes| bytes <= size_limit)
     });
     for format in videos.clone() {
         if format["protocol"] == "https"
@@ -110,17 +106,19 @@ mod tests {
             "url":"https://manifest.googlevideo.com/audio"
         });
         let mut info = json!({"formats":[audio, video]});
-        assert!(browser_source(&info, false, u64::MAX).is_none());
-        let source = browser_source(&info, true, u64::MAX).unwrap();
+        // The complete recording exceeds the file cache limit but can stream in segments.
+        info["formats"][1]["filesize_approx"] = json!(2_000_000_000);
+        assert!(browser_source(&info, false).is_none());
+        let source = browser_source(&info, true).unwrap();
         assert_eq!(source["video_playlist_url"], video["url"]);
         assert_eq!(source["audio_playlist_url"], audio["url"]);
         assert_eq!(source["mime"], "application/vnd.apple.mpegurl");
         assert_eq!(source["bandwidth"], 1_330_000);
 
         info["formats"][0]["manifest_url"] = json!("different master");
-        assert!(browser_source(&info, true, u64::MAX).is_none());
+        assert!(browser_source(&info, true).is_none());
         info["formats"][0]["manifest_url"] = json!("master");
         info["formats"][1]["height"] = json!(1080);
-        assert!(browser_source(&info, true, u64::MAX).is_none());
+        assert!(browser_source(&info, true).is_none());
     }
 }

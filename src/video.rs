@@ -1037,7 +1037,7 @@ fn resolve_stream_url(
     cancelled: &AtomicBool,
 ) -> Result<ResolvedStream, String> {
     let format = stream_format(quality);
-    let mut command = Command::new("yt-dlp");
+    let mut command = crate::deps::ytdlp_command();
     command.args([
         "--no-playlist",
         "--skip-download",
