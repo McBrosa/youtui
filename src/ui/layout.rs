@@ -799,6 +799,12 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
+    let video_hint = (!app.config.audio_only
+        && app
+            .player_manager
+            .as_ref()
+            .is_some_and(|player| player.current_video_id.is_some()))
+    .then_some(("v", "Video"));
     let line = if let Some(message) = app.status_message.as_deref() {
         Line::from(vec![
             Span::styled(
@@ -832,6 +838,7 @@ fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
             FocusedPanel::Results => {
                 if app.loading {
                     let mut controls = vec![("Esc", "Cancel")];
+                    controls.extend(video_hint);
                     if !app.current_page_results().is_empty() {
                         controls.extend([("Enter", "Queue"), ("↑↓/jk", "Move"), ("n/p", "Page")]);
                     }
@@ -864,20 +871,18 @@ fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
                         Span::styled(" Clear", Style::default().fg(Color::Gray)),
                     ])
                 } else {
-                    controls_line(
-                        &[
-                            ("q", "Quit"),
-                            ("Enter", "Queue"),
-                            ("↑↓/jk", "Move"),
-                            ("n/p", "Page"),
-                            ("/", "Search"),
-                            ("?", "Help"),
-                            ("Space", "Pause"),
-                            ("< >", "Seek"),
-                            ("Tab", "Panel"),
-                        ],
-                        area.width as usize,
-                    )
+                    let mut controls = vec![("q", "Quit"), ("Enter", "Queue")];
+                    controls.extend(video_hint);
+                    controls.extend([
+                        ("↑↓/jk", "Move"),
+                        ("n/p", "Page"),
+                        ("/", "Search"),
+                        ("?", "Help"),
+                        ("Space", "Pause"),
+                        ("< >", "Seek"),
+                        ("Tab", "Panel"),
+                    ]);
+                    controls_line(&controls, area.width as usize)
                 }
             }
             FocusedPanel::Queue => {
@@ -886,6 +891,7 @@ fn render_controls_line(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     vec![("q", "Quit")]
                 };
+                controls.extend(video_hint);
                 controls.extend([
                     ("Enter", "Play"),
                     ("↑↓/jk", "Move"),

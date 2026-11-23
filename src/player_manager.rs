@@ -521,6 +521,11 @@ impl PlayerManager {
         }
     }
 
+    /// A worker can read mpv metadata over its own IPC connection.
+    pub(crate) fn ipc_socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
     pub fn connect(&mut self) -> Result<()> {
         let start = Instant::now();
 
@@ -744,6 +749,9 @@ impl PlayerManager {
     /// decoder in both states, so toggling does not open or seek a second
     /// YouTube stream.
     pub fn set_kitty_video(&mut self, visible: bool, geometry: MpvKittyGeometry) -> Result<()> {
+        if !visible && !self.kitty_video {
+            return Ok(());
+        }
         if visible && !self.options.native_kitty {
             bail!("native Kitty video output is unavailable for this player");
         }
@@ -783,7 +791,7 @@ impl PlayerManager {
                 ipc.send_command(&["set_property", "vo", "kitty"])?;
                 self.kitty_video = true;
             }
-        } else if self.kitty_video {
+        } else {
             ipc.send_command(&["set_property", "vo", "null"])?;
             self.kitty_video = false;
         }
@@ -1114,20 +1122,26 @@ mod tests {
     fn player_shutdown_terminates_extractor_descendants() {
         let fixture = tempfile::tempdir().unwrap();
         let ready = fixture.path().join("ready");
-        let escaped = fixture.path().join("escaped");
         let mut command = Command::new("sh");
         command
             .args([
                 "-c",
-                r#"printf ready > "$1"
-(sleep 1; printf escaped > "$2") &
+                r#"exec 3<&0
+(
+    printf ready > "$1"
+    if IFS= read -r release <&3; then printf escaped; fi
+) &
 wait"#,
                 "player-fixture",
             ])
             .arg(&ready)
-            .arg(&escaped)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .process_group(0);
         let mut process = command.spawn().unwrap();
+        // Hold the writing end across wait() so a surviving child can answer after shutdown.
+        let mut release = process.stdin.take().unwrap();
         let started = Instant::now();
         while !ready.exists() {
             if started.elapsed() >= Duration::from_secs(3) {
@@ -1138,9 +1152,11 @@ wait"#,
         }
         terminate_player(&mut process);
         assert!(process.try_wait().unwrap().is_some());
-        thread::sleep(Duration::from_millis(1100));
+        let _ = writeln!(release, "probe");
+        drop(release);
+        let output = process.wait_with_output().unwrap();
         assert!(
-            !escaped.exists(),
+            output.stdout.is_empty(),
             "audio extractor survived player shutdown"
         );
     }
@@ -1245,6 +1261,21 @@ wait"#,
         );
         assert!(!manager.kitty_video);
         assert_eq!(manager.kitty_geometry, Some(geometry));
+    }
+
+    #[test]
+    fn hiding_inactive_kitty_video_needs_no_audio_ipc() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut manager = PlayerManager::from_test_stream(stream);
+        manager.ipc = None;
+        let geometry = MpvKittyGeometry {
+            cols: 80,
+            rows: 24,
+            width_px: 640,
+            height_px: 384,
+        };
+        manager.set_kitty_video(false, geometry).unwrap();
+        assert!(manager.ipc.is_none());
     }
 
     #[test]

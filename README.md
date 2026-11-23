@@ -21,7 +21,7 @@ A responsive terminal interface for searching, queueing, streaming, and download
 - Rust 1.90 or newer
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
 - One supported player: [`mpv`](https://mpv.io/) (recommended), VLC, or mplayer
-- `ffmpeg` when merging/extracting downloads or using the portable block/non-Kitty video renderer
+- `ffmpeg` for in-terminal video and for merging or extracting downloads
 
 mpv provides the full in-TUI queue and playback experience. VLC and mplayer use a foreground fallback that downloads media to a temporary directory before playback.
 
@@ -29,6 +29,12 @@ With mpv, leaving a result highlighted for about a second starts buffering its
 audio in the background. During playback, youtui buffers the next queued track.
 One standby player targets 10 seconds of audio with an 8 MiB in-memory packet cache.
 Pressing Enter can use that player even while its buffer is filling.
+
+During playback, press `v` to show video at the current audio position. Press
+`v` or `Esc` to return to the results and queue. The audio keeps playing in
+the same mpv process. When available, youtui reuses the stream details mpv
+already fetched. Returning to video within three seconds can reuse the running
+decoder. After that, youtui releases the decoder and keeps the stream URL.
 
 ## Install
 
@@ -162,6 +168,7 @@ while the rest of the page loads.
 | Playback | `+` / `-` | Raise / lower volume |
 | Playback | `m` | Mute or restore volume |
 | Playback | `v` | Toggle the in-terminal video pane |
+| Video pane | `Esc` | Return to the results and queue while playback continues |
 
 ## Settings
 

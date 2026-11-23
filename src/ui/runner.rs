@@ -180,6 +180,7 @@ pub fn run_app(
     let mut last_player_poll = Instant::now();
     let mut dirty = true;
     let mut native_video_visible = false;
+    let mut pixel_video_visible = false;
 
     loop {
         if app.should_quit || INTERRUPTED.load(Ordering::SeqCst) {
@@ -218,21 +219,21 @@ pub fn run_app(
             // the toggle did nothing.
             let entering_native =
                 app.video_view && app.native_kitty_video_active() && !native_video_visible;
-            if entering_native {
-                if let Some(player) = app.player_manager.as_mut() {
-                    let _ = player.take_kitty_output();
-                }
-                terminal.clear()?;
+            if entering_native && let Some(player) = app.player_manager.as_mut() {
+                let _ = player.take_kitty_output();
             }
 
             // Apply a video-mode toggle before drawing either surface.
             let terminal_size = terminal.size()?;
             sync_video(&mut app, (terminal_size.width, terminal_size.height));
             let native_video_active = app.video_view && app.native_kitty_video_active();
-            if native_video_visible && !native_video_active {
-                // Clearing after `vo=null` removes the last Kitty placement
-                // and forces Ratatui to restore every underlying TUI cell.
-                terminal.clear()?;
+            if entering_native
+                || (pixel_video_visible && !app.video_view)
+                || (native_video_visible && !native_video_active)
+            {
+                // Reset the full-screen viewport and its diff buffer. clear() would
+                // query the hidden cursor and stall terminals that don't answer.
+                terminal.resize(terminal_size.into())?;
             }
             crate::ui::terminal::resync_cursor(terminal)?;
             terminal.draw(|frame| render_ui(frame, &app))?;
@@ -245,6 +246,11 @@ pub fn run_app(
                 crate::ui::terminal::write_raw(terminal, &kitty_output)?;
             }
             native_video_visible = native_video_active;
+            pixel_video_visible = app.video_view
+                && matches!(
+                    app.video.render_state(),
+                    crate::video::VideoDisplay::Pixels(..) | crate::video::VideoDisplay::Kitty(..)
+                );
             dirty = false;
         }
 
@@ -270,13 +276,8 @@ pub fn run_app(
         }
 
         if last_tick.elapsed() >= tick_rate {
-            let terminal_size = terminal.size()?;
             let poll_status = last_player_poll.elapsed() >= TICK_RATE;
-            if poll_player(
-                &mut app,
-                (terminal_size.width, terminal_size.height),
-                poll_status,
-            ) {
+            if poll_player(&mut app, poll_status) {
                 dirty = true;
             }
             if poll_status {
@@ -638,7 +639,7 @@ fn start_queue_if_idle(app: &mut App) {
     }
 }
 
-fn poll_player(app: &mut App, terminal_size: (u16, u16), poll_status: bool) -> bool {
+fn poll_player(app: &mut App, poll_status: bool) -> bool {
     if app.player_manager.is_none() {
         return false;
     }
@@ -661,8 +662,6 @@ fn poll_player(app: &mut App, terminal_size: (u16, u16), poll_status: bool) -> b
     if finished {
         app.handle_next_video(false);
     }
-
-    sync_video(app, terminal_size);
 
     poll_status || app.video_view
 }
@@ -698,20 +697,28 @@ fn sync_video(app: &mut App, (width, height): (u16, u16)) {
         }
     }
 
-    if !app.video_view {
-        app.video.stop();
-        return;
-    }
-
     let Some(player) = app.player_manager.as_ref() else {
         app.video.stop();
         return;
     };
+    if app.config.audio_only {
+        app.video_view = false;
+        app.video.stop();
+        return;
+    }
+    if !app.video_view {
+        app.video.hide(
+            &player.status,
+            player.current_video_id.as_deref(),
+            app.config.pixel_video_quality,
+        );
+        return;
+    }
     app.video.sync(
         &player.status,
         player.current_video_id.as_deref(),
-        cols,
-        rows,
+        Some(player.ipc_socket_path()),
+        (cols, rows),
         app.config.video_render,
         app.config.pixel_video_quality,
     );

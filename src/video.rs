@@ -2,11 +2,14 @@
 //! failures and startup latency never affect the long-lived audio player. See
 //! docs/superpowers/specs/2026-08-11-terminal-video-view-design.md.
 
+mod mpv_source;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{IsTerminal, Read};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -32,6 +35,9 @@ use crate::player_manager::PlaybackStatus;
 const MAX_PIXEL_WIDTH: u32 = 1280;
 const MAX_PIXEL_HEIGHT: u32 = 720;
 const VIDEO_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const HIDDEN_VIDEO_GRACE: Duration = Duration::from_secs(3);
+// mpv's position is polled every 250 ms; smaller startup offsets are within one poll.
+const STARTUP_SYNC_TOLERANCE: f64 = 0.25;
 const STREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 // mpv's output is captured so youtui can serialize Kitty frames with Ratatui.
@@ -40,6 +46,7 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MPV_KITTY_TICK_RATE: Duration = Duration::from_millis(16);
 
 static MPV_KITTY_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static FFMPEG_INITIAL_REQUEST_SIZE: OnceLock<bool> = OnceLock::new();
 
 /// Pipeline frame rate over the pty (base64 `t=d` and half-block paths):
 /// full frame data flows through the terminal parser, so stay conservative.
@@ -237,8 +244,15 @@ pub fn ffmpeg_args(
     w_px: u16,
     h_px: u16,
     fps: f64,
+    initial_request_size_supported: bool,
 ) -> Vec<String> {
     let mut args = Vec::new();
+    if initial_request_size_supported && (url.starts_with("https://") || url.starts_with("http://"))
+    {
+        // Some CDNs delay an open-ended GET. Fetch the header in a bounded range,
+        // then let ffmpeg request the bytes needed at the audio playhead.
+        args.extend(["-initial_request_size".to_string(), "65536".to_string()]);
+    }
     if !http_headers.is_empty() {
         // Direct Googlevideo URLs are tied to the client identity yt-dlp used
         // to resolve them. In particular, omitting its User-Agent can turn an
@@ -296,17 +310,17 @@ pub struct VideoSession {
     exchange: Arc<Mutex<FrameExchange>>,
     /// Frames the reader thread has decoded so far — the pipeline clock.
     /// Counting consumed frames instead would undercount (the UI polls
-    /// slower than the pipeline) and make `expected_position` lag mpv until the
+    /// slower than the pipeline) and make the frame clock lag mpv until the
     /// drift check killed a perfectly healthy session.
     frames_read: Arc<AtomicU64>,
+    /// Decode without frame pacing up to this frame while catching up with audio.
+    catch_up_frame: Arc<AtomicU64>,
     w_px: u16,
     h_px: u16,
     fps: f64,
     start_pos: f64,
     started_at: Instant,
-    /// Whether `start_pos` has been rebased onto mpv's clock after the first
-    /// frame arrived (see `rebase`).
-    rebased: bool,
+    synchronized: bool,
     stopped: bool,
     /// Whether the URL used to start this session came from the cache
     /// (as opposed to a fresh yt-dlp resolution). Stale cached URLs are the
@@ -328,7 +342,15 @@ impl VideoSession {
         h_px: u16,
         fps: f64,
     ) -> Result<Self> {
-        let args = ffmpeg_args(stream_url, http_headers, position, w_px, h_px, fps);
+        let args = ffmpeg_args(
+            stream_url,
+            http_headers,
+            position,
+            w_px,
+            h_px,
+            fps,
+            FFMPEG_INITIAL_REQUEST_SIZE.get() == Some(&true),
+        );
 
         let mut child = Command::new("ffmpeg")
             .args(&args)
@@ -348,10 +370,12 @@ impl VideoSession {
         let frame_interval = Duration::from_secs_f64(1.0 / fps);
         let exchange = Arc::new(Mutex::new(FrameExchange::default()));
         let frames_read = Arc::new(AtomicU64::new(0));
+        let catch_up_frame = Arc::new(AtomicU64::new(0));
 
         let reader = {
             let exchange = Arc::clone(&exchange);
             let frames_read = Arc::clone(&frames_read);
+            let catch_up_frame = Arc::clone(&catch_up_frame);
             thread::Builder::new()
                 .name("youtui-video-reader".to_string())
                 .spawn(move || {
@@ -367,9 +391,16 @@ impl VideoSession {
                             height_px: h_px,
                             rgb: buf,
                         };
-                        let recycled = exchange.lock().unwrap().publish(frame);
+                        let (recycled, count) = {
+                            let mut exchange = exchange.lock().unwrap();
+                            let recycled = exchange.publish(frame);
+                            (recycled, frames_read.fetch_add(1, Ordering::Relaxed) + 1)
+                        };
                         buf = recycled.unwrap_or_else(|| vec![0u8; frame_size]);
-                        frames_read.fetch_add(1, Ordering::Relaxed);
+                        if count < catch_up_frame.load(Ordering::Relaxed) {
+                            next_frame_at = Instant::now();
+                            continue;
+                        }
 
                         // Pace only after a complete first frame is available.
                         // Sleeping here fills ffmpeg's stdout pipe and naturally
@@ -391,12 +422,13 @@ impl VideoSession {
             reader: Some(reader),
             exchange,
             frames_read,
+            catch_up_frame,
             w_px,
             h_px,
             fps,
             start_pos: position,
             started_at: Instant::now(),
-            rebased: false,
+            synchronized: false,
             stopped: false,
             from_cache: false,
             dead_handled: false,
@@ -404,8 +436,10 @@ impl VideoSession {
     }
 
     /// Latest frame if a new one arrived since the last poll.
-    pub fn poll_frame(&mut self) -> Option<Frame> {
-        self.exchange.lock().unwrap().take_latest()
+    pub fn poll_frame(&mut self) -> Option<(Frame, f64)> {
+        let mut exchange = self.exchange.lock().unwrap();
+        let frame = exchange.take_latest()?;
+        Some((frame, self.frame_position()))
     }
 
     /// Return a consumed buffer to the reader when it matches this session's
@@ -421,17 +455,45 @@ impl VideoSession {
         self.frames_read.load(Ordering::Relaxed)
     }
 
-    /// Position ffmpeg is expected to be at: `start_pos + frames_read / fps`.
-    pub fn expected_position(&self) -> f64 {
-        self.start_pos + self.frames_read() as f64 / self.fps
+    fn frame_position(&self) -> f64 {
+        // Frame one is the frame requested with -ss.
+        self.start_pos + self.frames_read().saturating_sub(1) as f64 / self.fps
     }
 
-    /// Absorb ffmpeg's startup latency (network open + seek): once the first
-    /// frame has arrived, treat mpv's current position as the point the
-    /// pipeline clock started. Without this the constant startup lag reads as
-    /// drift and can kill a healthy session on slow connections.
-    fn rebase(&mut self, mpv_pos: f64) {
-        self.start_pos = mpv_pos - self.frames_read() as f64 / self.fps;
+    /// Catch up to the audio that actually played while ffmpeg opened the input.
+    /// Return true when seeking the decoder is preferable to reading intervening frames.
+    fn needs_seek(&mut self, mpv_pos: f64, paused: bool) -> bool {
+        if self.frames_read() == 0 {
+            return false;
+        }
+        let frame_pos = self.frame_position();
+        if self.synchronized {
+            return if paused {
+                (mpv_pos - frame_pos).abs() > STARTUP_SYNC_TOLERANCE
+            } else {
+                drift_exceeded(mpv_pos, frame_pos)
+            };
+        }
+        let advance = mpv_pos - self.start_pos;
+        let lag = mpv_pos - frame_pos;
+        if advance < -STARTUP_SYNC_TOLERANCE
+            || advance > self.started_at.elapsed().as_secs_f64() + STARTUP_SYNC_TOLERANCE * 2.0
+            || (paused && lag.abs() > STARTUP_SYNC_TOLERANCE)
+        {
+            return true;
+        }
+        if lag <= STARTUP_SYNC_TOLERANCE {
+            self.synchronized = true;
+            self.catch_up_frame.store(0, Ordering::Relaxed);
+            return drift_exceeded(mpv_pos, frame_pos);
+        }
+        // A slow seek or decoder must not trigger an unbounded burst of decoded frames.
+        if advance > VIDEO_STARTUP_TIMEOUT.as_secs_f64() + 2.0 {
+            return true;
+        }
+        self.catch_up_frame
+            .store((advance * self.fps).round() as u64 + 1, Ordering::Relaxed);
+        false
     }
 
     /// Has the ffmpeg process exited (crashed, killed, or reached EOF)?
@@ -477,6 +539,7 @@ struct ResolvedStream {
     /// CRLF-delimited HTTP request headers in ffmpeg's `-headers` format.
     http_headers: String,
     quality: PixelVideoQuality,
+    from_audio_player: bool,
 }
 
 struct PendingResolve {
@@ -485,6 +548,12 @@ struct PendingResolve {
     rx: Receiver<Result<ResolvedStream, String>>,
     cancelled: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+}
+
+struct PresentedFrame {
+    position: f64,
+    size: (u16, u16),
+    mode: VideoRenderMode,
 }
 
 impl Drop for PendingResolve {
@@ -523,9 +592,12 @@ pub struct VideoState {
     resolving: Option<PendingResolve>,
     current_video_id: Option<String>,
     current_quality: Option<PixelVideoQuality>,
+    /// When the pane closed and the audio playhead at that instant.
+    hidden_since: Option<(Instant, f64)>,
+    presented: Option<PresentedFrame>,
+    /// Raw cell-renderer output or pixels for restoring a cleared Kitty image.
     last_frame: Option<Frame>,
-    /// Last frame encoded for the terminal's graphics protocol (pixel
-    /// renderer). Mutually exclusive with `last_frame`.
+    /// Last frame encoded for the generic terminal graphics protocol.
     last_protocol: Option<Protocol>,
     /// Detected terminal graphics support, set once at startup. `None` means
     /// the terminal only does half-block cells.
@@ -557,6 +629,8 @@ impl VideoState {
             resolving: None,
             current_video_id: None,
             current_quality: None,
+            hidden_since: None,
+            presented: None,
             last_frame: None,
             last_protocol: None,
             picker: None,
@@ -638,17 +712,12 @@ impl VideoState {
         }
     }
 
-    /// Stop any session and discard in-flight resolution work. Called both
-    /// when the video view is toggled off and when the sync loop decides
-    /// nothing should be playing.
+    /// Release video processes and presentation state, retaining resolved URLs.
     pub fn stop(&mut self) {
         self.session = None;
         self.resolving = None; // cancel and join the resolver before starting another
-        self.last_frame = None;
-        self.last_protocol = None;
-        if let Some(transport) = self.kitty_transport.as_mut() {
-            transport.reset();
-        }
+        self.hidden_since = None;
+        self.clear_output();
         self.error = None;
         self.current_video_id = None;
         self.current_quality = None;
@@ -658,8 +727,67 @@ impl VideoState {
         self.retried_after_evict = false;
     }
 
+    /// Keep an already requested video warm for a quick return to the same track.
+    pub fn hide(
+        &mut self,
+        status: &PlaybackStatus,
+        video_id: Option<&str>,
+        quality: PixelVideoQuality,
+    ) {
+        if self.current_video_id.is_none() {
+            return;
+        }
+        if self.current_video_id.as_deref() != video_id
+            || self.current_quality != Some(quality)
+            || !(status.playing || status.paused)
+            || self.error.is_some()
+            || self.give_up
+        {
+            self.stop();
+            return;
+        }
+        if self.hidden_since.is_none() {
+            self.hidden_since = Some((Instant::now(), status.time_pos));
+        }
+        self.maintain_hidden(status);
+    }
+
+    fn clear_output(&mut self) {
+        self.presented = None;
+        self.last_frame = None;
+        self.last_protocol = None;
+        if let Some(transport) = self.kitty_transport.as_mut() {
+            transport.reset();
+        }
+    }
+
+    fn maintain_hidden(&mut self, status: &PlaybackStatus) {
+        let Some((hidden_at, position)) = self.hidden_since else {
+            return;
+        };
+        if self.presented.as_ref().is_some_and(|frame| {
+            !status.paused || (frame.position - status.time_pos).abs() > STARTUP_SYNC_TOLERANCE
+        }) {
+            self.clear_output();
+        }
+        let elapsed = hidden_at.elapsed();
+        if elapsed >= HIDDEN_VIDEO_GRACE {
+            // A resolver may have finished after the pane closed. Keep its URL
+            // for the next visit without starting a decoder in the background.
+            if let Some(pending) = &self.resolving
+                && let Ok(Ok(stream)) = pending.rx.try_recv()
+            {
+                self.cache.insert(pending.video_id.clone(), stream);
+            }
+            self.stop();
+        } else if status.paused || drift_exceeded(status.time_pos, position + elapsed.as_secs_f64())
+        {
+            self.session = None;
+        }
+    }
+
     /// Start at most one resolver for the requested stream while video is visible.
-    fn begin_resolve(&mut self, video_id: &str, quality: PixelVideoQuality) {
+    fn begin_resolve(&mut self, video_id: &str, quality: PixelVideoQuality, socket: Option<&Path>) {
         if self
             .cache
             .get(video_id)
@@ -672,7 +800,8 @@ impl VideoState {
             return;
         }
         self.resolving = None;
-        self.resolving = Some(spawn_resolve(video_id, quality));
+        let socket = socket.filter(|_| !self.retried_after_evict);
+        self.resolving = Some(spawn_resolve(video_id, quality, socket));
     }
 
     /// Reset per-track rendering state while retaining a matching background
@@ -719,8 +848,8 @@ impl VideoState {
         &mut self,
         status: &PlaybackStatus,
         video_id: Option<&str>,
-        cols: u16,
-        rows: u16,
+        socket: Option<&Path>,
+        (cols, rows): (u16, u16),
         mode: VideoRenderMode,
         quality: PixelVideoQuality,
     ) {
@@ -729,17 +858,28 @@ impl VideoState {
             return;
         };
 
+        self.maintain_hidden(status);
+        let reopening = self.hidden_since.take().is_some();
         if self.current_video_id.as_deref() != Some(video_id)
             || self.current_quality != Some(quality)
         {
             self.switch_track(video_id, quality);
         }
 
-        if status.paused && self.has_output() {
-            // Freeze on the last frame; nothing should decode while paused.
-            self.session = None;
-            self.paused = true;
-            return;
+        if let Some(frame) = &self.presented {
+            if frame.size != (cols, rows)
+                || frame.mode != mode
+                || (status.paused
+                    && (frame.position - status.time_pos).abs() > STARTUP_SYNC_TOLERANCE)
+            {
+                self.clear_output();
+            } else if status.paused && (!reopening || self.restore_kitty_frame(cols, rows)) {
+                self.session = None;
+                self.paused = true;
+                return;
+            } else if status.paused {
+                self.clear_output();
+            }
         }
         // A pause before the first frame must still drive URL resolution and
         // decode one frame. Otherwise the early return above leaves a completed
@@ -758,28 +898,23 @@ impl VideoState {
         });
         let (w_px, h_px) = decode_size(cols, rows, font_size);
 
-        if self.restart_if_stale(status.time_pos, w_px, h_px, fps) {
-            // Never leave the pane saying "loading" forever. A fresh manual
-            // toggle may retry, but it must resolve a new URL first.
-            self.cache.remove(video_id);
-            self.error = Some("video unavailable: stream startup timed out".to_string());
-            self.give_up = true;
-            return;
-        }
+        self.restart_if_stale(video_id, status.time_pos, w_px, h_px, fps);
         self.handle_session_death(video_id);
 
         if self.give_up {
             return;
         }
 
-        if let Some(frame) = self.session.as_mut().and_then(VideoSession::poll_frame) {
-            self.store_frame(frame, pixels, cols, rows);
+        if let Some((frame, position)) = self.session.as_mut().and_then(VideoSession::poll_frame)
+            && self.store_frame(frame, pixels, cols, rows)
+        {
+            self.presented = Some(PresentedFrame {
+                position,
+                size: (cols, rows),
+                mode,
+            });
         }
-        if let Some(session) = self.session.as_mut() {
-            if !session.rebased && session.frames_read() > 0 {
-                session.rebase(status.time_pos);
-                session.rebased = true;
-            }
+        if self.session.is_some() {
             return;
         }
 
@@ -794,77 +929,99 @@ impl VideoState {
             return;
         }
 
-        self.poll_resolve(video_id, quality, status.time_pos, w_px, h_px, fps);
+        self.poll_resolve(
+            video_id,
+            quality,
+            socket,
+            status.time_pos,
+            (w_px, h_px),
+            fps,
+        );
+    }
+
+    fn restore_kitty_frame(&mut self, cols: u16, rows: u16) -> bool {
+        // Clearing the terminal can delete Kitty image data along with its
+        // placements. A paused decoder cannot supply a replacement frame.
+        if self
+            .kitty_transport
+            .as_ref()
+            .is_some_and(KittyTransport::has_frame)
+            || matches!(self.last_protocol, Some(Protocol::Kitty(_)))
+        {
+            return self
+                .last_frame
+                .take()
+                .is_some_and(|frame| self.store_frame(frame, true, cols, rows));
+        }
+        true
+    }
+
+    fn retain_frame(&mut self, frame: Frame) {
+        if let Some(previous) = self.last_frame.replace(frame)
+            && let Some(session) = &self.session
+        {
+            session.recycle_buffer(previous.rgb);
+        }
     }
 
     /// Store a decoded frame in the form the renderer needs: encoded for the
     /// terminal's graphics protocol when the pixel renderer is active,
     /// otherwise raw for the half-block path.
-    fn store_frame(&mut self, frame: Frame, pixels: bool, cols: u16, rows: u16) {
+    fn store_frame(&mut self, frame: Frame, pixels: bool, cols: u16, rows: u16) -> bool {
         if !pixels {
-            let replaced = self.last_frame.replace(frame);
+            self.retain_frame(frame);
             self.last_protocol = None;
-            if let Some(replaced) = replaced
-                && let Some(session) = &self.session
-            {
-                session.recycle_buffer(replaced.rgb);
-            }
-            return;
+            return true;
         }
         if let Some(transport) = self.kitty_transport.as_mut() {
             match transport.push_frame(&frame, cols, rows) {
                 Ok(()) => {
-                    self.last_frame = None;
+                    self.retain_frame(frame);
                     self.last_protocol = None;
-                    if let Some(session) = &self.session {
-                        session.recycle_buffer(frame.rgb);
-                    }
-                    return;
+                    return true;
                 }
                 Err(_error) => {
                     // Keep explicit cell placement when shared memory fails.
                     let mut direct = KittyTransport::new(false);
                     if direct.push_frame(&frame, cols, rows).is_ok() {
                         self.kitty_transport = Some(direct);
-                        self.last_frame = None;
+                        self.retain_frame(frame);
                         self.last_protocol = None;
-                        if let Some(session) = &self.session {
-                            session.recycle_buffer(frame.rgb);
-                        }
-                        return;
+                        return true;
                     }
                 }
             }
         }
         let Some(picker) = self.picker.as_ref() else {
-            let replaced = self.last_frame.replace(frame);
+            self.retain_frame(frame);
             self.last_protocol = None;
-            if let Some(replaced) = replaced
-                && let Some(session) = &self.session
-            {
-                session.recycle_buffer(replaced.rgb);
-            }
-            return;
+            return true;
         };
+        // The generic Kitty encoder (used for tmux passthrough) takes
+        // ownership of its RGB input and only transmits the encoded image once.
+        let replay = (picker.protocol_type() == ProtocolType::Kitty).then(|| Frame {
+            width: frame.width,
+            height_px: frame.height_px,
+            rgb: frame.rgb.clone(),
+        });
         let Some(image) = RgbImage::from_raw(
             u32::from(frame.width),
             u32::from(frame.height_px),
             frame.rgb,
         ) else {
-            return; // impossible: buffer size is derived from these dims
+            return false; // impossible: buffer size is derived from these dims
         };
         let size = Size::new(cols, rows);
         // Scale (not Fit): the decode size is capped at 720p, so panes larger
         // than that need the image upscaled to fill the cell area.
-        match picker.new_protocol(DynamicImage::ImageRgb8(image), size, Resize::Scale(None)) {
-            Ok(protocol) => {
-                self.last_protocol = Some(protocol);
-                self.last_frame = None;
-            }
-            Err(_) => {
-                // Keep showing the previous frame rather than flickering.
-            }
-        }
+        let Ok(protocol) =
+            picker.new_protocol(DynamicImage::ImageRgb8(image), size, Resize::Scale(None))
+        else {
+            return false;
+        };
+        self.last_protocol = Some(protocol);
+        self.last_frame = replay;
+        true
     }
 
     fn has_output(&self) -> bool {
@@ -876,24 +1033,25 @@ impl VideoState {
                 .is_some_and(KittyTransport::has_frame)
     }
 
-    /// Restart for ordinary drift/resize and report whether startup timed out.
-    fn restart_if_stale(&mut self, time_pos: f64, w_px: u16, h_px: u16, fps: f64) -> bool {
-        let (stale, timed_out) = self.session.as_ref().map_or((false, false), |session| {
-            if session.w_px != w_px || session.h_px != h_px || session.fps != fps {
-                return (true, false);
-            }
-            // A first frame can be ready before sync has aligned the decoder clock with mpv.
-            if !session.rebased {
-                let timed_out =
-                    startup_timed_out(session.frames_read(), session.started_at.elapsed());
-                return (timed_out, timed_out);
-            }
-            (drift_exceeded(time_pos, session.expected_position()), false)
-        });
-        if stale {
+    fn restart_if_stale(&mut self, video_id: &str, time_pos: f64, w_px: u16, h_px: u16, fps: f64) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if session.w_px != w_px
+            || session.h_px != h_px
+            || session.fps != fps
+            || session.needs_seek(time_pos, self.paused)
+        {
             self.session = None;
+        } else if startup_timed_out(session.frames_read(), session.started_at.elapsed()) {
+            let from_cache = session.from_cache;
+            self.session = None;
+            self.fail_or_refresh_source(
+                video_id,
+                from_cache,
+                "video unavailable: stream startup timed out",
+            );
         }
-        timed_out
     }
 
     fn handle_session_death(&mut self, video_id: &str) {
@@ -909,15 +1067,26 @@ impl VideoState {
         let from_cache = session.from_cache;
         self.session = None;
 
-        if died_immediately && from_cache && !self.retried_after_evict {
-            // The cached URL likely expired; evict it and re-resolve once
-            // before treating this as a real failure.
-            self.retried_after_evict = true;
-            self.cache.remove(video_id);
+        if died_immediately && (from_cache || self.retried_after_evict) {
+            self.fail_or_refresh_source(
+                video_id,
+                from_cache,
+                "video unavailable: ffmpeg exited before the first frame",
+            );
             return;
         }
 
         self.record_death();
+    }
+
+    fn fail_or_refresh_source(&mut self, video_id: &str, from_cache: bool, message: &str) {
+        self.cache.remove(video_id);
+        if from_cache && !self.retried_after_evict {
+            self.retried_after_evict = true;
+        } else {
+            self.error = Some(message.to_string());
+            self.give_up = true;
+        }
     }
 
     fn record_death(&mut self) {
@@ -960,9 +1129,9 @@ impl VideoState {
         &mut self,
         video_id: &str,
         quality: PixelVideoQuality,
+        socket: Option<&Path>,
         position: f64,
-        w_px: u16,
-        h_px: u16,
+        (w_px, h_px): (u16, u16),
         fps: f64,
     ) {
         let needs_new_request = match &self.resolving {
@@ -970,7 +1139,7 @@ impl VideoState {
             None => true,
         };
         if needs_new_request {
-            self.begin_resolve(video_id, quality);
+            self.begin_resolve(video_id, quality, socket);
             return;
         }
 
@@ -981,7 +1150,7 @@ impl VideoState {
             Ok(Ok(stream)) => {
                 self.cache.insert(video_id.to_string(), stream.clone());
                 self.resolving = None;
-                self.start_session(&stream, position, w_px, h_px, fps, false);
+                self.start_session(&stream, position, w_px, h_px, fps, stream.from_audio_player);
             }
             Ok(Err(reason)) => {
                 self.resolving = None;
@@ -999,15 +1168,31 @@ impl VideoState {
 }
 
 /// Resolve a video stream on a cancellable worker owned by the video pane.
-fn spawn_resolve(video_id: &str, quality: PixelVideoQuality) -> PendingResolve {
+fn spawn_resolve(
+    video_id: &str,
+    quality: PixelVideoQuality,
+    socket: Option<&Path>,
+) -> PendingResolve {
     let (tx, rx) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
-    let watch_url = format!("https://www.youtube.com/watch?v={video_id}");
+    let track = video_id.to_owned();
+    let socket = socket.map(Path::to_owned);
     let worker = thread::Builder::new()
         .name("youtui-video-resolver".to_string())
         .spawn(move || {
-            let _ = tx.send(resolve_stream_url(&watch_url, quality, &worker_cancelled));
+            let stream = socket
+                .as_deref()
+                .and_then(|path| mpv_source::from_player(path, &track, quality))
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    let url = format!("https://www.youtube.com/watch?v={track}");
+                    resolve_stream_url(&url, quality, &worker_cancelled)
+                });
+            if stream.is_ok() {
+                probe_ffmpeg_http_options(&worker_cancelled);
+            }
+            let _ = tx.send(stream);
         })
         .ok();
     PendingResolve {
@@ -1016,6 +1201,25 @@ fn spawn_resolve(video_id: &str, quality: PixelVideoQuality) -> PendingResolve {
         rx,
         cancelled,
         worker,
+    }
+}
+
+// Older ffmpeg versions reject the HTTP option. Probe once on the video worker
+// so startup, playback controls and audio-only sessions never wait for it.
+fn probe_ffmpeg_http_options(cancelled: &AtomicBool) {
+    if FFMPEG_INITIAL_REQUEST_SIZE.get().is_some() {
+        return;
+    }
+    let mut command = Command::new("ffmpeg");
+    command.args(["-hide_banner", "-h", "protocol=http"]);
+    let supported =
+        run_resolve_command(command, cancelled, Duration::from_secs(1)).is_ok_and(|help| {
+            String::from_utf8_lossy(&help)
+                .split_ascii_whitespace()
+                .any(|word| word == "-initial_request_size")
+        });
+    if !cancelled.load(Ordering::Relaxed) {
+        let _ = FFMPEG_INITIAL_REQUEST_SIZE.set(supported);
     }
 }
 
@@ -1133,34 +1337,33 @@ fn parse_resolve_output(
         .filter(|url| !url.is_empty())
         .ok_or_else(|| "yt-dlp returned no stream URL".to_string())?;
 
-    let mut headers = lines
+    let headers = lines
         .next()
-        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .and_then(|value| value.as_object().cloned())
-        .map(|headers| {
-            headers
-                .into_iter()
-                .filter_map(|(name, value)| {
-                    let value = value.as_str()?;
-                    safe_http_header(&name, value).then_some((name, value.to_string()))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    headers.sort_unstable_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
-    let mut http_headers = String::new();
-    for (name, value) in headers {
-        http_headers.push_str(&name);
-        http_headers.push_str(": ");
-        http_headers.push_str(&value);
-        http_headers.push_str("\r\n");
-    }
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok());
 
     Ok(ResolvedStream {
         url: url.to_string(),
-        http_headers,
+        http_headers: ffmpeg_headers(headers.as_ref()),
         quality,
+        from_audio_player: false,
     })
+}
+
+fn ffmpeg_headers(value: Option<&serde_json::Value>) -> String {
+    let mut output = String::new();
+    if let Some(headers) = value.and_then(serde_json::Value::as_object) {
+        for (name, value) in headers {
+            if let Some(value) = value.as_str()
+                && safe_http_header(name, value)
+            {
+                output.push_str(name);
+                output.push_str(": ");
+                output.push_str(value);
+                output.push_str("\r\n");
+            }
+        }
+    }
+    output
 }
 
 fn safe_http_header(name: &str, value: &str) -> bool {
@@ -1184,10 +1387,13 @@ mod tests {
             80,
             48,
             24.0,
+            true,
         );
         assert_eq!(
             args,
             vec![
+                "-initial_request_size",
+                "65536",
                 "-headers",
                 "User-Agent: yt-dlp-agent\r\n",
                 "-ss",
@@ -1209,8 +1415,9 @@ mod tests {
 
     #[test]
     fn ffmpeg_args_omit_empty_http_headers_and_input_throttling() {
-        let args = ffmpeg_args("https://example.com/stream", "", 0.0, 80, 48, 24.0);
+        let args = ffmpeg_args("https://example.com/stream", "", 0.0, 80, 48, 24.0, false);
 
+        assert!(!args.iter().any(|arg| arg == "-initial_request_size"));
         assert!(!args.iter().any(|arg| arg == "-headers"));
         assert!(!args.iter().any(|arg| arg == "-re" || arg == "-readrate"));
     }
@@ -1408,9 +1615,10 @@ mod tests {
                 url: "https://cached".to_string(),
                 http_headers: String::new(),
                 quality: PixelVideoQuality::P144,
+                from_audio_player: false,
             },
         );
-        state.begin_resolve("abc123", PixelVideoQuality::P144);
+        state.begin_resolve("abc123", PixelVideoQuality::P144, None);
         assert!(state.resolving.is_none());
     }
 
@@ -1457,15 +1665,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn delayed_first_frame_syncs_before_checking_for_drift() {
-        let mut state = VideoState::new();
-        let quality = PixelVideoQuality::P144;
-        let mode = VideoRenderMode::Blocks;
-        let fps = state.fps(mode);
-        state.switch_track("abc", quality);
-        // A live process stands in for ffmpeg. Advance playback time without sleeping.
-        state.session = Some(VideoSession {
+    fn session_with_queued_frame(fps: f64) -> VideoSession {
+        VideoSession {
             child: Command::new("cat").stdin(Stdio::piped()).spawn().unwrap(),
             reader: None,
             exchange: Arc::new(Mutex::new(FrameExchange {
@@ -1477,16 +1678,30 @@ mod tests {
                 spare: None,
             })),
             frames_read: Arc::new(AtomicU64::new(1)),
+            catch_up_frame: Arc::new(AtomicU64::new(0)),
             w_px: 1,
             h_px: 2,
             fps,
             start_pos: 0.0,
             started_at: Instant::now(),
-            rebased: false,
+            synchronized: false,
             stopped: false,
             from_cache: false,
             dead_handled: false,
-        });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_first_frame_syncs_before_checking_for_drift() {
+        let mut state = VideoState::new();
+        let quality = PixelVideoQuality::P144;
+        let mode = VideoRenderMode::Blocks;
+        let fps = state.fps(mode);
+        state.switch_track("abc", quality);
+        let mut session = session_with_queued_frame(fps);
+        session.started_at = Instant::now() - Duration::from_secs(5);
+        state.session = Some(session);
         let status = PlaybackStatus {
             playing: true,
             time_pos: 5.0,
@@ -1494,17 +1709,47 @@ mod tests {
         };
 
         // Keep the regression hermetic even if the session would ordinarily restart the resolver.
-        assert!(!state.restart_if_stale(status.time_pos, 1, 2, fps));
+        state.restart_if_stale("abc", status.time_pos, 1, 2, fps);
         assert!(state.session.is_some(), "first frame discarded as drift");
-        state.sync(&status, Some("abc"), 1, 1, mode, quality);
+        let session = state.session.as_ref().unwrap();
+        let target = 1 + (5.0 * fps) as u64;
+        assert_eq!(session.catch_up_frame.load(Ordering::Relaxed), target);
+        assert_eq!(session.frame_position(), 0.0);
+        assert!(!session.synchronized);
+        state.sync(&status, Some("abc"), None, (1, 1), mode, quality);
         assert!(state.last_frame.is_some());
-        assert!(!state.restart_if_stale(status.time_pos, 1, 2, fps));
-        assert!(state.session.is_some());
-        assert!(!state.restart_if_stale(status.time_pos + 3.0, 1, 2, fps));
+        // Advance the reader to its unpaced target. The frame timestamp now matches mpv.
+        state
+            .session
+            .as_ref()
+            .unwrap()
+            .frames_read
+            .store(target, Ordering::Relaxed);
+        state.restart_if_stale("abc", status.time_pos, 1, 2, fps);
+        let session = state.session.as_ref().unwrap();
+        assert!(session.synchronized);
+        assert_eq!(session.frame_position(), 5.0);
+        assert_eq!(session.catch_up_frame.load(Ordering::Relaxed), 0);
+        state.restart_if_stale("abc", status.time_pos + 3.0, 1, 2, fps);
         assert!(
             state.session.is_none(),
             "seek after synchronization must restart"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_seeks_and_pauses_never_request_an_unpaced_frame_burst() {
+        for (playhead, elapsed, paused) in [(300.0, 3, false), (24.0, 24, false), (3.0, 3, true)] {
+            let mut session = session_with_queued_frame(PTY_FPS);
+            session.started_at = Instant::now() - Duration::from_secs(elapsed);
+            assert!(session.needs_seek(playhead, paused));
+            assert_eq!(session.catch_up_frame.load(Ordering::Relaxed), 0);
+        }
+        let mut session = session_with_queued_frame(PTY_FPS);
+        assert!(!session.needs_seek(0.0, true));
+        assert!(session.synchronized);
+        assert_eq!(session.catch_up_frame.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1515,6 +1760,107 @@ mod tests {
             VIDEO_STARTUP_TIMEOUT + Duration::from_millis(1)
         ));
         assert!(!startup_timed_out(1, Duration::from_secs(60)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decoder_startup_timeout_refreshes_a_reused_source_only_once() {
+        let quality = PixelVideoQuality::P144;
+        let mut state = VideoState::new();
+        state.switch_track("abc", quality);
+        for reused in [true, false] {
+            let mut session = session_with_queued_frame(PTY_FPS);
+            session.frames_read.store(0, Ordering::Relaxed);
+            session.started_at = Instant::now() - VIDEO_STARTUP_TIMEOUT - Duration::from_millis(1);
+            session.from_cache = reused;
+            state.session = Some(session);
+            state.cache.insert(
+                "abc".to_string(),
+                ResolvedStream {
+                    url: "expired".to_string(),
+                    http_headers: String::new(),
+                    quality,
+                    from_audio_player: reused,
+                },
+            );
+            state.restart_if_stale("abc", 0.0, 1, 2, PTY_FPS);
+            assert!(state.session.is_none() && !state.cache.contains_key("abc"));
+            assert!(state.retried_after_evict);
+            assert_eq!(state.give_up, !reused);
+            assert_eq!(
+                state.error.as_deref(),
+                (!reused).then_some("video unavailable: stream startup timed out")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopened_pane_reuses_the_decoder_and_discards_it_on_a_hidden_seek_or_pause() {
+        let mut state = VideoState::new();
+        let quality = PixelVideoQuality::P144;
+        let mode = VideoRenderMode::Blocks;
+        let mut status = PlaybackStatus {
+            playing: true,
+            ..PlaybackStatus::default()
+        };
+        state.switch_track("abc", quality);
+        let session = session_with_queued_frame(state.fps(mode));
+        let pid = session.child.id();
+        state.session = Some(session);
+        state.hide(&status, Some("abc"), quality);
+        state.sync(&status, Some("abc"), None, (1, 1), mode, quality);
+        assert_eq!(state.session.as_ref().unwrap().child.id(), pid);
+        assert!(matches!(
+            state.render_state(),
+            VideoDisplay::Frame(_, false)
+        ));
+
+        state.hide(&status, Some("abc"), quality);
+        assert!(!state.has_output());
+        status.time_pos = 60.0;
+        state.hide(&status, Some("abc"), quality);
+        assert!(state.session.is_none());
+
+        state.hidden_since = None;
+        state.session = Some(session_with_queued_frame(state.fps(mode)));
+        status.paused = true;
+        state.hide(&status, Some("abc"), quality);
+        assert!(state.session.is_none());
+    }
+
+    #[test]
+    fn hidden_pane_releases_workers_and_caches_a_finished_resolution() {
+        let quality = PixelVideoQuality::P240;
+        let mut state = VideoState::new();
+        state.switch_track("abc", quality);
+        let (tx, rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.resolving = Some(PendingResolve {
+            video_id: "abc".to_string(),
+            quality,
+            rx,
+            cancelled: Arc::clone(&cancelled),
+            worker: None,
+        });
+        let status = PlaybackStatus {
+            playing: true,
+            ..PlaybackStatus::default()
+        };
+        state.hide(&status, Some("abc"), quality);
+        assert!(!cancelled.load(Ordering::Relaxed));
+        tx.send(Ok(ResolvedStream {
+            url: "video".to_string(),
+            http_headers: String::new(),
+            quality,
+            from_audio_player: false,
+        }))
+        .unwrap();
+        state.hidden_since = Some((Instant::now() - HIDDEN_VIDEO_GRACE, 0.0));
+        state.hide(&status, Some("abc"), quality);
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert_eq!(state.cache["abc"].url, "video");
+        assert!(state.resolving.is_none() && state.session.is_none());
     }
 
     #[test]
@@ -1531,6 +1877,7 @@ mod tests {
                 url: "url".to_string(),
                 http_headers: String::new(),
                 quality: PixelVideoQuality::P144,
+                from_audio_player: false,
             },
         );
 
@@ -1561,8 +1908,8 @@ mod tests {
         state.sync(
             &PlaybackStatus::default(),
             None,
-            80,
-            24,
+            None,
+            (80, 24),
             VideoRenderMode::Auto,
             PixelVideoQuality::P144,
         );
@@ -1571,34 +1918,48 @@ mod tests {
         assert!(matches!(state.render_state(), VideoDisplay::Placeholder));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn sync_while_paused_drops_the_session_but_keeps_the_last_frame() {
-        let mut state = VideoState::new();
-        state.current_video_id = Some("abc".to_string());
-        state.current_quality = Some(PixelVideoQuality::P144);
-        state.last_frame = Some(Frame {
-            width: 1,
-            height_px: 2,
-            rgb: vec![9, 9, 9, 1, 1, 1],
-        });
-
-        state.sync(
-            &PlaybackStatus {
+    fn quick_reopen_reuses_a_paused_frame_only_at_its_playhead_size_and_mode() {
+        let quality = PixelVideoQuality::P144;
+        let mode = VideoRenderMode::Blocks;
+        for (playhead, size, reopened_mode) in [
+            (15.0, (1, 1), mode),
+            (5.0, (2, 1), mode),
+            (5.0, (1, 1), VideoRenderMode::Auto),
+        ] {
+            let mut state = VideoState::new();
+            state.switch_track("abc", quality);
+            let mut session = session_with_queued_frame(state.fps(mode));
+            session.start_pos = 5.0;
+            state.session = Some(session);
+            let mut status = PlaybackStatus {
                 playing: true,
-                paused: true,
                 time_pos: 5.0,
                 ..PlaybackStatus::default()
-            },
-            Some("abc"),
-            80,
-            24,
-            VideoRenderMode::Auto,
-            PixelVideoQuality::P144,
-        );
+            };
+            state.sync(&status, Some("abc"), None, (1, 1), mode, quality);
+            status.paused = true;
+            state.hide(&status, Some("abc"), quality);
+            state.sync(&status, Some("abc"), None, (1, 1), mode, quality);
+            assert!(matches!(state.render_state(), VideoDisplay::Frame(_, true)));
+            assert!(state.session.is_none() && state.resolving.is_none());
 
-        assert!(state.session.is_none());
-        assert!(state.paused);
-        assert!(matches!(state.render_state(), VideoDisplay::Frame(_, true)));
+            state.hide(&status, Some("abc"), quality);
+            // Block resolution so an invalidated frame cannot be silently replaced.
+            let (_tx, rx) = mpsc::channel();
+            state.resolving = Some(PendingResolve {
+                video_id: "abc".into(),
+                quality,
+                rx,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                worker: None,
+            });
+            status.time_pos = playhead;
+            state.sync(&status, Some("abc"), None, size, reopened_mode, quality);
+            assert!(!state.has_output());
+            assert!(matches!(state.render_state(), VideoDisplay::Loading));
+        }
     }
 
     #[test]
@@ -1625,8 +1986,8 @@ mod tests {
                 ..PlaybackStatus::default()
             },
             Some("abc"),
-            80,
-            24,
+            None,
+            (80, 24),
             VideoRenderMode::Auto,
             PixelVideoQuality::P144,
         );
@@ -1663,8 +2024,8 @@ mod tests {
                 state.sync(
                     &status,
                     Some("abc"),
-                    80,
-                    24,
+                    None,
+                    (80, 24),
                     VideoRenderMode::Blocks,
                     PixelVideoQuality::P144,
                 );
@@ -1723,6 +2084,7 @@ wait"#,
                 url: "unused".to_string(),
                 http_headers: String::new(),
                 quality: PixelVideoQuality::P144,
+                from_audio_player: false,
             }))
             .unwrap();
         });
@@ -1807,6 +2169,80 @@ wait"#,
                 .symbol()
                 .contains(",c=188,r=51,")
         );
+    }
+
+    #[test]
+    fn paused_kitty_reopen_transmits_the_cached_pixels_again_after_screen_clear() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        let area = Rect::new(0, 0, 2, 1);
+        let render = |state: &VideoState| {
+            let mut buffer = Buffer::empty(area);
+            match state.render_state() {
+                VideoDisplay::Kitty(transport, _) => transport.render(area, &mut buffer),
+                VideoDisplay::Pixels(protocol, _) => {
+                    ratatui_image::Image::new(protocol).render(area, &mut buffer)
+                }
+                _ => panic!("expected a Kitty frame"),
+            }
+            buffer.cell((0, 0)).unwrap().symbol().to_owned()
+        };
+        for use_shm in [Some(false), Some(true), None] {
+            let mut state = VideoState::new();
+            let quality = PixelVideoQuality::P144;
+            let mode = VideoRenderMode::Auto;
+            let status = PlaybackStatus {
+                playing: true,
+                paused: true,
+                time_pos: 3.0,
+                ..PlaybackStatus::default()
+            };
+            state.switch_track("video", quality);
+            state.picker = Some(picker_for_protocol(ProtocolType::Kitty, (1, 2)));
+            state.kitty_transport = use_shm.map(KittyTransport::new);
+            let frame = Frame {
+                width: 2,
+                height_px: 2,
+                rgb: vec![55; 12],
+            };
+            assert!(state.store_frame(frame, true, 2, 1));
+            state.presented = Some(PresentedFrame {
+                position: status.time_pos,
+                size: (2, 1),
+                mode,
+            });
+
+            for pass in 0..2 {
+                let output = render(&state);
+                assert!(
+                    output.contains("a=T"),
+                    "no Kitty pixel upload on render {pass}"
+                );
+                if use_shm == Some(true) {
+                    assert!(output.contains("t=s"));
+                    let payload = output
+                        .split_once(';')
+                        .unwrap()
+                        .1
+                        .split_once("\x1b\\")
+                        .unwrap()
+                        .0;
+                    let bytes = base64_simd::STANDARD.decode_to_vec(payload).unwrap();
+                    let name = std::ffi::CString::new(bytes).unwrap();
+                    // SAFETY: this is the NUL-terminated name of the shm object the transport just uploaded.
+                    assert_eq!(unsafe { libc::shm_unlink(name.as_ptr()) }, 0);
+                }
+                assert!(
+                    !render(&state).contains("a=T"),
+                    "ordinary redraw should reuse placement"
+                );
+                if pass == 0 {
+                    state.hide(&status, Some("video"), quality);
+                    state.sync(&status, Some("video"), None, (2, 1), mode, quality);
+                }
+            }
+            assert!(state.resolving.is_none() && state.session.is_none());
+        }
     }
 
     #[test]

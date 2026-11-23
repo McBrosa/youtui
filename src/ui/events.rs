@@ -231,13 +231,10 @@ fn handle_browse_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Toggle the terminal video pane. The runner performs the corresponding mpv
-/// output switch once it knows the exact pane geometry; portable renderers are
-/// stopped immediately when leaving the pane.
+/// Toggle the pane; the runner synchronizes the renderer with the active track.
 fn toggle_video_view(app: &mut App) {
     if app.video_view {
         app.video_view = false;
-        app.video.stop();
         return;
     }
 

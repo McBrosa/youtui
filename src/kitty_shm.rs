@@ -728,6 +728,8 @@ mod tests {
     #[test]
     fn push_frame_queues_a_transmit_escape_with_the_pane_grid() {
         let mut transport = KittyTransport::new(true);
+        // The paused-video redraw test uses slots 1 and 2 in the same process.
+        transport.seq = 4;
         let frame = Frame {
             width: 2,
             height_px: 2,
@@ -740,7 +742,7 @@ mod tests {
         assert!(transport.has_frame());
 
         // Clean up the shm slot the test created.
-        let c_name = CString::new(shm_name(1)).unwrap();
+        let c_name = CString::new(shm_name(5)).unwrap();
         // SAFETY: valid NUL-terminated name.
         unsafe { libc::shm_unlink(c_name.as_ptr()) };
     }
