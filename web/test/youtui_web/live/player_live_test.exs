@@ -404,7 +404,8 @@ defmodule YoutuiWeb.PlayerLiveTest do
       retry_generation = :sys.get_state(view.pid).socket.assigns.play_generation
 
       completion =
-        {:retry_prepared, 0, retry_generation, failure, newer_revision, {:ok, "/media/current"}}
+        {:retry_prepared, 0, retry_generation, failure, newer_revision,
+         {:ok, %{url: "/media/current", kind: :file}}}
 
       send(view.pid, completion)
       _ = :sys.get_state(view.pid)
@@ -799,6 +800,69 @@ defmodule YoutuiWeb.PlayerLiveTest do
     refute has_element?(view, "#player-error")
   end
 
+  test "a stream error prepares a local file once without changing playback", %{conn: conn} do
+    conn = put_connect_params(conn, %{"native_hls" => true})
+    view = live_player(conn, "liveview-stream-fallback")
+    owner = :sys.get_state(view.pid).socket.assigns.owner
+    current = track("buffer-test")
+    :ok = :sys.suspend(Youtui.Backend)
+
+    try do
+      send(view.pid, {:initial_state, 0, {:ok, snapshot(9, current, owner)}})
+      assert await_backend_prepare_request_count(1) == 1
+      assert [%{"prefer_stream" => true, "prefer_hls" => true}] = backend_prepare_requests()
+      stream = %{url: "/media/stream001", kind: :stream}
+      send(view.pid, {:prepare_current_result, 0, 9, {:ok, stream}})
+
+      assert_push_event(view, "load_video", %{
+        source_id: source_id,
+        playback_id: 9,
+        url: "/media/stream001"
+      })
+
+      error = %{"playback_id" => 9, "source_id" => source_id}
+      render_hook(view, "video_error", Map.put(error, "playback_id", 8))
+      assert backend_prepare_request_count() == 1
+      render_hook(view, "video_error", error)
+      assert await_backend_prepare_request_count(2) == 2
+      assert [_, %{"prefer_stream" => false} = fallback] = backend_prepare_requests()
+      refute Map.has_key?(fallback, "prefer_hls")
+      render_hook(view, "video_error", error)
+      assert backend_prepare_request_count() == 2
+
+      file = %{url: "/media/local0001", kind: :file}
+      send(view.pid, {:prepare_current_result, 0, 9, {:ok, file}})
+
+      assert_push_event(view, "load_video", %{
+        source_id: local_source,
+        playback_id: 9,
+        url: "/media/local0001"
+      })
+
+      render_hook(view, "video_error", error)
+      refute has_element?(view, "#player-error")
+      render_hook(view, "video_error", Map.put(error, "source_id", local_source))
+      assert has_element?(view, "#player-error", "This video could not be played")
+      assert backend_prepare_request_count() == 2
+    after
+      :ok = :sys.resume(Youtui.Backend)
+    end
+  end
+
+  test "a client without native HLS requests progressive MP4 by default", %{conn: conn} do
+    view = live_player(conn, "liveview-mp4-buffer")
+    :ok = :sys.suspend(Youtui.Backend)
+
+    try do
+      render_click(view, "play_result", %{"track" => Jason.encode!(track("buffer-test"))})
+      assert await_backend_prepare_request_count(1) == 1
+      assert [%{"prefer_stream" => true} = params] = backend_prepare_requests()
+      refute Map.has_key?(params, "prefer_hls")
+    after
+      :ok = :sys.resume(Youtui.Backend)
+    end
+  end
+
   defp live_player(conn, session) do
     conn = init_test_session(conn, %{youtui_session: session})
     {:ok, view, _html} = live(conn, "/")
@@ -806,12 +870,14 @@ defmodule YoutuiWeb.PlayerLiveTest do
     view
   end
 
-  defp backend_prepare_request_count do
+  defp backend_prepare_request_count, do: length(backend_prepare_requests())
+
+  defp backend_prepare_requests do
     {:messages, messages} = Process.info(Process.whereis(Youtui.Backend), :messages)
 
-    Enum.count(messages, fn
-      {:"$gen_call", _from, {:request, "prepare_media", _params, _timeout}} -> true
-      _ -> false
+    Enum.flat_map(messages, fn
+      {:"$gen_call", _from, {:request, "prepare_media", params, _timeout}} -> [params]
+      _ -> []
     end)
   end
 

@@ -46,6 +46,8 @@ defmodule YoutuiWeb.Router do
 
     get "/media/:media_id", MediaController, :show
     head "/media/:media_id", MediaController, :show
+    get "/media/:media_id/:kind/index.m3u8", MediaController, :rendition
+    get "/media/:media_id/:kind/:index", MediaController, :asset
   end
 
   # Other scopes may use custom stacks.

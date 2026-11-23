@@ -25,6 +25,11 @@ A responsive terminal interface for searching, queueing, streaming, and download
 
 mpv provides the full in-TUI queue and playback experience. VLC and mplayer use a foreground fallback that downloads media to a temporary directory before playback.
 
+With mpv, leaving a result highlighted for about a second starts buffering its
+audio in the background. During playback, youtui buffers the next queued track.
+One standby player targets 10 seconds of audio with an 8 MiB in-memory packet cache.
+Pressing Enter can use that player even while its buffer is filling.
+
 ## Install
 
 From this repository:
@@ -66,9 +71,13 @@ Web mode does not require mpv or a terminal with graphics support.
 
 The interface includes search, cancellation, pagination, video playback, queue controls, and shared settings.
 The browser supplies playback controls for pause, seeking, volume, and fullscreen.
-The first version prepares a complete MP4 before playback starts.
-Video preparation uses H.264 and AAC, with a source height limit of 720p.
-The page shows the preparation state. Temporary media files are removed when the background worker exits.
+When you select a video, youtui resolves its available streams. The browser can
+start playing a combined H.264/AAC MP4 as it downloads. Browsers with native
+HLS support can also buffer separate audio and video tracks through the local
+server, one segment at a time. Video is capped at 720p. If a compatible stream
+is unavailable or playback fails, youtui prepares a local MP4 and reuses it for
+subsequent plays during that session.
+Temporary files are removed when the background worker exits.
 
 One browser tab owns playback at a time.
 Searches remain independent between tabs.

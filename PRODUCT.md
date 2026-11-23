@@ -40,10 +40,10 @@ Success means users can search, queue, and watch videos locally without duplicat
 - Native browser controls provide pause, seek, volume, and fullscreen.
 - Only one media preparation job can run at a time. Additional playback requests cannot start another job while preparation is active.
 - Prepared videos are reused during the current session. This cache does not persist between runs.
-- Playback starts after the MP4 is prepared. The current target is H.264 video and AAC audio, up to 720p.
+- Browsers can start playback while buffering a progressive MP4 or a native HLS presentation with one video rendition up to 720p. A prepared local MP4 supplies the fallback.
 - One browser tab owns playback at a time. Playing from another tab transfers ownership. Tabs can search independently.
 - The upcoming queue is stored in memory and is limited to 100 entries. Saved playlists are not implemented.
-- Adaptive streaming is not implemented. The app is not an offline mirror of YouTube.
+- HLS playback uses a fixed rendition for the selected video. The app is not an offline mirror of YouTube.
 
 Public release requirements remain undecided. These include distribution, hosting, remote access, supported browsers, and an accessibility target.
 

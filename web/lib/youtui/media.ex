@@ -1,5 +1,5 @@
 defmodule Youtui.Media do
-  @moduledoc "Registers worker-created media files and exposes session-bound URLs."
+  @moduledoc "Registers worker-prepared media for authenticated browser playback."
   use GenServer
 
   @max_entries 64
@@ -9,6 +9,12 @@ defmodule Youtui.Media do
   def set_cache_dir(path), do: GenServer.call(__MODULE__, {:set_cache_dir, path})
   def register(result), do: GenServer.call(__MODULE__, {:register, result})
   def lookup(media_id), do: GenServer.call(__MODULE__, {:lookup, media_id})
+  def rendition(id, kind), do: GenServer.call(__MODULE__, {:rendition, id, kind})
+
+  def store_rendition(id, kind, url, rendition),
+    do: GenServer.call(__MODULE__, {:store_rendition, id, kind, url, rendition})
+
+  def asset(id, kind, index), do: GenServer.call(__MODULE__, {:asset, id, kind, index})
 
   @impl true
   def init(_opts), do: {:ok, %{cache_dir: nil, entries: %{}, order: []}}
@@ -31,13 +37,11 @@ defmodule Youtui.Media do
 
   def handle_call({:register, result}, _from, state) when is_map(result) do
     media_id = Map.get(result, "media_id") || Map.get(result, :media_id)
-    path = Map.get(result, "path") || Map.get(result, :path)
     mime = Map.get(result, "mime") || Map.get(result, :mime)
 
     with true <- is_binary(media_id) and Regex.match?(@id_pattern, media_id),
-         true <- mime == "video/mp4",
-         {:ok, safe_path} <- safe_file(state.cache_dir, path) do
-      entries = Map.put(state.entries, media_id, %{path: safe_path, mime: mime})
+         {:ok, entry} <- media_entry(state.cache_dir, mime, result, media_id) do
+      entries = Map.put(state.entries, media_id, Map.put(entry, :mime, mime))
       order = [media_id | Enum.reject(state.order, &(&1 == media_id))]
       {entries, order} = trim(entries, order)
       {:reply, {:ok, "/media/#{media_id}"}, %{state | entries: entries, order: order}}
@@ -51,7 +55,7 @@ defmodule Youtui.Media do
 
   def handle_call({:lookup, media_id}, _from, state) do
     case Map.fetch(state.entries, media_id) do
-      {:ok, entry} ->
+      {:ok, %{path: _} = entry} ->
         case safe_file(state.cache_dir, entry.path) do
           {:ok, path} when path == entry.path ->
             {:reply, {:ok, entry}, state}
@@ -62,10 +66,131 @@ defmodule Youtui.Media do
             {:reply, :error, %{state | entries: entries, order: order}}
         end
 
+      {:ok, %{playlist: playlist, mime: mime}} ->
+        {:reply, {:ok, %{playlist: playlist, mime: mime}}, state}
+
+      {:ok, entry} ->
+        {:reply, {:ok, entry}, state}
+
       :error ->
         {:reply, :error, state}
     end
   end
+
+  def handle_call({:rendition, id, kind}, _from, state) do
+    result =
+      case get_in(state.entries, [id, :sources, kind]) do
+        %{rendition: %{playlist: playlist}} -> {:ok, playlist}
+        %{url: url} -> {:fetch, url}
+        _ -> :error
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:store_rendition, id, kind, url, rendition}, _from, state) do
+    case get_in(state.entries, [id, :sources, kind]) do
+      %{url: ^url, rendition: %{playlist: playlist}} ->
+        {:reply, {:ok, playlist}, state}
+
+      %{url: ^url} ->
+        {:reply, {:ok, rendition.playlist},
+         put_in(state, [:entries, id, :sources, kind, :rendition], rendition)}
+
+      _ ->
+        {:reply, :error, state}
+    end
+  end
+
+  def handle_call({:asset, id, kind, index}, _from, state) do
+    case get_in(state.entries, [id, :sources, kind, :rendition, :assets]) do
+      assets
+      when is_tuple(assets) and is_integer(index) and index >= 0 and index < tuple_size(assets) ->
+        {:reply, {:ok, elem(assets, index)}, state}
+
+      _ ->
+        {:reply, :error, state}
+    end
+  end
+
+  defp media_entry(root, "video/mp4", result, _id) when is_binary(root) do
+    path = result["path"] || result[:path]
+    stream = result["stream_url"] || result[:stream_url]
+
+    case {path, stream} do
+      {nil, url} ->
+        with :ok <- check_cdn_url(url), do: {:ok, %{stream_url: url}}
+
+      {path, nil} ->
+        with {:ok, path} <- safe_file(root, path), do: {:ok, %{path: path}}
+
+      _ ->
+        :error
+    end
+  end
+
+  defp media_entry(
+         root,
+         "application/vnd.apple.mpegurl",
+         %{
+           "video_playlist_url" => video_url,
+           "audio_playlist_url" => audio_url,
+           "bandwidth" => bandwidth
+         } = result,
+         id
+       )
+       when is_binary(root) and is_integer(bandwidth) and bandwidth in 1..0xFFFFFFFFFFFFFFFF do
+    with :ok <- check_cdn_url(video_url),
+         :ok <- check_cdn_url(audio_url) do
+      metadata = Youtui.HLS.variant_attributes(result)
+
+      playlist = """
+      #EXTM3U
+      #EXT-X-VERSION:4
+      #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="/media/#{id}/audio/index.m3u8"
+      #EXT-X-STREAM-INF:BANDWIDTH=#{bandwidth},AUDIO="audio"#{metadata}
+      /media/#{id}/video/index.m3u8
+      """
+
+      {:ok,
+       %{
+         playlist: playlist,
+         sources: %{"audio" => %{url: audio_url}, "video" => %{url: video_url}}
+       }}
+    end
+  end
+
+  defp media_entry(_, _, _, _), do: :error
+
+  def check_cdn_url(url) when is_binary(url) and byte_size(url) <= 16_384 do
+    with {:ok, %URI{scheme: "https", host: host, port: 443, userinfo: nil, fragment: nil}}
+         when is_binary(host) <- URI.new(url),
+         true <- Regex.match?(~r/\A(?:[a-z0-9-]+\.)+googlevideo\.com\z/i, host),
+         true <- String.starts_with?(url, "https://#{host}/"),
+         false <- Regex.match?(~r/["\\\x00-\x20\x7F]/, url) do
+      :ok
+    else
+      _ -> :error
+    end
+  end
+
+  def check_cdn_url(_), do: :error
+
+  def resolve_cdn_url(_base, "https://" <> _ = url), do: checked_url(url)
+  def resolve_cdn_url(_base, "//" <> _ = ref), do: checked_url("https:" <> ref)
+
+  def resolve_cdn_url(base, ref) when is_binary(ref) and byte_size(ref) in 1..16_384 do
+    with false <- Regex.match?(~r/["\\\x00-\x20\x7F]/, ref),
+         {:ok, %URI{scheme: nil, host: nil, fragment: nil} = relative} <- URI.new(ref) do
+      base |> URI.merge(relative) |> URI.to_string() |> checked_url()
+    else
+      _ -> :error
+    end
+  end
+
+  def resolve_cdn_url(_, _), do: :error
+
+  defp checked_url(url), do: with(:ok <- check_cdn_url(url), do: {:ok, url})
 
   defp trusted_root(path) when is_binary(path) do
     with true <- Path.type(path) == :absolute,

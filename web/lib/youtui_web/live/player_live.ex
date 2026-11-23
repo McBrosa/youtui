@@ -24,6 +24,7 @@ defmodule YoutuiWeb.PlayerLive do
       |> stream(:queue, [], dom_id: &queue_dom_id/1)
       |> assign(
         page_title: "Youtui",
+        native_hls?: match?(%{"native_hls" => true}, get_connect_params(socket)),
         owner: owner,
         snapshot: empty_snapshot(),
         result_count: 0,
@@ -51,6 +52,7 @@ defmodule YoutuiWeb.PlayerLive do
         preparing_current: nil,
         preparing_current_track: nil,
         loaded_playback_id: nil,
+        loaded_source: nil,
         pending_play: nil,
         failed_preparation: nil,
         preparation_error?: false,
@@ -327,10 +329,25 @@ defmodule YoutuiWeb.PlayerLive do
     end
   end
 
-  def handle_event("video_error", %{"playback_id" => playback_id}, socket) do
-    if playback_id == socket.assigns.playback_id and
-         socket.assigns.playback_owner == socket.assigns.owner do
-      {:noreply, assign_error(socket, "This video could not be played. Try preparing it again.")}
+  def handle_event(
+        "video_error",
+        %{"playback_id" => playback_id, "source_id" => source_id},
+        socket
+      ) do
+    if current_playback?(socket.assigns, playback_id) and
+         socket.assigns.loaded_playback_id == playback_id and not preparing_media?(socket.assigns) do
+      case socket.assigns.loaded_source do
+        {^source_id, :stream} ->
+          socket = assign(socket, :loaded_source, nil)
+          {:noreply, start_current_media(socket, socket.assigns.current, playback_id, false)}
+
+        {^source_id, :file} ->
+          {:noreply,
+           assign_error(socket, "This video could not be played. Try preparing it again.")}
+
+        _ ->
+          {:noreply, socket}
+      end
     else
       {:noreply, socket}
     end
@@ -439,12 +456,12 @@ defmodule YoutuiWeb.PlayerLive do
 
       if current_playback?(socket.assigns, playback_id) do
         case result do
-          {:ok, url} ->
+          {:ok, source} ->
             socket =
               socket
-              |> assign(loaded_playback_id: playback_id, error: nil, preparation_error?: false)
+              |> assign(error: nil, preparation_error?: false)
               |> refresh_play_controls()
-              |> push_event("load_video", %{url: url, playback_id: playback_id})
+              |> load_video(playback_id, source)
 
             {:noreply, socket}
 
@@ -629,7 +646,7 @@ defmodule YoutuiWeb.PlayerLive do
                   class="yt-video"
                   controls
                   playsinline
-                  preload="metadata"
+                  preload="auto"
                   aria-label="Video player"
                 ></video>
                 <div id="player-placeholder" class="yt-player-placeholder">
@@ -947,6 +964,7 @@ defmodule YoutuiWeb.PlayerLive do
     epoch = socket.assigns.backend_epoch
     generation = socket.assigns.play_generation + 1
     expected_revision = socket.assigns.snapshot["revision"]
+    params = media_params(socket, track)
 
     socket =
       assign(socket,
@@ -968,7 +986,7 @@ defmodule YoutuiWeb.PlayerLive do
       |> refresh_play_controls()
 
     Task.start(fn ->
-      result = prepare_media(track["id"])
+      result = prepare_media(params)
 
       send(
         parent,
@@ -984,6 +1002,7 @@ defmodule YoutuiWeb.PlayerLive do
     epoch = socket.assigns.backend_epoch
     generation = socket.assigns.play_generation + 1
     track = failure.track
+    params = media_params(socket, track, failure.kind != :current)
 
     socket =
       assign(socket,
@@ -1001,7 +1020,7 @@ defmodule YoutuiWeb.PlayerLive do
       case Backend.request("state", %{}, @backend_timeout) do
         {:ok, snapshot} ->
           if retry_snapshot_matches?(snapshot, failure) do
-            result = prepare_media(track["id"])
+            result = prepare_media(params)
 
             case Backend.request("state", %{}, @backend_timeout) do
               {:ok, prepared_snapshot} ->
@@ -1042,14 +1061,13 @@ defmodule YoutuiWeb.PlayerLive do
     )
   end
 
-  defp commit_retry_result(socket, %{kind: :current} = failure, snapshot, {:ok, url}) do
+  defp commit_retry_result(socket, %{kind: :current} = failure, snapshot, {:ok, source}) do
     playback_id = snapshot["playback_id"]
 
     if get_in(snapshot, ["current", "id"]) == failure.track["id"] and
          snapshot["owner"] == socket.assigns.owner do
       socket
       |> assign(
-        loaded_playback_id: playback_id,
         preparing_video_id: nil,
         preparing_track: nil,
         pending_play: nil,
@@ -1058,7 +1076,7 @@ defmodule YoutuiWeb.PlayerLive do
         error: nil
       )
       |> refresh_play_controls()
-      |> push_event("load_video", %{url: url, playback_id: playback_id})
+      |> load_video(playback_id, source)
     else
       clear_stale_retry(socket, snapshot)
     end
@@ -1071,6 +1089,7 @@ defmodule YoutuiWeb.PlayerLive do
     parent = self()
     epoch = socket.assigns.backend_epoch
     generation = socket.assigns.play_generation + 1
+    params = media_params(socket, track)
 
     socket =
       assign(socket,
@@ -1090,19 +1109,30 @@ defmodule YoutuiWeb.PlayerLive do
       |> refresh_play_controls()
 
     Task.start(fn ->
-      result = prepare_media(track["id"])
+      result = prepare_media(params)
       send(parent, {:play_prepared, epoch, generation, track, result})
     end)
 
     socket
   end
 
-  defp prepare_media(video_id) do
-    case Backend.request("prepare_media", %{"video_id" => video_id}, @media_timeout) do
+  defp media_params(socket, track, prefer_stream \\ true) do
+    params = %{"video_id" => track["id"], "prefer_stream" => prefer_stream}
+
+    if prefer_stream and socket.assigns.native_hls?,
+      do: Map.put(params, "prefer_hls", true),
+      else: params
+  end
+
+  defp prepare_media(params) do
+    case Backend.request("prepare_media", params, @media_timeout) do
       {:ok, media} ->
         case Media.register(media) do
-          {:ok, url} -> {:ok, url}
-          {:error, message} -> {:error, {:media_registration, message}}
+          {:ok, url} ->
+            {:ok, %{url: url, kind: if(media["path"], do: :file, else: :stream)}}
+
+          {:error, message} ->
+            {:error, {:media_registration, message}}
         end
 
       {:error, message} ->
@@ -1110,13 +1140,13 @@ defmodule YoutuiWeb.PlayerLive do
     end
   end
 
-  defp commit_prepared_play(socket, track, {:ok, url}) do
+  defp commit_prepared_play(socket, track, {:ok, source}) do
     case Backend.request(
            "play",
            %{"track" => track, "owner" => socket.assigns.owner},
            @backend_timeout
          ) do
-      {:ok, snapshot} -> install_prepared_playback(socket, track, snapshot, url)
+      {:ok, snapshot} -> install_prepared_playback(socket, track, snapshot, source)
       {:error, message} -> clear_pending_play(socket, message)
     end
   end
@@ -1133,7 +1163,7 @@ defmodule YoutuiWeb.PlayerLive do
   defp commit_prepared_play(socket, _track, {:error, message}),
     do: clear_pending_play(socket, message, true)
 
-  defp commit_prepared_queue_play(socket, index, expected_revision, track, {:ok, url}) do
+  defp commit_prepared_queue_play(socket, index, expected_revision, track, {:ok, source}) do
     case Backend.request(
            "queue_play",
            %{
@@ -1143,7 +1173,7 @@ defmodule YoutuiWeb.PlayerLive do
            },
            @backend_timeout
          ) do
-      {:ok, snapshot} -> install_prepared_playback(socket, track, snapshot, url)
+      {:ok, snapshot} -> install_prepared_playback(socket, track, snapshot, source)
       {:error, message} -> clear_pending_play(socket, message)
     end
   end
@@ -1178,7 +1208,7 @@ defmodule YoutuiWeb.PlayerLive do
   defp commit_prepared_queue_play(socket, _index, _expected_revision, _track, {:error, message}),
     do: clear_pending_play(socket, message, true)
 
-  defp install_prepared_playback(socket, track, snapshot, url) do
+  defp install_prepared_playback(socket, track, snapshot, source) do
     playback_id = snapshot["playback_id"]
 
     owns_current? =
@@ -1191,7 +1221,6 @@ defmodule YoutuiWeb.PlayerLive do
       socket
       |> apply_snapshot(snapshot, false, true)
       |> assign(
-        loaded_playback_id: playback_id,
         preparing_video_id: nil,
         preparing_track: nil,
         pending_play: nil,
@@ -1200,10 +1229,18 @@ defmodule YoutuiWeb.PlayerLive do
         error: nil
       )
       |> refresh_play_controls()
-      |> push_event("load_video", %{url: url, playback_id: playback_id})
+      |> load_video(playback_id, source)
     else
       clear_pending_play(socket, "Playback changed before this video was ready.")
     end
+  end
+
+  defp load_video(socket, playback_id, %{url: url, kind: kind}) do
+    source_id = Integer.to_string(System.unique_integer([:positive]))
+
+    socket
+    |> assign(loaded_playback_id: playback_id, loaded_source: {source_id, kind})
+    |> push_event("load_video", %{url: url, playback_id: playback_id, source_id: source_id})
   end
 
   defp clear_pending_play(socket, message, retryable? \\ false) do
@@ -1276,7 +1313,9 @@ defmodule YoutuiWeb.PlayerLive do
     |> refresh_play_controls()
   end
 
-  defp start_current_media(socket, track, playback_id) do
+  defp start_current_media(socket, track, playback_id, prefer_stream \\ true) do
+    params = media_params(socket, track, prefer_stream)
+
     socket =
       socket
       |> assign(
@@ -1294,32 +1333,18 @@ defmodule YoutuiWeb.PlayerLive do
 
     Task.start(fn ->
       result =
-        case Backend.request(
-               "prepare_media",
-               %{"video_id" => track["id"]},
-               @media_timeout
-             ) do
-          {:ok, media} ->
-            case Media.register(media) do
-              {:ok, url} ->
-                case Backend.request("state", %{}, @backend_timeout) do
-                  {:ok, snapshot} ->
-                    if snapshot["owner"] == owner and snapshot["playback_id"] == playback_id do
-                      {:ok, url}
-                    else
-                      {:error, {:retry_state, "Playback changed while the video was preparing."}}
-                    end
+        with {:ok, source} <- prepare_media(params) do
+          case Backend.request("state", %{}, @backend_timeout) do
+            {:ok, snapshot} ->
+              if snapshot["owner"] == owner and snapshot["playback_id"] == playback_id do
+                {:ok, source}
+              else
+                {:error, {:retry_state, "Playback changed while the video was preparing."}}
+              end
 
-                  {:error, message} ->
-                    {:error, {:retry_state, message}}
-                end
-
-              {:error, message} ->
-                {:error, {:media_registration, message}}
-            end
-
-          {:error, message} ->
-            {:error, {:media_preparation, message}}
+            {:error, message} ->
+              {:error, {:retry_state, message}}
+          end
         end
 
       send(parent, {:prepare_current_result, epoch, playback_id, result})
@@ -1621,6 +1646,7 @@ defmodule YoutuiWeb.PlayerLive do
       preparing_current: nil,
       preparing_current_track: nil,
       loaded_playback_id: nil,
+      loaded_source: nil,
       pending_play: nil,
       failed_preparation: nil,
       preparation_error?: false,

@@ -89,6 +89,244 @@ defmodule YoutuiWeb.AuthMediaTest do
     assert get_resp_header(conn, "content-range") == ["bytes */10"]
   end
 
+  test "authenticated media requests redirect to the worker's progressive stream", %{conn: conn} do
+    url = "https://rr2.googlevideo.com/videoplayback?sig=x%2Fy"
+    media = %{"media_id" => "stream001", "mime" => "video/mp4", "stream_url" => url}
+    assert {:ok, path} = Youtui.Media.register(media)
+    assert conn |> get(path) |> response(401) == "authentication required"
+
+    conn = conn |> init_test_session(%{youtui_session: "signed-session"}) |> get(path)
+    assert response(conn, 307) == ""
+    assert get_resp_header(conn, "location") == [url]
+    assert get_resp_header(conn, "cache-control") == ["private, no-store"]
+    assert get_resp_header(conn, "referrer-policy") == ["no-referrer"]
+  end
+
+  test "media registration limits progressive destinations to HTTPS CDN hosts" do
+    for url <- [
+          "http://rr2.googlevideo.com/videoplayback",
+          "https://googlevideo.com.example.org/videoplayback",
+          "https://outside.example/",
+          "https://user@rr2.googlevideo.com/videoplayback",
+          "https://rr2.googlevideo.com:443/videoplayback",
+          "https://rr2.googlevideo.com/videoplayback#fragment"
+        ] do
+      assert {:error, _} =
+               Youtui.Media.register(%{
+                 "media_id" => "stream001",
+                 "mime" => "video/mp4",
+                 "stream_url" => url
+               })
+    end
+  end
+
+  test "authenticated HLS master pairs the selected video and audio playlists", %{conn: conn} do
+    video = "https://manifest.googlevideo.com/video.m3u8?sig=foo%2Fbar"
+    audio = "https://manifest.googlevideo.com/audio.m3u8?sig=foo&part=1"
+
+    media = %{
+      "media_id" => "hls00001",
+      "mime" => "application/vnd.apple.mpegurl",
+      "video_playlist_url" => video,
+      "audio_playlist_url" => audio,
+      "bandwidth" => 2_800_000,
+      "width" => 1280,
+      "height" => 720,
+      "video_codec" => "avc1.64001F",
+      "audio_codec" => "mp4a.40.2"
+    }
+
+    assert {:ok, path} = Youtui.Media.register(media)
+    assert conn |> get(path) |> response(401) == "authentication required"
+    conn = conn |> init_test_session(%{youtui_session: "signed-session"}) |> get(path)
+    assert get_resp_header(conn, "cache-control") == ["private, no-store"]
+    assert get_resp_header(conn, "referrer-policy") == ["no-referrer"]
+    assert get_resp_header(conn, "content-type") == ["application/vnd.apple.mpegurl"]
+
+    assert response(conn, 200) == """
+           #EXTM3U
+           #EXT-X-VERSION:4
+           #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="#{path}/audio/index.m3u8"
+           #EXT-X-STREAM-INF:BANDWIDTH=2800000,AUDIO="audio",CODECS="avc1.64001F,mp4a.40.2",RESOLUTION=1280x720
+           #{path}/video/index.m3u8
+           """
+
+    for invalid <- [
+          %{"bandwidth" => -1},
+          %{"bandwidth" => "2800000"},
+          %{"audio_playlist_url" => audio <> "\""},
+          %{"video_playlist_url" => video <> "\n#EXTM3U"},
+          %{"audio_playlist_url" => "https://untrusted.example/audio"}
+        ] do
+      assert {:error, _} = Youtui.Media.register(Map.merge(media, invalid))
+    end
+
+    assert {:ok, ^path} = Youtui.Media.register(Map.drop(media, ["height", "audio_codec"]))
+    assert {:ok, %{playlist: playlist}} = Youtui.Media.lookup("hls00001")
+    refute playlist =~ "CODECS"
+    refute playlist =~ "RESOLUTION"
+  end
+
+  describe "authenticated HLS renditions" do
+    setup %{conn: conn} do
+      {:ok, path} =
+        Youtui.Media.register(%{
+          "media_id" => "hls00002",
+          "mime" => "application/vnd.apple.mpegurl",
+          "video_playlist_url" => "https://manifest.googlevideo.com/v/index.m3u8",
+          "audio_playlist_url" => "https://manifest.googlevideo.com/a/index.m3u8",
+          "bandwidth" => 1_500_000
+        })
+
+      old = Application.fetch_env(:youtui_web, :media_http_options)
+
+      on_exit(fn ->
+        case old do
+          {:ok, options} -> Application.put_env(:youtui_web, :media_http_options, options)
+          :error -> Application.delete_env(:youtui_web, :media_http_options)
+        end
+      end)
+
+      %{path: path, authenticated: init_test_session(conn, %{youtui_session: "signed-session"})}
+    end
+
+    test "rewrites playlists and map/key references, forwards range and caches each rendition", %{
+      conn: anon,
+      authenticated: auth,
+      path: path
+    } do
+      parent = self()
+
+      playlist = """
+      #EXTM3U
+      #EXT-X-VERSION:6
+      #EXT-X-MAP:URI="init.mp4",BYTERANGE="2@0"
+      #EXT-X-KEY:METHOD=AES-128,URI="/key"
+      #EXTINF:4,
+      https://rr2.googlevideo.com/seg?sig=test%2Fkey
+      #EXT-X-ENDLIST
+      """
+
+      stub_media(fn conn ->
+        send(
+          parent,
+          {:fetched, conn.host, conn.request_path, conn.query_string,
+           get_req_header(conn, "range")}
+        )
+
+        case conn.request_path do
+          "/v/index.m3u8" ->
+            send_resp(conn, 200, playlist)
+
+          "/a/index.m3u8" ->
+            send_resp(conn, 200, "#EXTM3U\n#EXTINF:4,\naudio.mp4\n#EXT-X-ENDLIST\n")
+
+          "/v/init.mp4" ->
+            send_resp(conn, 200, "init")
+
+          "/key" ->
+            send_resp(conn, 200, "key")
+
+          "/seg" ->
+            conn
+            |> put_resp_header("content-range", "bytes 2-4/8")
+            |> put_resp_content_type("video/mp4", nil)
+            |> send_resp(206, "234")
+
+          "/a/audio.mp4" ->
+            send_resp(conn, 200, "audio")
+        end
+      end)
+
+      for suffix <- ["/video/index.m3u8", "/video/0"] do
+        assert anon |> get(path <> suffix) |> response(401) == "authentication required"
+      end
+
+      assert auth |> get(path <> "/video/0") |> response(404) == "media not found"
+      refute_received {:fetched, _, _, _, _}
+
+      local = auth |> get(path <> "/video/index.m3u8") |> response(200)
+      assert local =~ ~s(#EXT-X-MAP:URI="0",BYTERANGE="2@0")
+      assert local =~ ~s(#EXT-X-KEY:METHOD=AES-128,URI="1")
+      assert local =~ "\n2\n"
+      refute local =~ "googlevideo"
+      assert_received {:fetched, "manifest.googlevideo.com", "/v/index.m3u8", "", []}
+      assert auth |> get(path <> "/video/index.m3u8") |> response(200) == local
+      refute_received {:fetched, _, _, _, _}
+      assert auth |> get(path <> "/video/0") |> response(200) == "init"
+      assert auth |> get(path <> "/video/1") |> response(200) == "key"
+      assert_received {:fetched, _, "/v/init.mp4", "", []}
+      assert_received {:fetched, _, "/key", "", []}
+      seg = auth |> put_req_header("range", "bytes=2-4") |> get(path <> "/video/2")
+      assert response(seg, 206) == "234"
+      assert get_resp_header(seg, "content-range") == ["bytes 2-4/8"]
+      assert get_resp_header(seg, "content-type") == ["video/mp4"]
+      assert_received {:fetched, "rr2.googlevideo.com", "/seg", "sig=test%2Fkey", ["bytes=2-4"]}
+      assert auth |> get(path <> "/audio/index.m3u8") |> response(200) =~ "\n0\n"
+      assert auth |> get(path <> "/audio/0") |> response(200) == "audio"
+
+      for suffix <- ["/video/3", "/video/000", "/video/-1", "/unused/index.m3u8"] do
+        assert auth |> get(path <> suffix) |> response(404) == "media not found"
+      end
+
+      assert auth
+             |> put_req_header("range", "bytes=1-2,3-4")
+             |> get(path <> "/video/0")
+             |> response(416) == ""
+    end
+
+    test "rejects malformed, untrusted and oversized playlists before registering assets", %{
+      authenticated: auth,
+      path: path
+    } do
+      for element <- [
+            "https://outside.example/seg",
+            "//user@rr2.googlevideo.com/seg",
+            "https://rr2.googlevideo.com:443/seg",
+            ~s(#EXT-X-MAP:URI="https://outside.example/init"),
+            ~s(#EXT-X-KEY:METHOD=AES-128,URI="one",URI="two"),
+            "#EXT-X-STREAM-INF:BANDWIDTH=1",
+            "#EXTINF:4,\rhttps://outside.example/seg",
+            String.duplicate("seg\n", 4097)
+          ] do
+        body = "#EXTM3U\n#EXTINF:4,\n" <> element <> "\n#EXT-X-ENDLIST\n"
+        stub_media(fn conn -> send_resp(conn, 200, body) end)
+
+        assert auth |> get(path <> "/video/index.m3u8") |> response(502) ==
+                 "media playlist unavailable"
+
+        assert auth |> get(path <> "/video/0") |> response(404) == "media not found"
+      end
+    end
+
+    test "handles expired segments, excessive responses and malformed partial responses", %{
+      authenticated: auth,
+      path: path
+    } do
+      stub_media(fn conn ->
+        send_resp(conn, 200, "#EXTM3U\n#EXTINF:4,\nseg\n#EXT-X-ENDLIST\n")
+      end)
+
+      assert auth |> get(path <> "/video/index.m3u8") |> response(200) =~ "\n0\n"
+
+      for {status, body} <- [
+            {403, "expired"},
+            {206, "partial without byte positions"},
+            {200, :binary.copy("x", 16 * 1024 * 1024 + 1)}
+          ] do
+        stub_media(fn conn -> send_resp(conn, status, body) end)
+        assert auth |> get(path <> "/video/0") |> response(502) == "media segment unavailable"
+      end
+
+      stub_media(fn conn -> send_resp(conn, 416, "") end)
+
+      assert auth
+             |> put_req_header("range", "bytes=9000-")
+             |> get(path <> "/video/0")
+             |> response(416) == ""
+    end
+  end
+
   test "ranges outside the byte grammar return 416", %{conn: conn, media_url: media_url} do
     conn =
       conn
@@ -179,4 +417,5 @@ defmodule YoutuiWeb.AuthMediaTest do
 
   defp restore_env(name, nil), do: System.delete_env(name)
   defp restore_env(name, value), do: System.put_env(name, value)
+  defp stub_media(plug), do: Application.put_env(:youtui_web, :media_http_options, plug: plug)
 end

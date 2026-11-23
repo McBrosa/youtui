@@ -314,7 +314,7 @@ pub struct PlayerManager {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PlaybackOptions {
+pub(crate) struct PlaybackOptions {
     audio_only: bool,
     format: String,
     native_kitty: bool,
@@ -425,7 +425,19 @@ impl PlaybackStatus {
 }
 
 impl PlayerManager {
-    pub fn new(config: &Config) -> Result<Self> {
+    pub fn new(config: &Config, initial_volume: Option<i32>) -> Result<Self> {
+        Self::spawn(config, None, initial_volume)
+    }
+
+    pub(crate) fn buffer(config: &Config, url: &str) -> Result<Self> {
+        Self::spawn(config, Some(url), None)
+    }
+
+    fn spawn(
+        config: &Config,
+        buffered_url: Option<&str>,
+        initial_volume: Option<i32>,
+    ) -> Result<Self> {
         // A private directory avoids collisions between multiple managers and
         // stale socket files left by a previously crashed process.
         let socket_dir = tempfile::Builder::new()
@@ -436,6 +448,24 @@ impl PlayerManager {
 
         let options = PlaybackOptions::from(config);
         let mut cmd = build_mpv_command(&socket_path, &options);
+        let mut status = PlaybackStatus::default();
+        if let Some(volume) = initial_volume {
+            status.volume = volume.clamp(0, 100);
+            cmd.arg(format!("--volume={}", status.volume));
+        }
+        if let Some(url) = buffered_url {
+            // File-local options let later queue entries use ordinary playback settings.
+            cmd.args([
+                "--{",
+                "--pause",
+                "--cache=yes",
+                "--cache-secs=10",
+                "--demuxer-max-bytes=8MiB",
+                "--cache-on-disk=no",
+                url,
+                "--}",
+            ]);
+        }
 
         let mut process = cmd.spawn().context("Failed to spawn mpv process")?;
         let kitty_output = if options.native_kitty {
@@ -461,7 +491,7 @@ impl PlayerManager {
             socket_path,
             ipc: None,
             options,
-            status: PlaybackStatus::default(),
+            status,
             current_video_id: None,
             current_playlist_entry_id: None,
             kitty_video: false,
@@ -572,13 +602,54 @@ impl PlayerManager {
         Ok(())
     }
 
+    pub(crate) fn claim_buffered(
+        &mut self,
+        title: &str,
+        video_id: &str,
+        volume: Option<i32>,
+    ) -> Result<()> {
+        self.connect()?;
+        let ipc = self
+            .ipc
+            .as_mut()
+            .context("mpv IPC connection was not initialized")?;
+        let values = ipc.get_properties(&["playlist-playing-pos", "playlist/0/id"])?;
+        let [Some(position), Some(id)] = values.as_slice() else {
+            bail!("buffered track is unavailable");
+        };
+        if position.as_i64() != Some(0) {
+            bail!("buffered track is no longer active");
+        }
+        let entry_id = id
+            .as_i64()
+            .context("buffered track has no playlist entry ID")?;
+        self.current_playlist_entry_id = Some(entry_id);
+        self.current_video_id = Some(video_id.to_string());
+        self.status.title = title.to_string();
+        self.status.playing = true;
+        self.status.paused = true;
+        if let Some(volume) = volume {
+            self.set_volume(volume)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resume_buffered(&mut self) -> Result<()> {
+        self.ipc
+            .as_mut()
+            .context("mpv IPC connection was not initialized")?
+            .send_command(&["set_property", "pause", "no"])?;
+        self.status.paused = false;
+        Ok(())
+    }
+
     fn apply_runtime_config(&mut self, config: &Config) -> Result<()> {
         let desired = PlaybackOptions::from(config);
         if self.options != desired {
             // mpv's audio/video and yt-dlp format options belong to the player
             // process. Recreate it before the next load so settings changed in
             // the TUI take effect without requiring an application restart.
-            *self = Self::new(config)?;
+            *self = Self::new(config, Some(self.status.volume))?;
         }
         Ok(())
     }

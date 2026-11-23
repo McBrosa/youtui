@@ -1,5 +1,7 @@
+use std::time::{Duration, Instant};
+
 use crate::config::Config;
-use crate::player_manager::PlayerManager;
+use crate::player_manager::{PlaybackOptions, PlayerManager};
 use crate::queue::Queue;
 use crate::search::SearchResult;
 
@@ -47,6 +49,18 @@ enum QueuePlayback {
     Advance { manual: bool },
 }
 
+enum BufferState {
+    Waiting(Instant),
+    Started(Box<PlayerManager>),
+    Unavailable,
+}
+
+struct AudioBuffer {
+    video_id: String,
+    options: PlaybackOptions,
+    state: BufferState,
+}
+
 pub struct App {
     pub results: Vec<SearchResult>,
     pub selected_index: usize,
@@ -62,6 +76,7 @@ pub struct App {
     pub pending_action: AppAction,
     pub should_quit: bool,
     pub player_manager: Option<PlayerManager>,
+    audio_buffer: Option<AudioBuffer>,
     pub queue: Queue,
     pub focused_panel: FocusedPanel,
     pub loading: bool,
@@ -99,6 +114,7 @@ impl App {
             pending_action: AppAction::None,
             should_quit: false,
             player_manager: None,
+            audio_buffer: None,
             queue: Queue::new(),
             focused_panel: FocusedPanel::Results,
             loading: false,
@@ -174,6 +190,51 @@ impl App {
         }
     }
 
+    fn buffer_candidate(&self) -> Option<&SearchResult> {
+        if self.config.download_mode
+            || !crate::player::supports_background_playback(self.config.player)
+            || self.settings_open
+            || self.input_mode != InputMode::Browse
+        {
+            return None;
+        }
+        if self.player_manager.is_some() {
+            return self.queue.get(1);
+        }
+        match self.focused_panel {
+            FocusedPanel::Results => self.current_page_results().get(self.selected_index),
+            FocusedPanel::Queue => self.queue.get(self.queue.selected_index()),
+            FocusedPanel::SearchBar => None,
+        }
+    }
+
+    pub(super) fn update_audio_buffer(&mut self, now: Instant) {
+        const DWELL: Duration = Duration::from_millis(600);
+        let Some(track) = self.buffer_candidate() else {
+            self.audio_buffer = None;
+            return;
+        };
+        let options = PlaybackOptions::from(&self.config);
+        let state = match &self.audio_buffer {
+            Some(buffer) if buffer.video_id == track.id && buffer.options == options => {
+                if !matches!(buffer.state, BufferState::Waiting(deadline) if now >= deadline) {
+                    return;
+                }
+                // mpv resolves and fills its cache in its own process. No IPC wait on the UI thread.
+                match PlayerManager::buffer(&self.config, &track.url()) {
+                    Ok(player) => BufferState::Started(Box::new(player)),
+                    Err(_) => BufferState::Unavailable,
+                }
+            }
+            _ => BufferState::Waiting(now + DWELL),
+        };
+        self.audio_buffer = Some(AudioBuffer {
+            video_id: track.id.clone(),
+            options,
+            state,
+        });
+    }
+
     pub(super) fn play_queue_front(&mut self) {
         self.load_queue_front(QueuePlayback::Play);
     }
@@ -183,6 +244,28 @@ impl App {
             return;
         };
 
+        let volume = self
+            .player_manager
+            .as_ref()
+            .map(|player| player.status.volume);
+        let start_paused = matches!(playback, QueuePlayback::Advance { manual: false })
+            && !self.config.auto_play_queue;
+        if let Some(buffer) = self.audio_buffer.take()
+            && buffer.video_id == track.id
+            && buffer.options == PlaybackOptions::from(&self.config)
+            && let BufferState::Started(mut buffered) = buffer.state
+            && buffered
+                .claim_buffered(&track.title, &track.id, volume)
+                .is_ok()
+        {
+            drop(self.player_manager.take());
+            if start_paused || buffered.resume_buffered().is_ok() {
+                self.player_manager = Some(*buffered);
+                self.status_message = None;
+                return;
+            }
+        }
+
         let (mut player, load_error) = match self.player_manager.take() {
             Some(player) => {
                 let context = match playback {
@@ -191,7 +274,7 @@ impl App {
                 };
                 (player, context)
             }
-            None => match PlayerManager::new(&self.config) {
+            None => match PlayerManager::new(&self.config, volume) {
                 Ok(player) => (player, "Could not start playback"),
                 Err(error) => {
                     let context = match playback {
@@ -205,8 +288,6 @@ impl App {
         };
 
         let url = track.url();
-        let start_paused = matches!(playback, QueuePlayback::Advance { manual: false })
-            && !self.config.auto_play_queue;
         let result = if start_paused {
             player.load_paused(&self.config, &url, &track.title, &track.id)
         } else {
@@ -247,6 +328,25 @@ mod tests {
     }
 
     // --- current_page_results ---
+
+    #[test]
+    fn changing_the_highlight_restarts_the_buffer_delay() {
+        let mut app = App::new(String::new(), 10, Config::default());
+        app.results = make_results(2);
+        let now = Instant::now();
+        app.update_audio_buffer(now);
+        app.selected_index = 1;
+        app.update_audio_buffer(now + Duration::from_millis(400));
+        app.update_audio_buffer(now + Duration::from_millis(650));
+
+        let buffer = app.audio_buffer.as_ref().unwrap();
+        assert_eq!(buffer.video_id, app.results[1].id);
+        assert!(matches!(buffer.state, BufferState::Waiting(_)));
+
+        app.focused_panel = FocusedPanel::SearchBar;
+        app.update_audio_buffer(now + Duration::from_secs(2));
+        assert!(app.audio_buffer.is_none());
+    }
 
     #[test]
     fn test_current_page_results_page_zero() {

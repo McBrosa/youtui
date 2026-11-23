@@ -42,6 +42,7 @@ defmodule Youtui.MixProject do
     [
       {:phoenix, "~> 1.8.15"},
       {:phoenix_html, "~> 4.1"},
+      {:req, "~> 0.7.5"},
       {:phoenix_live_reload, "~> 1.2", only: :dev},
       {:phoenix_live_view, "~> 1.2.0"},
       {:lazy_html, ">= 0.1.0", only: :test},

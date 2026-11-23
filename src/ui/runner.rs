@@ -280,6 +280,7 @@ pub fn run_app(
                 dirty = true;
             }
             if poll_status {
+                app.update_audio_buffer(Instant::now());
                 last_player_poll = Instant::now();
             }
             last_tick = Instant::now();

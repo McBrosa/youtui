@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
+use super::stream::browser_source;
 use crate::config::{Config, MAX_RESULTS_PER_PAGE, MIN_RESULTS_PER_PAGE};
 use crate::queue::Queue;
 use crate::search::{PaginatedSearch, SearchResult};
@@ -24,6 +25,8 @@ const MAX_TRACK_BYTES: usize = 8192;
 const MAX_SESSION_LENGTH: usize = 128;
 const SEARCH_ID_LENGTH: usize = 11;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const STREAM_LOOKUP_TIMEOUT: Duration = Duration::from_secs(20);
+const MEDIA_FORMAT: &str = "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=720][vcodec^=avc1][acodec^=mp4a]/bestvideo[height<=720]+bestaudio/best[height<=720]";
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MEDIA_CACHE_LIMIT: usize = 12;
 const MEDIA_JOB_LIMIT: usize = 1;
@@ -164,8 +167,8 @@ pub fn run_stdio() -> Result<()> {
                 }
                 "prepare_media" => {
                     let id = request.id;
-                    let video_id = match required_video_id(&request.params) {
-                        Ok(video_id) => video_id,
+                    let (video_id, delivery) = match media_request(&request.params) {
+                        Ok(params) => params,
                         Err(error) => {
                             finish_request(&output, &requests, id, Err(error))?;
                             continue;
@@ -204,6 +207,7 @@ pub fn run_stdio() -> Result<()> {
                     jobs.push(thread::spawn(move || {
                         let result = prepare_or_reuse_media(
                             &video_id,
+                            delivery,
                             &cache_path,
                             &media_cache,
                             &counter,
@@ -505,8 +509,30 @@ fn cached_media_path(cache_root: &Path, entry: &CachedMedia) -> Result<PathBuf> 
     Ok(path)
 }
 
+enum MediaDelivery {
+    File,
+    Stream { native_hls: bool },
+}
+
+fn media_request(params: &Map<String, Value>) -> Result<(String, MediaDelivery)> {
+    let flag = |name: &str| {
+        params
+            .get(name)
+            .map(|value| required_bool_value(value, name))
+            .transpose()
+    };
+    let native_hls = flag("prefer_hls")?.unwrap_or(false);
+    let delivery = if flag("prefer_stream")?.unwrap_or(false) {
+        MediaDelivery::Stream { native_hls }
+    } else {
+        MediaDelivery::File
+    };
+    Ok((required_video_id(params)?, delivery))
+}
+
 fn prepare_or_reuse_media(
     video_id: &str,
+    delivery: MediaDelivery,
     cache_dir: &Path,
     media_cache: &Arc<Mutex<MediaCache>>,
     counter: &AtomicU64,
@@ -517,24 +543,6 @@ fn prepare_or_reuse_media(
         return Ok(result);
     }
 
-    prepare_media(
-        video_id,
-        cache_dir,
-        media_cache,
-        counter,
-        cancelled,
-        shutting_down,
-    )
-}
-
-fn prepare_media(
-    video_id: &str,
-    cache_dir: &Path,
-    media_cache: &Arc<Mutex<MediaCache>>,
-    counter: &AtomicU64,
-    cancelled: &AtomicBool,
-    shutting_down: &AtomicBool,
-) -> Result<Value> {
     validate_video_id(video_id)?;
     let job_dir = tempfile::Builder::new()
         .prefix("prepare-")
@@ -543,27 +551,38 @@ fn prepare_media(
     let source_prefix = job_dir.path().join("source");
     let source_template = format!("{}.%(ext)s", source_prefix.display());
     let url = format!("https://www.youtube.com/watch?v={video_id}");
-    let format = "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=720][vcodec^=avc1][acodec^=mp4a]/bestvideo[height<=720]+bestaudio/best[height<=720]";
-    run_checked_process(
-        Command::new("yt-dlp")
-            .args([
-                "--no-playlist",
-                "--no-warnings",
-                "--max-filesize",
-                "512M",
-                "--format",
-                format,
-                "--merge-output-format",
-                "mkv",
-                "--output",
-            ])
-            .arg(&source_template)
-            .arg(&url),
-        MEDIA_TIMEOUT,
-        cancelled,
-        shutting_down,
-    )
-    .context("cannot download media")?;
+    let mut download = Command::new("yt-dlp");
+    download
+        .args([
+            "--no-playlist",
+            "--no-warnings",
+            "--max-filesize",
+            "512M",
+            "--format",
+            MEDIA_FORMAT,
+            "--merge-output-format",
+            "mkv",
+            "--output",
+        ])
+        .arg(&source_template);
+    let info_path = job_dir.path().join("source.info.json");
+    if let MediaDelivery::Stream { native_hls } = delivery
+        && let Ok(info) =
+            extract_media_info(&url, &source_template, &info_path, cancelled, shutting_down)
+    {
+        if let Some(mut source) = browser_source(&info, native_hls, MEDIA_FILE_LIMIT) {
+            let id = counter.fetch_add(1, Ordering::Relaxed);
+            source["media_id"] = json!(format!("s{id:016x}"));
+            return Ok(source);
+        }
+        // The same extraction also supplies the audio/video formats needed for a local MP4.
+        download.arg("--load-info-json").arg(&info_path);
+    } else {
+        download.arg(&url);
+    }
+    ensure_active(cancelled, shutting_down)?;
+    run_checked_process(&mut download, MEDIA_TIMEOUT, cancelled, shutting_down)
+        .context("cannot download media")?;
 
     ensure_active(cancelled, shutting_down)?;
     let source = fs::read_dir(job_dir.path())?
@@ -662,6 +681,36 @@ fn prepare_media(
         },
     );
     Ok(json!({"media_id": media_id, "path": path, "mime": "video/mp4"}))
+}
+
+fn extract_media_info(
+    url: &str,
+    template: &str,
+    info_path: &Path,
+    cancelled: &AtomicBool,
+    shutting_down: &AtomicBool,
+) -> Result<Value> {
+    run_checked_process(
+        Command::new("yt-dlp").args([
+            "--no-playlist",
+            "--no-warnings",
+            "--skip-download",
+            "--write-info-json",
+            "--format",
+            MEDIA_FORMAT,
+            "--output",
+            template,
+            url,
+        ]),
+        STREAM_LOOKUP_TIMEOUT,
+        cancelled,
+        shutting_down,
+    )?;
+    let file = fs::File::open(info_path)?;
+    if file.metadata()?.len() > 16 * 1024 * 1024 {
+        bail!("media metadata is too large");
+    }
+    Ok(serde_json::from_reader(BufReader::new(file))?)
 }
 
 fn validate_mp4(path: &Path, cancelled: &AtomicBool, shutting_down: &AtomicBool) -> Result<Value> {
@@ -1410,6 +1459,7 @@ mod tests {
 
         let result = prepare_or_reuse_media(
             video_id,
+            super::MediaDelivery::Stream { native_hls: true },
             cache_dir.path(),
             &cache,
             &counter,

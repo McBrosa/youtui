@@ -206,6 +206,70 @@ fn search_progress_and_final_result_echo_generation() {
 }
 
 #[test]
+fn browser_can_start_a_progressive_stream_before_any_media_download() {
+    let config_dir = TempDir::new().unwrap();
+    let fake_bin = TempDir::new().unwrap();
+    let downloads = fake_bin.path().join("downloads");
+    let script = format!(
+        r#"#!/bin/sh
+template=""
+probe=false
+for arg do
+    case "$arg" in
+        --skip-download) probe=true ;;
+        *'%(ext)s') template=$arg ;;
+    esac
+done
+if [ "$probe" = true ]; then
+    host="rr1.googlevideo.com"
+    case "$arg" in *{VIDEO_B}) host="rr1.googlevideo.com.example.org" ;; esac
+    printf '{{"formats":[{{"url":"https://%s/videoplayback?id=test","ext":"mp4","protocol":"https","acodec":"mp4a.40.2","vcodec":"avc1.42001E","height":360}}]}}' "$host" > "${{template%.*}}.info.json"
+else
+    # The extractor's metadata must be reused for the local fallback.
+    case " $* " in *" --load-info-json "*) ;; *) exit 1 ;; esac
+    printf x >> '{}'
+    printf source > "${{template%.*}}.mp4"
+fi
+"#,
+        downloads.display()
+    );
+    install_media_tools(fake_bin.path(), &script);
+    let (mut child, mut stdin, mut stdout) =
+        start_backend(config_dir.path(), Some(fake_bin.path()));
+    assert_eq!(read_frame(&mut stdout)["event"], "ready");
+
+    send(
+        &mut stdin,
+        1,
+        "prepare_media",
+        json!({"video_id": VIDEO_A, "prefer_stream": true}),
+    );
+    let streamed = response(&mut stdout, 1);
+    assert_eq!(
+        streamed["result"]["stream_url"],
+        "https://rr1.googlevideo.com/videoplayback?id=test"
+    );
+    assert!(streamed["result"].get("path").is_none());
+    assert!(!downloads.exists());
+
+    send(
+        &mut stdin,
+        2,
+        "prepare_media",
+        json!({"video_id": VIDEO_B, "prefer_stream": true}),
+    );
+    let local = response(&mut stdout, 2);
+    assert!(Path::new(local["result"]["path"].as_str().unwrap()).is_file());
+    assert!(local["result"].get("stream_url").is_none());
+    assert_eq!(fs::read(&downloads).unwrap(), b"x");
+
+    send(&mut stdin, 3, "shutdown", json!({}));
+    response(&mut stdout, 3);
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn media_is_validated_and_cache_files_are_removed_on_shutdown() {
     let config_dir = TempDir::new().unwrap();
     let fake_bin = TempDir::new().unwrap();

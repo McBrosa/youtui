@@ -30,6 +30,107 @@ fn video_extraction_is_lazy_and_failures_require_an_explicit_retry() {
     check_playback(false);
 }
 
+#[test]
+fn enter_resumes_the_selected_results_buffered_audio() -> Result<(), String> {
+    let fixture = SmokeFixture::new(true);
+    let mut youtui = fixture.spawn_youtui();
+    let mut player = enter_buffered_result(&fixture, &mut youtui)?;
+    for (command, data) in [
+        (json!(["get_property", "playlist-playing-pos"]), json!(0)),
+        (json!(["get_property", "playlist/0/id"]), json!(42)),
+        (json!(["set_property", "pause", "no"]), Value::Null),
+    ] {
+        let request = read_request(&mut player, WAIT_TIMEOUT)?;
+        assert_eq!(request["command"], command);
+        reply(player.get_mut(), request_id(&request)?, data)?;
+    }
+
+    confirm_playback_and_quit(&mut youtui, &mut player)
+}
+
+#[test]
+fn unavailable_buffered_track_falls_back_to_loading_the_selection() -> Result<(), String> {
+    let fixture = SmokeFixture::new(true);
+    let mut youtui = fixture.spawn_youtui();
+    let mut buffered = enter_buffered_result(&fixture, &mut youtui)?;
+    let probe = read_request(&mut buffered, WAIT_TIMEOUT)?;
+    assert_eq!(
+        probe["command"],
+        json!(["get_property", "playlist-playing-pos"])
+    );
+
+    // Only the replacement mpv can publish another argument file.
+    fs::remove_file(&fixture.mpv_args).unwrap();
+    reply(buffered.get_mut(), request_id(&probe)?, json!(-1))?;
+    let args = wait_for_lines(&fixture.mpv_args, WAIT_TIMEOUT);
+    let listener = UnixListener::bind(ipc_socket_path(&args)?).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut player = BufReader::new(accept_until(&listener, WAIT_TIMEOUT)?);
+    let load = read_request(&mut player, WAIT_TIMEOUT)?;
+    assert_eq!(
+        load["command"],
+        json!([
+            "loadfile",
+            format!("https://www.youtube.com/watch?v={VIDEO_ID}"),
+            "replace"
+        ])
+    );
+    reply(
+        player.get_mut(),
+        request_id(&load)?,
+        json!({"playlist_entry_id": 42}),
+    )?;
+
+    confirm_playback_and_quit(&mut youtui, &mut player)
+}
+
+fn confirm_playback_and_quit(
+    youtui: &mut PtyProcess,
+    player: &mut BufReader<UnixStream>,
+) -> Result<(), String> {
+    let properties = read_property_batch(player)?;
+    reply_to_properties(player.get_mut(), &properties)?;
+    youtui.wait_for_screen("0:12", WAIT_TIMEOUT);
+    youtui.write_all(b"q");
+    assert!(youtui.wait_for_exit(WAIT_TIMEOUT).success());
+    Ok(())
+}
+
+fn enter_buffered_result(
+    fixture: &SmokeFixture,
+    youtui: &mut PtyProcess,
+) -> Result<BufReader<UnixStream>, String> {
+    youtui.wait_for_screen("Search", WAIT_TIMEOUT);
+    youtui.write_all(b"buffered playback\r");
+    youtui.wait_for_screen(RESULT_TITLE, WAIT_TIMEOUT);
+
+    let args = wait_for_lines(&fixture.mpv_args, WAIT_TIMEOUT);
+    for flag in [
+        "--pause",
+        "--cache=yes",
+        "--cache-secs=10",
+        "--demuxer-max-bytes=8MiB",
+        "--cache-on-disk=no",
+    ] {
+        assert!(
+            args.iter().any(|arg| arg == flag),
+            "preload missing {flag}: {args:?}"
+        );
+    }
+    assert!(args.contains(&format!("https://www.youtube.com/watch?v={VIDEO_ID}")));
+
+    let listener = UnixListener::bind(ipc_socket_path(&args)?).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // Give the app one playback poll while the result is highlighted.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    youtui.write_all(b"\r");
+    Ok(BufReader::new(accept_until(&listener, WAIT_TIMEOUT)?))
+}
+
 fn check_playback(audio_only: bool) {
     let fixture = SmokeFixture::new(audio_only);
     let mut youtui = fixture.spawn_youtui();

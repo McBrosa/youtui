@@ -27,9 +27,12 @@ import YoutuiPlayer from "./player"
 import topbar from "../vendor/topbar"
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
+const video = document.createElement("video")
+const nativeHls = ["application/vnd.apple.mpegurl", "application/x-mpegURL"]
+  .some(type => ["maybe", "probably"].includes(video.canPlayType(type)))
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
-  params: {_csrf_token: csrfToken},
+  params: {_csrf_token: csrfToken, native_hls: nativeHls},
   hooks: {...colocatedHooks, YoutuiPlayer},
 })
 
