@@ -475,58 +475,48 @@ fn handle_search_bar_keys(app: &mut App, key: KeyEvent) {
 fn handle_queue_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
-            if app.queue_selected_index > 0 {
-                app.queue_selected_index -= 1;
-            }
+            app.queue
+                .select(app.queue.selected_index().saturating_sub(1));
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.queue_selected_index < app.queue.len().saturating_sub(1) {
-                app.queue_selected_index += 1;
-            }
+            app.queue
+                .select(app.queue.selected_index().saturating_add(1));
         }
         KeyCode::Home | KeyCode::Char('g') => {
-            app.queue_selected_index = 0;
+            app.queue.select(0);
         }
         KeyCode::End | KeyCode::Char('G') => {
-            app.queue_selected_index = app.queue.len().saturating_sub(1);
+            app.queue.select(app.queue.len().saturating_sub(1));
         }
         KeyCode::Enter => {
             if promote_selected_queue_item(app) {
-                play_queue_front(app);
+                app.play_queue_front();
             }
         }
         KeyCode::Delete | KeyCode::Backspace => {
-            if app.queue_selected_index < app.queue.len() {
-                let was_playing = removed_queue_item_was_playing(
-                    app.queue_selected_index,
-                    app.player_manager
-                        .as_ref()
-                        .and_then(|pm| pm.current_video_id.as_deref()),
-                );
-                app.queue.remove(app.queue_selected_index);
-
-                if app.queue_selected_index >= app.queue.len() && app.queue_selected_index > 0 {
-                    app.queue_selected_index -= 1;
-                }
-
-                if was_playing {
-                    // The currently-playing track was removed; play whatever is now at the
-                    // front WITHOUT popping again (calling handle_next_video would double-pop).
-                    if app.queue.is_empty() {
-                        if let Some(mut pm) = app.player_manager.take()
-                            && let Err(error) = pm.clear()
-                        {
-                            app.status_message = Some(format!("Could not stop playback: {error}"));
-                        }
-                    } else {
-                        play_queue_front(app);
+            let selected = app.queue.selected_index();
+            let was_playing = removed_queue_item_was_playing(
+                selected,
+                app.player_manager
+                    .as_ref()
+                    .and_then(|pm| pm.current_video_id.as_deref()),
+            );
+            if app.queue.remove(selected).is_some() && was_playing {
+                // The currently-playing track was removed; play whatever is now at the
+                // front WITHOUT popping again (calling handle_next_video would double-pop).
+                if app.queue.is_empty() {
+                    if let Some(mut pm) = app.player_manager.take()
+                        && let Err(error) = pm.clear()
+                    {
+                        app.status_message = Some(format!("Could not stop playback: {error}"));
                     }
+                } else {
+                    app.play_queue_front();
                 }
             }
         }
         KeyCode::Char('c') => {
             app.queue.clear();
-            app.queue_selected_index = 0;
             // Clear player when queue is cleared
             if let Some(mut player) = app.player_manager.take()
                 && let Err(error) = player.clear()
@@ -549,46 +539,11 @@ fn handle_queue_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn promote_selected_queue_item(app: &mut App) -> bool {
-    if app.queue.is_empty() || app.queue_selected_index >= app.queue.len() {
+    if app.queue.is_empty() {
         return false;
     }
-    if app.queue_selected_index > 0 {
-        app.queue.move_to_front(app.queue_selected_index);
-        app.queue_selected_index = 0;
-    }
+    app.queue.move_to_front(app.queue.selected_index());
     true
-}
-
-fn play_queue_front(app: &mut App) {
-    let Some(track) = app.queue.get(0) else {
-        return;
-    };
-    let url = format!("https://www.youtube.com/watch?v={}", track.id);
-    let title = track.title.clone();
-    let video_id = track.id.clone();
-
-    let result = if let Some(player) = app.player_manager.as_mut() {
-        player.play(&app.config, &url, &title, &video_id)
-    } else {
-        match PlayerManager::new(&app.config) {
-            Ok(mut player) => match player.play(&app.config, &url, &title, &video_id) {
-                Ok(()) => {
-                    app.player_manager = Some(player);
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        }
-    };
-
-    match result {
-        Ok(()) => app.status_message = None,
-        Err(error) => {
-            app.player_manager = None;
-            app.status_message = Some(format!("Could not start playback: {error}"));
-        }
-    }
 }
 
 fn removed_queue_item_was_playing(selected_index: usize, current_video_id: Option<&str>) -> bool {
@@ -1607,6 +1562,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn advancing_queue_honors_autoplay_and_manual_skip() {
+        for (manual, auto_play_queue) in [(false, false), (false, true), (true, false)] {
+            let config = Config {
+                auto_play_queue,
+                ..Config::default()
+            };
+            let (mut app, server) = app_with_command_capture(config, 0.0);
+            app.queue.push_back(create_test_track("old", "Old"));
+            let next = create_test_track("next", "Next");
+            let url = next.url();
+            app.queue.push_back(next);
+            app.queue.select(1);
+
+            app.handle_next_video(manual);
+
+            let expected = if manual || auto_play_queue {
+                json!(["loadfile", url, "replace"])
+            } else {
+                json!(["loadfile", url, "replace", "-1", "pause=yes"])
+            };
+            assert_eq!(server.join().unwrap(), expected);
+            assert_eq!(app.queue.len(), 1);
+            assert_eq!(app.queue.selected_index(), 0);
+        }
+    }
+
     // --- Video selection & play action ---
 
     #[test]
@@ -1732,12 +1714,12 @@ mod tests {
         app.queue.push_back(create_test_track("1", "Track 1"));
         app.queue.push_back(create_test_track("2", "Track 2"));
         app.queue.push_back(create_test_track("3", "Track 3"));
-        app.queue_selected_index = 0;
+        app.queue.select(0);
 
         let key = KeyEvent::from(KeyCode::Down);
         handle_queue_keys(&mut app, key);
 
-        assert_eq!(app.queue_selected_index, 1);
+        assert_eq!(app.queue.selected_index(), 1);
     }
 
     #[test]
@@ -1745,24 +1727,24 @@ mod tests {
         let mut app = App::new("test".to_string(), 10, Config::default());
         app.queue.push_back(create_test_track("1", "Track 1"));
         app.queue.push_back(create_test_track("2", "Track 2"));
-        app.queue_selected_index = 1;
+        app.queue.select(1);
 
         let key = KeyEvent::from(KeyCode::Up);
         handle_queue_keys(&mut app, key);
 
-        assert_eq!(app.queue_selected_index, 0);
+        assert_eq!(app.queue.selected_index(), 0);
     }
 
     #[test]
     fn test_queue_up_at_top_stays() {
         let mut app = App::new("test".to_string(), 10, Config::default());
         app.queue.push_back(create_test_track("1", "Track 1"));
-        app.queue_selected_index = 0;
+        app.queue.select(0);
 
         let key = KeyEvent::from(KeyCode::Up);
         handle_queue_keys(&mut app, key);
 
-        assert_eq!(app.queue_selected_index, 0);
+        assert_eq!(app.queue.selected_index(), 0);
     }
 
     #[test]
@@ -1770,12 +1752,12 @@ mod tests {
         let mut app = App::new("test".to_string(), 10, Config::default());
         app.queue.push_back(create_test_track("1", "Track 1"));
         app.queue.push_back(create_test_track("2", "Track 2"));
-        app.queue_selected_index = 1; // last
+        app.queue.select(1); // last
 
         let key = KeyEvent::from(KeyCode::Down);
         handle_queue_keys(&mut app, key);
 
-        assert_eq!(app.queue_selected_index, 1);
+        assert_eq!(app.queue.selected_index(), 1);
     }
 
     // --- Queue delete ---
@@ -1786,7 +1768,7 @@ mod tests {
         app.queue.push_back(create_test_track("1", "Track 1"));
         app.queue.push_back(create_test_track("2", "Track 2"));
         app.queue.push_back(create_test_track("3", "Track 3"));
-        app.queue_selected_index = 1;
+        app.queue.select(1);
 
         let key = KeyEvent::from(KeyCode::Delete);
         handle_queue_keys(&mut app, key);
@@ -1794,7 +1776,7 @@ mod tests {
         assert_eq!(app.queue.len(), 2);
         assert_eq!(app.queue.get(0).unwrap().id, "1");
         assert_eq!(app.queue.get(1).unwrap().id, "3");
-        assert_eq!(app.queue_selected_index, 1);
+        assert_eq!(app.queue.selected_index(), 1);
     }
 
     #[test]
@@ -1802,19 +1784,19 @@ mod tests {
         let mut app = App::new("test".to_string(), 10, Config::default());
         app.queue.push_back(create_test_track("1", "Track 1"));
         app.queue.push_back(create_test_track("2", "Track 2"));
-        app.queue_selected_index = 1; // last item
+        app.queue.select(1); // last item
 
         let key = KeyEvent::from(KeyCode::Delete);
         handle_queue_keys(&mut app, key);
 
         assert_eq!(app.queue.len(), 1);
-        assert_eq!(app.queue_selected_index, 0);
+        assert_eq!(app.queue.selected_index(), 0);
     }
 
     #[test]
     fn test_queue_delete_on_empty_queue_is_safe() {
         let mut app = App::new("test".to_string(), 10, Config::default());
-        app.queue_selected_index = 0;
+        app.queue.select(0);
 
         let key = KeyEvent::from(KeyCode::Delete);
         handle_queue_keys(&mut app, key); // Should not panic
@@ -1830,13 +1812,13 @@ mod tests {
         app.queue.push_back(create_test_track("1", "Track 1"));
         app.queue.push_back(create_test_track("2", "Track 2"));
         app.queue.push_back(create_test_track("3", "Track 3"));
-        app.queue_selected_index = 2;
+        app.queue.select(2);
 
         let key = KeyEvent::from(KeyCode::Char('c'));
         handle_queue_keys(&mut app, key);
 
         assert!(app.queue.is_empty());
-        assert_eq!(app.queue_selected_index, 0);
+        assert_eq!(app.queue.selected_index(), 0);
     }
 
     // --- Queue Enter (play / reorder) ---
@@ -1847,13 +1829,13 @@ mod tests {
         app.queue.push_back(create_test_track("1", "Track 1"));
         app.queue.push_back(create_test_track("2", "Track 2"));
         app.queue.push_back(create_test_track("3", "Track 3"));
-        app.queue_selected_index = 2; // Track 3
+        app.queue.select(2); // Track 3
 
         assert!(promote_selected_queue_item(&mut app));
 
         // Track 3 moved to front, selection reset to 0
         assert_eq!(app.queue.get(0).unwrap().id, "3");
-        assert_eq!(app.queue_selected_index, 0);
+        assert_eq!(app.queue.selected_index(), 0);
     }
 
     #[test]
@@ -1861,7 +1843,7 @@ mod tests {
         let mut app = App::new("test".to_string(), 10, Config::default());
         app.queue.push_back(create_test_track("1", "Track 1"));
         app.queue.push_back(create_test_track("2", "Track 2"));
-        app.queue_selected_index = 0;
+        app.queue.select(0);
 
         assert!(promote_selected_queue_item(&mut app));
 

@@ -32,13 +32,6 @@ impl std::fmt::Display for PlayerType {
     }
 }
 
-#[allow(dead_code)]
-pub enum PlaybackResult {
-    Finished,
-    ReturnToMenu,
-    Error(String),
-}
-
 pub fn supports_background_playback(player: PlayerType) -> bool {
     matches!(player, PlayerType::Mpv)
 }
@@ -63,7 +56,7 @@ pub fn play_video(
     video_title: &str,
     safe_title: &str,
     temp_dir: &Path,
-) -> Result<PlaybackResult> {
+) -> Result<()> {
     let url = format!("https://www.youtube.com/watch?v={video_id}");
 
     if config.download_mode {
@@ -93,7 +86,7 @@ pub fn play_video(
     }
 }
 
-fn download_permanently(config: &Config, video_title: &str, url: &str) -> Result<PlaybackResult> {
+fn download_permanently(config: &Config, video_title: &str, url: &str) -> Result<()> {
     ensure_download_capabilities(config)?;
     println!("{} {}", "Downloading:".blue(), video_title);
 
@@ -122,14 +115,14 @@ fn download_permanently(config: &Config, video_title: &str, url: &str) -> Result
 
     if !status.success() {
         eprintln!("{} Download failed.", "Error:".red());
-        return Ok(PlaybackResult::ReturnToMenu);
+        return Ok(());
     }
 
     println!("{} {}", "Downloaded to:".green(), config.download_dir);
-    Ok(PlaybackResult::ReturnToMenu)
+    Ok(())
 }
 
-fn play_with_mpv(config: &Config, url: &str, temp_dir: &Path) -> Result<PlaybackResult> {
+fn play_with_mpv(config: &Config, url: &str, temp_dir: &Path) -> Result<()> {
     println!("{}", "Playing with mpv...".blue());
 
     let input_conf = temp_dir.join("mpv-input.conf");
@@ -149,22 +142,21 @@ fn play_with_mpv(config: &Config, url: &str, temp_dir: &Path) -> Result<Playback
     let code = status.code().unwrap_or(-1);
 
     match code {
-        42 => Ok(PlaybackResult::ReturnToMenu),
+        42 => {}
         0 => {
             println!(
                 "{}",
                 "Video finished. Returning to search results...".green()
             );
-            Ok(PlaybackResult::ReturnToMenu)
         }
         other => {
             println!(
                 "{}",
                 format!("Player exited with code {other}. Returning to search results...").yellow()
             );
-            Ok(PlaybackResult::ReturnToMenu)
         }
     }
+    Ok(())
 }
 
 fn play_with_download(
@@ -175,7 +167,7 @@ fn play_with_download(
     url: &str,
     temp_dir: &Path,
     player_name: &str,
-) -> Result<PlaybackResult> {
+) -> Result<()> {
     ensure_download_capabilities(config)?;
     println!("{} {}", "Downloading temporarily:".blue(), video_title);
 
@@ -206,7 +198,7 @@ fn play_with_download(
             "Error:".red(),
             status.code().unwrap_or(-1)
         );
-        return Ok(PlaybackResult::ReturnToMenu);
+        return Ok(());
     }
 
     // yt-dlp can select a different final extension after post-processing.
@@ -219,7 +211,7 @@ fn play_with_download(
             Some(path) => path,
             None => {
                 eprintln!("{} Failed to locate the downloaded video.", "Error:".red());
-                return Ok(PlaybackResult::ReturnToMenu);
+                return Ok(());
             }
         }
     };
@@ -255,7 +247,7 @@ fn play_with_download(
         "Video finished. Returning to search results...".green()
     );
 
-    Ok(PlaybackResult::ReturnToMenu)
+    Ok(())
 }
 
 fn ensure_download_capabilities(config: &Config) -> Result<()> {

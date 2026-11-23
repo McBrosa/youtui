@@ -14,7 +14,7 @@ use crossterm::event::{self, Event};
 use crate::cleanup::{INTERRUPTED, ManagedTempDir};
 use crate::config::clamp_results_per_page;
 use crate::player_manager::PlayerManager;
-use crate::search::PaginatedSearch;
+use crate::search::{PaginatedSearch, SearchBatch};
 use crate::ui::app::{AppAction, SearchPhase};
 use crate::ui::{App, handle_key_event, layout::render_ui, terminal::Tui};
 
@@ -125,7 +125,7 @@ enum SearchMessage {
     Progress {
         generation: u64,
         request: SearchRequest,
-        state: PaginatedSearch,
+        batch: SearchBatch,
     },
     Finished(SearchOutcome),
 }
@@ -416,13 +416,15 @@ fn spawn_search(
     let spawn_result = thread::Builder::new()
         .name(format!("youtui-search-{current_generation}"))
         .spawn(move || {
+            let mut first_unsent = state.results.len();
             let result = state
                 .ensure_page_with_cancel_and_progress(page, &worker_cancelled, |progress| {
                     let _ = tx.send(SearchMessage::Progress {
                         generation: current_generation,
                         request,
-                        state: progress.clone(),
+                        batch: progress.batch_since(first_unsent),
                     });
+                    first_unsent = progress.results.len();
                 })
                 .map(|_| ());
             let _ = tx.send(SearchMessage::Finished(SearchOutcome {
@@ -460,10 +462,10 @@ fn drain_search_results(
             Ok(SearchMessage::Progress {
                 generation,
                 request,
-                state,
+                batch,
             }) => {
                 if generation == active_generation {
-                    apply_search_progress(request, state, app, search);
+                    apply_search_progress(request, batch, app, search);
                     changed = true;
                 }
             }
@@ -498,12 +500,11 @@ fn apply_cached_search(state: PaginatedSearch, app: &mut App, search: &mut Pagin
 
 fn apply_search_progress(
     request: SearchRequest,
-    state: PaginatedSearch,
+    batch: SearchBatch,
     app: &mut App,
     search: &mut PaginatedSearch,
 ) {
-    *search = state;
-    app.results.clone_from(&search.results);
+    app.results.extend_from_slice(search.append_batch(batch));
     app.total_results = search.results.len();
     app.exhausted = search.exhausted;
 
@@ -555,7 +556,9 @@ fn apply_search_outcome(outcome: SearchOutcome, app: &mut App, search: &mut Pagi
     app.loading = false;
     app.search_phase = None;
     *search = outcome.state;
-    app.results.clone_from(&search.results);
+    // Active-generation batches arrive in order. Only a final unpublished tail needs copying.
+    app.results
+        .extend_from_slice(&search.results[app.results.len()..]);
     app.total_results = search.results.len();
     app.exhausted = search.exhausted;
 
@@ -625,42 +628,12 @@ fn play_result(
 }
 
 fn start_queue_if_idle(app: &mut App) {
-    let player_is_idle = app
+    if app
         .player_manager
         .as_ref()
-        .is_none_or(|player| player.current_video_id.is_none());
-    if !player_is_idle {
-        return;
-    }
-
-    let Some(track) = app.queue.get(0) else {
-        return;
-    };
-    let url = format!("https://www.youtube.com/watch?v={}", track.id);
-    let title = track.title.clone();
-    let video_id = track.id.clone();
-
-    let result = if let Some(player) = app.player_manager.as_mut() {
-        player.play(&app.config, &url, &title, &video_id)
-    } else {
-        match PlayerManager::new(&app.config) {
-            Ok(mut player) => match player.play(&app.config, &url, &title, &video_id) {
-                Ok(()) => {
-                    app.player_manager = Some(player);
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        }
-    };
-
-    match result {
-        Ok(()) => app.status_message = None,
-        Err(error) => {
-            app.player_manager = None;
-            app.status_message = Some(format!("Could not start playback: {error}"));
-        }
+        .is_none_or(|player| player.current_video_id.is_none())
+    {
+        app.play_queue_front();
     }
 }
 
@@ -729,21 +702,13 @@ fn sync_video(app: &mut App, (width, height): (u16, u16)) {
         return;
     }
 
-    let (video_id, playing, paused, time_pos) = match app.player_manager.as_ref() {
-        Some(player) => (
-            player.current_video_id.as_deref(),
-            player.status.playing,
-            player.status.paused,
-            player.status.time_pos,
-        ),
-        None => (None, false, false, 0.0),
+    let Some(player) = app.player_manager.as_ref() else {
+        app.video.stop();
+        return;
     };
-
     app.video.sync(
-        playing,
-        paused,
-        video_id,
-        time_pos,
+        &player.status,
+        player.current_video_id.as_deref(),
         cols,
         rows,
         app.config.video_render,
@@ -868,7 +833,12 @@ mod tests {
         let mut progress = search.clone();
         progress.results = (0..5).map(|index| result(&index.to_string())).collect();
 
-        apply_search_progress(SearchRequest::New, progress, &mut app, &mut search);
+        apply_search_progress(
+            SearchRequest::New,
+            progress.batch_since(search.results.len()),
+            &mut app,
+            &mut search,
+        );
 
         assert!(app.loading);
         assert_eq!(app.results.len(), 5);
@@ -895,7 +865,7 @@ mod tests {
             .extend((10..15).map(|index| result(&index.to_string())));
         apply_search_progress(
             SearchRequest::NextPage { target_page: 1 },
-            progress,
+            progress.batch_since(search.results.len()),
             &mut app,
             &mut search,
         );
@@ -919,7 +889,7 @@ mod tests {
 
         apply_search_progress(
             SearchRequest::NextPage { target_page: 1 },
-            progress,
+            progress.batch_since(search.results.len()),
             &mut app,
             &mut search,
         );
@@ -943,7 +913,7 @@ mod tests {
 
         apply_search_progress(
             SearchRequest::BackgroundPrefetch,
-            progress,
+            progress.batch_since(search.results.len()),
             &mut app,
             &mut search,
         );

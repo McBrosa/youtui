@@ -66,16 +66,6 @@ impl IpcClient {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn get_property(&mut self, property: &str) -> Result<Value> {
-        let values = self.get_properties(&[property])?;
-        values
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| anyhow!("Property unavailable: {property}"))
-    }
-
     /// Fetch several properties in a single write/read batch. Each missing or
     /// unavailable property is returned as `None`, while transport and JSON
     /// errors still fail the whole request.
@@ -268,7 +258,10 @@ mod tests {
             .send_command_with_data(&["loadfile", "video-url", "replace"])
             .unwrap();
         assert_eq!(data, Some(json!({ "playlist_entry_id": 7 })));
-        assert_eq!(client.get_property("duration").unwrap(), json!(123.5));
+        assert_eq!(
+            client.get_properties(&["duration"]).unwrap(),
+            [Some(json!(123.5))]
+        );
         server.join().unwrap();
     }
 

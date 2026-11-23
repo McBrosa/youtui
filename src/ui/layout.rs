@@ -634,20 +634,15 @@ fn render_queue_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let mut state = ListState::default();
     if is_focused && !app.queue.is_empty() {
-        state.select(Some(
-            app.queue_selected_index
-                .min(app.queue.len().saturating_sub(1)),
-        ));
+        state.select(Some(app.queue.selected_index()));
     }
 
     f.render_stateful_widget(list, area, &mut state);
 
     let visible_rows = area.height.saturating_sub(2) as usize;
     if app.queue.len() > visible_rows.max(1) {
-        let mut scrollbar_state = ScrollbarState::new(app.queue.len()).position(
-            app.queue_selected_index
-                .min(app.queue.len().saturating_sub(1)),
-        );
+        let mut scrollbar_state =
+            ScrollbarState::new(app.queue.len()).position(app.queue.selected_index());
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             area,

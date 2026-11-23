@@ -23,6 +23,7 @@ use ratatui_image::protocol::Protocol;
 
 use crate::config::{PixelVideoQuality, VideoRenderMode};
 use crate::kitty_shm::{KittyTransport, shm_supported};
+use crate::player_manager::PlaybackStatus;
 
 /// Decode-size ceiling for the pixel renderer. Panes larger than this are
 /// upscaled by the terminal-side image resize instead of pushing more raw
@@ -125,13 +126,17 @@ pub fn detect_picker() -> Option<Picker> {
         &std::env::var("TERM_PROGRAM").unwrap_or_default(),
         std::env::var_os("KITTY_WINDOW_ID").is_some(),
     )?;
-    let font_size = font_size_from_winsize()?;
-    // from_fontsize is deprecated in favor of the stdio query, which is
-    // exactly what this function exists to avoid.
-    #[allow(deprecated)]
+    Some(picker_for_protocol(protocol, font_size_from_winsize()?))
+}
+
+fn picker_for_protocol(protocol: ProtocolType, font_size: (u16, u16)) -> Picker {
+    #[expect(
+        deprecated,
+        reason = "querying stdio for cell size races the TUI input reader"
+    )]
     let mut picker = Picker::from_fontsize(font_size.into());
     picker.set_protocol_type(protocol);
-    Some(picker)
+    picker
 }
 
 /// Pure function: which graphics protocol the environment advertises.
@@ -710,19 +715,16 @@ impl VideoState {
 
     /// Drive the pipeline from the latest mpv status snapshot. Called once per
     /// video-delivery tick while the video view is active.
-    #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &mut self,
-        playing: bool,
-        paused: bool,
+        status: &PlaybackStatus,
         video_id: Option<&str>,
-        time_pos: f64,
         cols: u16,
         rows: u16,
         mode: VideoRenderMode,
         quality: PixelVideoQuality,
     ) {
-        let Some(video_id) = video_id.filter(|_| playing || paused) else {
+        let Some(video_id) = video_id.filter(|_| status.playing || status.paused) else {
             self.stop();
             return;
         };
@@ -733,7 +735,7 @@ impl VideoState {
             self.switch_track(video_id, quality);
         }
 
-        if paused && self.has_output() {
+        if status.paused && self.has_output() {
             // Freeze on the last frame; nothing should decode while paused.
             self.session = None;
             self.paused = true;
@@ -742,7 +744,7 @@ impl VideoState {
         // A pause before the first frame must still drive URL resolution and
         // decode one frame. Otherwise the early return above leaves a completed
         // prefetch unread forever and the pane stays on "loading video…".
-        self.paused = paused;
+        self.paused = status.paused;
 
         if cols == 0 || rows == 0 {
             return; // pane not usable yet (e.g. mid-resize)
@@ -756,7 +758,7 @@ impl VideoState {
         });
         let (w_px, h_px) = decode_size(cols, rows, font_size);
 
-        if self.restart_if_stale(time_pos, w_px, h_px, fps) {
+        if self.restart_if_stale(status.time_pos, w_px, h_px, fps) {
             // Never leave the pane saying "loading" forever. A fresh manual
             // toggle may retry, but it must resolve a new URL first.
             self.cache.remove(video_id);
@@ -775,7 +777,7 @@ impl VideoState {
         }
         if let Some(session) = self.session.as_mut() {
             if !session.rebased && session.frames_read() > 0 {
-                session.rebase(time_pos);
+                session.rebase(status.time_pos);
                 session.rebased = true;
             }
             return;
@@ -788,11 +790,11 @@ impl VideoState {
                 .filter(|stream| stream.quality == quality)
                 .cloned()
         {
-            self.start_session(&stream, time_pos, w_px, h_px, fps, true);
+            self.start_session(&stream, status.time_pos, w_px, h_px, fps, true);
             return;
         }
 
-        self.poll_resolve(video_id, quality, time_pos, w_px, h_px, fps);
+        self.poll_resolve(video_id, quality, status.time_pos, w_px, h_px, fps);
     }
 
     /// Store a decoded frame in the form the renderer needs: encoded for the
@@ -880,10 +882,10 @@ impl VideoState {
             if session.w_px != w_px || session.h_px != h_px || session.fps != fps {
                 return (true, false);
             }
-            // No drift verdict until the first frame arrives — startup
-            // latency (network open + seek) is not drift.
-            if session.frames_read() == 0 {
-                let timed_out = startup_timed_out(0, session.started_at.elapsed());
+            // A first frame can be ready before sync has aligned the decoder clock with mpv.
+            if !session.rebased {
+                let timed_out =
+                    startup_timed_out(session.frames_read(), session.started_at.elapsed());
                 return (timed_out, timed_out);
             }
             (drift_exceeded(time_pos, session.expected_position()), false)
@@ -1348,8 +1350,7 @@ mod tests {
         assert!(!state.pixels_active(VideoRenderMode::Blocks));
 
         let mut state = VideoState::new();
-        #[allow(deprecated)] // test-only picker construction without a tty
-        state.set_picker(Picker::from_fontsize((8, 16).into()));
+        state.set_picker(picker_for_protocol(ProtocolType::Iterm2, (8, 16)));
         assert!(state.pixels_active(VideoRenderMode::Auto));
         assert!(state.pixels_active(VideoRenderMode::Pixels));
         assert!(!state.pixels_active(VideoRenderMode::Blocks));
@@ -1358,10 +1359,7 @@ mod tests {
     #[test]
     fn frame_rate_tracks_the_effective_transport_not_detected_capability() {
         let mut state = VideoState::new();
-        #[allow(deprecated)] // test-only picker construction without a tty
-        let mut picker = Picker::from_fontsize((8, 16).into());
-        picker.set_protocol_type(ProtocolType::Kitty);
-        state.picker = Some(picker);
+        state.picker = Some(picker_for_protocol(ProtocolType::Kitty, (8, 16)));
         state.kitty_transport = Some(KittyTransport::new(true));
 
         assert_eq!(state.fps(VideoRenderMode::Auto), SHM_FPS);
@@ -1379,10 +1377,7 @@ mod tests {
     #[test]
     fn native_mpv_kitty_mode_is_mode_aware_and_uses_font_geometry() {
         let mut state = VideoState::new();
-        #[allow(deprecated)] // test-only picker construction without a tty
-        let mut picker = Picker::from_fontsize((8, 16).into());
-        picker.set_protocol_type(ProtocolType::Kitty);
-        state.picker = Some(picker);
+        state.picker = Some(picker_for_protocol(ProtocolType::Kitty, (8, 16)));
         state.kitty_transport = Some(KittyTransport::new(true));
         state.mpv_kitty = true;
 
@@ -1461,6 +1456,57 @@ mod tests {
         assert!(drift_exceeded(7.9, 10.0)); // negative drift, over threshold
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn delayed_first_frame_syncs_before_checking_for_drift() {
+        let mut state = VideoState::new();
+        let quality = PixelVideoQuality::P144;
+        let mode = VideoRenderMode::Blocks;
+        let fps = state.fps(mode);
+        state.switch_track("abc", quality);
+        // A live process stands in for ffmpeg. Advance playback time without sleeping.
+        state.session = Some(VideoSession {
+            child: Command::new("cat").stdin(Stdio::piped()).spawn().unwrap(),
+            reader: None,
+            exchange: Arc::new(Mutex::new(FrameExchange {
+                latest: Some(Frame {
+                    width: 1,
+                    height_px: 2,
+                    rgb: vec![0; 6],
+                }),
+                spare: None,
+            })),
+            frames_read: Arc::new(AtomicU64::new(1)),
+            w_px: 1,
+            h_px: 2,
+            fps,
+            start_pos: 0.0,
+            started_at: Instant::now(),
+            rebased: false,
+            stopped: false,
+            from_cache: false,
+            dead_handled: false,
+        });
+        let status = PlaybackStatus {
+            playing: true,
+            time_pos: 5.0,
+            ..PlaybackStatus::default()
+        };
+
+        // Keep the regression hermetic even if the session would ordinarily restart the resolver.
+        assert!(!state.restart_if_stale(status.time_pos, 1, 2, fps));
+        assert!(state.session.is_some(), "first frame discarded as drift");
+        state.sync(&status, Some("abc"), 1, 1, mode, quality);
+        assert!(state.last_frame.is_some());
+        assert!(!state.restart_if_stale(status.time_pos, 1, 2, fps));
+        assert!(state.session.is_some());
+        assert!(!state.restart_if_stale(status.time_pos + 3.0, 1, 2, fps));
+        assert!(
+            state.session.is_none(),
+            "seek after synchronization must restart"
+        );
+    }
+
     #[test]
     fn startup_timeout_only_applies_before_the_first_frame() {
         assert!(!startup_timed_out(0, VIDEO_STARTUP_TIMEOUT));
@@ -1513,10 +1559,8 @@ mod tests {
         });
 
         state.sync(
-            false,
-            false,
+            &PlaybackStatus::default(),
             None,
-            0.0,
             80,
             24,
             VideoRenderMode::Auto,
@@ -1539,10 +1583,13 @@ mod tests {
         });
 
         state.sync(
-            true,
-            true,
+            &PlaybackStatus {
+                playing: true,
+                paused: true,
+                time_pos: 5.0,
+                ..PlaybackStatus::default()
+            },
             Some("abc"),
-            5.0,
             80,
             24,
             VideoRenderMode::Auto,
@@ -1571,10 +1618,13 @@ mod tests {
         });
 
         state.sync(
-            true,
-            true,
+            &PlaybackStatus {
+                playing: true,
+                paused: true,
+                time_pos: 8.0,
+                ..PlaybackStatus::default()
+            },
             Some("abc"),
-            8.0,
             80,
             24,
             VideoRenderMode::Auto,
@@ -1605,12 +1655,14 @@ mod tests {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 worker: None,
             });
+            let status = PlaybackStatus {
+                playing: true,
+                ..PlaybackStatus::default()
+            };
             for _ in 0..20 {
                 state.sync(
-                    true,
-                    false,
+                    &status,
                     Some("abc"),
-                    0.0,
                     80,
                     24,
                     VideoRenderMode::Blocks,
@@ -1732,10 +1784,7 @@ wait"#,
     #[test]
     fn direct_kitty_video_uses_full_pane_cell_dimensions_on_hidpi() {
         let mut state = VideoState::new();
-        #[allow(deprecated)]
-        let mut picker = Picker::from_fontsize((16, 34).into());
-        picker.set_protocol_type(ProtocolType::Kitty);
-        state.picker = Some(picker);
+        state.picker = Some(picker_for_protocol(ProtocolType::Kitty, (16, 34)));
         state.kitty_transport = Some(KittyTransport::new(false));
         let (width, height_px) = decode_size(188, 51, Some((16, 34)));
         let frame = Frame {

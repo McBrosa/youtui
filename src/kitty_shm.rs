@@ -126,10 +126,7 @@ impl KittyTransport {
         // are far shorter in practice.
         let height = area.height.min(DIACRITICS.len() as u16);
         for y in 0..height {
-            let mut symbol = String::new();
-            if let Some(escapes) = pending.take() {
-                symbol.push_str(&escapes);
-            }
+            let mut symbol = pending.take().unwrap_or_default();
             // Save cursor, set fg color to the image id, then one
             // fully-specified placeholder (row, column 0, id high byte);
             // the rest of the row inherits its diacritics.

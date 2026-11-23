@@ -50,7 +50,6 @@ impl SearchResult {
         })
     }
 
-    #[allow(dead_code)]
     pub fn url(&self) -> String {
         format!("https://www.youtube.com/watch?v={}", self.id)
     }
@@ -101,6 +100,12 @@ pub struct PaginatedSearch {
     pub exhausted: bool,
 }
 
+pub(crate) struct SearchBatch {
+    results: Vec<SearchResult>,
+    // Filtered entries also advance the playlist position needed to resume a cancelled search.
+    raw_cursor: usize,
+}
+
 impl PaginatedSearch {
     pub fn new(query: &str, page_size: usize, filter_shorts: bool) -> Self {
         PaginatedSearch {
@@ -116,6 +121,20 @@ impl PaginatedSearch {
 
     pub(crate) fn query(&self) -> &str {
         &self.query
+    }
+
+    pub(crate) fn batch_since(&self, first: usize) -> SearchBatch {
+        SearchBatch {
+            results: self.results[first..].to_vec(),
+            raw_cursor: self.raw_cursor,
+        }
+    }
+
+    pub(crate) fn append_batch(&mut self, batch: SearchBatch) -> &[SearchResult] {
+        let first = self.results.len();
+        self.results.extend(batch.results);
+        self.raw_cursor = batch.raw_cursor;
+        &self.results[first..]
     }
 
     /// Make sure we have enough filtered results to display `page` (0-indexed).
@@ -411,7 +430,11 @@ where
             }
 
             if stdout_done {
-                if let Some(status) = exit_status.take() {
+                // A helper may still hold stderr open after the extractor exits.
+                // Keep polling cancellation and the deadline until both pipes close.
+                if stderr_reader.is_finished()
+                    && let Some(status) = exit_status.take()
+                {
                     break CommandEnd::Completed(status);
                 }
                 std::thread::sleep(PROCESS_POLL_INTERVAL);
@@ -729,6 +752,82 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn extractor_leaving_stderr_open(ready: &std::path::Path) -> Command {
+        let mut command = Command::new("sh");
+        // Signal readiness only once the search loop has reaped the direct child.
+        command
+            .args([
+                "-c",
+                r#"
+extractor=$$
+(
+    while kill -0 "$extractor" 2>/dev/null; do sleep 0.01; done
+    printf diagnostic >&2
+    : > "$1"
+    exec sleep 5
+) >/dev/null &
+"#,
+                "mock-yt-dlp",
+            ])
+            .arg(ready);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_cancels_helpers_holding_only_stderr_after_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let command = extractor_leaving_stderr_open(&ready);
+        let cancelled = AtomicBool::new(false);
+        let started = Instant::now();
+        let completion = std::thread::scope(|scope| {
+            let search = scope.spawn(|| {
+                run_streaming_search_command(
+                    command,
+                    &cancelled,
+                    started,
+                    Duration::from_secs(8),
+                    |_| false,
+                )
+            });
+            while !ready.exists() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "helper never became ready"
+                );
+                std::thread::sleep(PROCESS_POLL_INTERVAL);
+            }
+            cancelled.store(true, Ordering::Relaxed);
+            let cancelled_at = Instant::now();
+            let completion = search.join().unwrap().unwrap();
+            assert!(cancelled_at.elapsed() < Duration::from_secs(3));
+            completion
+        });
+        assert!(matches!(completion.end, CommandEnd::Cancelled));
+        assert_eq!(completion.stderr, "diagnostic");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_deadline_includes_helpers_holding_only_stderr_after_exit() {
+        let command = extractor_leaving_stderr_open(std::path::Path::new("/dev/null"));
+        let started = Instant::now();
+        let completion = run_streaming_search_command(
+            command,
+            &AtomicBool::new(false),
+            started,
+            Duration::from_millis(300),
+            |_| false,
+        )
+        .unwrap();
+
+        assert!(matches!(completion.end, CommandEnd::TimedOut));
+        assert_eq!(completion.stderr, "diagnostic");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn partial_output_survives_a_nonzero_process_exit() {
         let cancelled = AtomicBool::new(false);
@@ -832,6 +931,29 @@ mod tests {
 
         assert_eq!(search.results.len(), 1);
         assert_eq!(search.raw_cursor, 2);
+    }
+
+    #[test]
+    fn progress_batches_only_copy_new_rows_and_preserve_the_resume_cursor() {
+        let mut worker = PaginatedSearch::new("query", 10, true);
+        worker.consume_search_line(r#"{"id":"cached","playlist_index":1}"#);
+        let mut visible = worker.clone();
+
+        for (id, playlist_index) in [("first", 3), ("second", 6)] {
+            let first_unsent = worker.results.len();
+            worker.consume_search_line(&format!(
+                r#"{{"id":"{id}","playlist_index":{playlist_index}}}"#
+            ));
+            worker.consume_search_line(r#"{"id":"short","duration":5}"#);
+
+            let batch = worker.batch_since(first_unsent);
+            let appended = visible.append_batch(batch);
+            assert_eq!(appended.len(), 1);
+            assert_eq!(appended[0].id, id);
+            assert_eq!(visible.raw_cursor, playlist_index + 1);
+        }
+
+        assert_eq!(visible.results.len(), 3);
     }
 
     #[test]

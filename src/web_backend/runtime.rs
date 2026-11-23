@@ -1,12 +1,12 @@
 //! JSON framed backend runtime used by the local Phoenix interface.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -52,10 +52,9 @@ pub fn run_stdio() -> Result<()> {
         .tempdir()
         .context("cannot create web media cache")?;
     let config = Config::load_or_create().context("cannot load settings")?;
-    let state = Arc::new(Mutex::new(BackendState::new(config)));
+    let mut state = BackendState::new(config);
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
     let requests = Arc::new(Mutex::new(HashSet::new()));
-    let cancellation = Arc::new(Mutex::new(HashMap::<String, Arc<AtomicBool>>::new()));
     let media_slots = Arc::new(Mutex::new(0_usize));
     let media_cache = Arc::new(Mutex::new(MediaCache::default()));
     let media_counter = Arc::new(AtomicU64::new(1));
@@ -134,8 +133,7 @@ pub fn run_stdio() -> Result<()> {
                     Ok(json!({"version": PROTOCOL_VERSION})),
                 )?,
                 "state" => {
-                    let result = lock_state(&state).map(|state| state.snapshot());
-                    finish_request(&output, &requests, request.id, result)?;
+                    finish_request(&output, &requests, request.id, Ok(state.snapshot()))?;
                 }
                 "search" => {
                     let id = request.id;
@@ -149,7 +147,7 @@ pub fn run_stdio() -> Result<()> {
                         )?;
                         continue;
                     }
-                    match prepare_search(&request.params, id, &state, &cancellation) {
+                    match prepare_search(&request.params, id, &mut state) {
                         Ok(search) => {
                             let output = Arc::clone(&output);
                             let requests = Arc::clone(&requests);
@@ -161,7 +159,7 @@ pub fn run_stdio() -> Result<()> {
                     }
                 }
                 "cancel_search" => {
-                    let result = cancel_search(&request.params, &cancellation);
+                    let result = cancel_search(&request.params, &state);
                     finish_request(&output, &requests, request.id, result)?;
                 }
                 "prepare_media" => {
@@ -235,7 +233,7 @@ pub fn run_stdio() -> Result<()> {
                     break;
                 }
                 command => {
-                    let result = run_state_command(command, &request.params, &state, &output);
+                    let result = run_state_command(command, &request.params, &mut state, &output);
                     finish_request(&output, &requests, request.id, result)?;
                 }
             }
@@ -244,8 +242,8 @@ pub fn run_stdio() -> Result<()> {
     })();
 
     shutting_down.store(true, Ordering::SeqCst);
-    if let Ok(cancellations) = cancellation.lock() {
-        for cancelled in cancellations.values() {
+    for entry in &state.searches {
+        if let Some(cancelled) = entry.cancelled.upgrade() {
             cancelled.store(true, Ordering::SeqCst);
         }
     }
@@ -259,10 +257,9 @@ pub fn run_stdio() -> Result<()> {
 fn run_state_command(
     command: &str,
     params: &Map<String, Value>,
-    state: &Arc<Mutex<BackendState>>,
+    state: &mut BackendState,
     output: &Arc<Mutex<BufWriter<io::Stdout>>>,
 ) -> Result<Value> {
-    let mut state = lock_state(state)?;
     let changed = match command {
         "queue_add" => {
             let track = parse_track(params.get("track"))?;
@@ -327,11 +324,10 @@ fn run_state_command(
         state.revision = state.revision.saturating_add(1);
     }
     let snapshot = state.snapshot();
-    drop(state);
     if changed {
         write_event(
             output,
-            json!({"version": PROTOCOL_VERSION, "event": "state_changed", "result": snapshot.clone()}),
+            json!({"version": PROTOCOL_VERSION, "event": "state_changed", "result": snapshot}),
         )?;
     }
     Ok(snapshot)
@@ -340,8 +336,7 @@ fn run_state_command(
 fn prepare_search(
     params: &Map<String, Value>,
     request_id: u64,
-    state: &Arc<Mutex<BackendState>>,
-    cancellations: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    state: &mut BackendState,
 ) -> Result<SearchJob> {
     let session = required_session(params)?;
     let query = required_string(params, "query", 512)?;
@@ -360,21 +355,36 @@ fn prepare_search(
             .ok_or_else(|| anyhow!("generation must be a positive unsigned integer"))?,
     };
 
-    let backend = lock_state(state)?;
-    if !backend.searches.contains_key(&session) && backend.searches.len() >= MAX_SEARCH_SESSIONS {
-        bail!("too many search sessions are active");
+    let page = usize::try_from(page).context("page is out of range")?;
+    let previous = state
+        .searches
+        .iter()
+        .position(|entry| entry.session == session)
+        .and_then(|index| state.searches.remove(index));
+    if let Some(entry) = &previous {
+        if let Some(cancelled) = entry.cancelled.upgrade() {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+    } else if state.searches.len() >= MAX_SEARCH_SESSIONS {
+        let idle = state
+            .searches
+            .iter()
+            .position(|entry| entry.cancelled.strong_count() == 0)
+            .ok_or_else(|| anyhow!("too many search sessions are active"))?;
+        state.searches.remove(idle);
     }
-    let page_size = backend.config.results_per_page;
-    let filter_shorts = !backend.config.include_shorts;
-    let sort_by_date = backend.config.sort_by_date;
-    let search = match backend.searches.get(&session) {
+
+    let page_size = state.config.results_per_page;
+    let filter_shorts = !state.config.include_shorts;
+    let sort_by_date = state.config.sort_by_date;
+    let search = match previous {
         Some(entry)
             if entry.query == query
                 && entry.page_size == page_size
                 && entry.filter_shorts == filter_shorts
                 && entry.sort_by_date == sort_by_date =>
         {
-            Arc::clone(&entry.search)
+            entry.search
         }
         _ => Arc::new(Mutex::new(PaginatedSearch::new(
             &query,
@@ -382,34 +392,21 @@ fn prepare_search(
             filter_shorts,
         ))),
     };
-    drop(backend);
-
-    let mut cancellations = cancellations
-        .lock()
-        .map_err(|_| anyhow!("search cancellation state is unavailable"))?;
-    if let Some(previous) = cancellations.get(&session) {
-        previous.store(true, Ordering::SeqCst);
-    }
     let cancelled = Arc::new(AtomicBool::new(false));
-    cancellations.insert(session.clone(), Arc::clone(&cancelled));
-    drop(cancellations);
-
-    let mut backend = lock_state(state)?;
-    backend.searches.insert(
-        session.clone(),
-        SearchCacheEntry {
-            query: query.clone(),
-            page_size,
-            filter_shorts,
-            sort_by_date,
-            search: Arc::clone(&search),
-        },
-    );
+    state.searches.push_back(SearchCacheEntry {
+        session: session.clone(),
+        query: query.clone(),
+        page_size,
+        filter_shorts,
+        sort_by_date,
+        cancelled: Arc::downgrade(&cancelled),
+        search: Arc::clone(&search),
+    });
 
     Ok(SearchJob {
         session,
         query,
-        page: usize::try_from(page).context("page is out of range")?,
+        page,
         request_id,
         generation,
         sort_by_date,
@@ -451,17 +448,14 @@ fn run_search(
     let _ = finish_request(&output, &requests, job.request_id, result);
 }
 
-fn cancel_search(
-    params: &Map<String, Value>,
-    cancellations: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-) -> Result<Value> {
+fn cancel_search(params: &Map<String, Value>, state: &BackendState) -> Result<Value> {
     let session = required_session(params)?;
-    let cancelled = cancellations
-        .lock()
-        .map_err(|_| anyhow!("search cancellation state is unavailable"))?
-        .get(&session)
-        .map(|token| !token.swap(true, Ordering::SeqCst))
-        .unwrap_or(false);
+    let cancelled = state
+        .searches
+        .iter()
+        .find(|entry| entry.session == session)
+        .and_then(|entry| entry.cancelled.upgrade())
+        .is_some_and(|token| !token.swap(true, Ordering::SeqCst));
     Ok(json!({"cancelled": cancelled}))
 }
 
@@ -1154,12 +1148,6 @@ fn release_media_slot(slots: &Arc<Mutex<usize>>) {
     }
 }
 
-fn lock_state(state: &Arc<Mutex<BackendState>>) -> Result<std::sync::MutexGuard<'_, BackendState>> {
-    state
-        .lock()
-        .map_err(|_| anyhow!("backend state is unavailable"))
-}
-
 fn ensure_known<T>(value: Option<T>, message: &'static str) -> Result<T> {
     value.ok_or_else(|| anyhow!(message))
 }
@@ -1188,10 +1176,14 @@ struct BackendState {
     owner: Option<String>,
     config: Config,
     revision: u64,
-    searches: HashMap<String, SearchCacheEntry>,
+    // Least recently requested session first.
+    searches: VecDeque<SearchCacheEntry>,
 }
 
 struct SearchCacheEntry {
+    session: String,
+    // Only an outstanding job keeps this token alive.
+    cancelled: Weak<AtomicBool>,
     query: String,
     page_size: usize,
     filter_shorts: bool,
@@ -1208,7 +1200,7 @@ impl BackendState {
             owner: None,
             config,
             revision: 0,
-            searches: HashMap::new(),
+            searches: VecDeque::new(),
         }
     }
 
@@ -1259,16 +1251,16 @@ fn ensure_active(cancelled: &AtomicBool, shutting_down: &AtomicBool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendState, CachedMedia, MAX_FRAME_SIZE, MediaCache, cached_media, output_is_truncated,
-        parse_request, parse_track, prepare_or_reuse_media, prune_media_cache, read_frame,
-        search_snapshot, validate_video_id,
+        BackendState, CachedMedia, MAX_FRAME_SIZE, MAX_SEARCH_SESSIONS, MediaCache, cached_media,
+        cancel_search, output_is_truncated, parse_request, parse_track, prepare_or_reuse_media,
+        prepare_search, prune_media_cache, read_frame, search_snapshot, validate_video_id,
     };
     use crate::config::Config;
     use crate::search::{PaginatedSearch, SearchResult};
-    use serde_json::{Value, json};
+    use serde_json::json;
     use std::fs;
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1322,7 +1314,7 @@ mod tests {
         };
         let mut state = BackendState::new(Config::default());
         state.start_playback(current.clone(), "tab-a".to_string());
-        state.queue.push_back(current.clone());
+        state.queue.push_back(current);
         let stale = json!({"owner":"tab-a","playback_id":0});
         let stale_params = stale.as_object().unwrap();
         let state_snapshot = state.snapshot();
@@ -1330,6 +1322,31 @@ mod tests {
         assert_eq!(state_snapshot["current"]["id"], "abcdefghijk");
         assert_eq!(stale_params["playback_id"], 0);
         assert_eq!(state.playback_id, 1);
+    }
+
+    #[test]
+    fn search_cache_evicts_oldest_idle_session_and_preserves_active_pagination() {
+        let mut state = BackendState::new(Config::default());
+        let params = |session: usize, page: usize| json!({"session": session.to_string(), "query": "query", "page": page});
+        let first = params(0, 1);
+        let active = prepare_search(first.as_object().unwrap(), 1, &mut state).unwrap();
+        for session in 1..=MAX_SEARCH_SESSIONS {
+            let request = params(session, 1);
+            prepare_search(request.as_object().unwrap(), 2, &mut state).unwrap();
+        }
+
+        assert_eq!(state.searches.len(), MAX_SEARCH_SESSIONS);
+        assert!(!state.searches.iter().any(|entry| entry.session == "1"));
+        assert!(!active.cancelled.load(Ordering::SeqCst));
+        let next = params(0, 2);
+        let next = prepare_search(next.as_object().unwrap(), 3, &mut state).unwrap();
+        assert!(Arc::ptr_eq(&active.search, &next.search));
+        assert!(active.cancelled.load(Ordering::SeqCst));
+        assert_eq!(
+            cancel_search(first.as_object().unwrap(), &state).unwrap()["cancelled"],
+            true
+        );
+        assert!(next.cancelled.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1345,7 +1362,6 @@ mod tests {
             published: "today".to_string(),
         });
         let snapshot = search_snapshot(&search, "tab-a", "query", 1, 0);
-        let _: Value = snapshot.clone();
         assert_eq!(snapshot["page"], 1);
         assert_eq!(snapshot["results"][0]["published"], "today");
         assert_eq!(snapshot["has_more"], false);
@@ -1425,7 +1441,7 @@ mod tests {
             .lock()
             .unwrap()
             .by_video_id
-            .insert(missing_video_id.to_string(), missing.clone());
+            .insert(missing_video_id.to_string(), missing);
 
         assert!(
             cached_media(missing_video_id, &cache_root, &cache)

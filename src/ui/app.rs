@@ -42,6 +42,11 @@ pub enum SearchPhase {
     Prefetch { target_page: usize },
 }
 
+enum QueuePlayback {
+    Play,
+    Advance { manual: bool },
+}
+
 pub struct App {
     pub results: Vec<SearchResult>,
     pub selected_index: usize,
@@ -58,7 +63,6 @@ pub struct App {
     pub should_quit: bool,
     pub player_manager: Option<PlayerManager>,
     pub queue: Queue,
-    pub queue_selected_index: usize,
     pub focused_panel: FocusedPanel,
     pub loading: bool,
     pub search_phase: Option<SearchPhase>,
@@ -96,7 +100,6 @@ impl App {
             should_quit: false,
             player_manager: None,
             queue: Queue::new(),
-            queue_selected_index: 0,
             focused_panel: FocusedPanel::Results,
             loading: false,
             search_phase: None,
@@ -158,73 +161,64 @@ impl App {
     }
 
     pub fn handle_next_video(&mut self, manual: bool) {
-        // Remove the currently playing track from front of queue
-        if !self.queue.is_empty() {
-            self.queue.pop_front();
-            // Adjust selected index if needed
-            if self.queue_selected_index > 0 {
-                self.queue_selected_index -= 1;
-            }
-        }
+        self.queue.pop_front();
 
-        // Now play the new front of the queue (if any)
-        if !self.queue.is_empty() {
-            if let Some(track) = self.queue.get(0) {
-                let url = format!("https://www.youtube.com/watch?v={}", track.id);
-                let title = track.title.clone();
-                let video_id = track.id.clone();
-
-                // Manual 'n' press always auto-plays, automatic transitions respect setting
-                let should_auto_play = manual || self.config.auto_play_queue;
-
-                if let Some(ref mut player) = self.player_manager {
-                    let result = if should_auto_play {
-                        player.play(&self.config, &url, &title, &video_id)
-                    } else {
-                        player.load_paused(&self.config, &url, &title, &video_id)
-                    };
-
-                    if let Err(error) = result {
-                        self.player_manager = None;
-                        self.status_message = Some(format!("Playback stopped: {error}"));
-                    } else {
-                        self.status_message = None;
-                    }
-                } else {
-                    // Create player manager if it doesn't exist
-                    match PlayerManager::new(&self.config) {
-                        Ok(mut pm) => {
-                            let result = if should_auto_play {
-                                pm.play(&self.config, &url, &title, &video_id)
-                            } else {
-                                pm.load_paused(&self.config, &url, &title, &video_id)
-                            };
-
-                            match result {
-                                Ok(()) => {
-                                    self.player_manager = Some(pm);
-                                    self.status_message = None;
-                                }
-                                Err(error) => {
-                                    self.status_message =
-                                        Some(format!("Could not start playback: {error}"));
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            self.status_message = Some(format!("Could not create player: {error}"));
-                        }
-                    }
-                }
-            }
-        } else {
-            // Do not retain an idle manager here: AppAction::Play treats the
-            // absence of a manager as the signal to start a fresh selection.
+        if self.queue.is_empty() {
             if let Some(mut player) = self.player_manager.take()
                 && let Err(error) = player.clear()
             {
                 self.status_message = Some(format!("Playback stopped: {error}"));
             }
+        } else {
+            self.load_queue_front(QueuePlayback::Advance { manual });
+        }
+    }
+
+    pub(super) fn play_queue_front(&mut self) {
+        self.load_queue_front(QueuePlayback::Play);
+    }
+
+    fn load_queue_front(&mut self, playback: QueuePlayback) {
+        let Some(track) = self.queue.get(0) else {
+            return;
+        };
+
+        let (mut player, load_error) = match self.player_manager.take() {
+            Some(player) => {
+                let context = match playback {
+                    QueuePlayback::Play => "Could not start playback",
+                    QueuePlayback::Advance { .. } => "Playback stopped",
+                };
+                (player, context)
+            }
+            None => match PlayerManager::new(&self.config) {
+                Ok(player) => (player, "Could not start playback"),
+                Err(error) => {
+                    let context = match playback {
+                        QueuePlayback::Play => "Could not start playback",
+                        QueuePlayback::Advance { .. } => "Could not create player",
+                    };
+                    self.status_message = Some(format!("{context}: {error}"));
+                    return;
+                }
+            },
+        };
+
+        let url = track.url();
+        let start_paused = matches!(playback, QueuePlayback::Advance { manual: false })
+            && !self.config.auto_play_queue;
+        let result = if start_paused {
+            player.load_paused(&self.config, &url, &track.title, &track.id)
+        } else {
+            player.play(&self.config, &url, &track.title, &track.id)
+        };
+
+        match result {
+            Ok(()) => {
+                self.player_manager = Some(player);
+                self.status_message = None;
+            }
+            Err(error) => self.status_message = Some(format!("{load_error}: {error}")),
         }
     }
 }
@@ -379,27 +373,15 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_next_video_decrements_queue_selected_index() {
-        let mut app = App::new("test".to_string(), 10, Config::default());
-        app.queue.push_back(make_track("1", "Track 1"));
-        app.queue_selected_index = 1; // pointing beyond the only item
-
-        app.handle_next_video(false);
-
-        // selected_index was > 0 so it should be decremented
-        assert_eq!(app.queue_selected_index, 0);
-    }
-
-    #[test]
     fn test_handle_next_video_does_not_underflow_queue_selected_index() {
         let mut app = App::new("test".to_string(), 10, Config::default());
         app.queue.push_back(make_track("1", "Track 1"));
-        app.queue_selected_index = 0;
+        app.queue.select(0);
 
         app.handle_next_video(false);
 
         // selected_index must not wrap below 0
-        assert_eq!(app.queue_selected_index, 0);
+        assert_eq!(app.queue.selected_index(), 0);
     }
 
     /// Verifies the fix for the double-pop bug: when the currently-playing video is

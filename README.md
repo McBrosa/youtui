@@ -170,11 +170,23 @@ Changes are persisted automatically. Configuration is stored at:
 ## Development
 
 ```bash
+cargo +1.90.0 check --all-targets --all-features --locked
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
 cargo build --release --locked
 ```
+
+`Cargo.toml` defines the Rust and Clippy rules that CI runs. Handle `Result` and
+other `must_use` values. For an unsafe block, document the specific invariant
+that makes the operation safe. Scope any lint exception to the affected item
+and include `reason = "…"` in the lint attribute.
+
+Keep queue selection in `Queue` and player ownership in `App`. Keyboard actions
+and automatic transitions share the same queue-front loading code. When
+changing streaming search, check how much data each progress update copies as
+the result set grows. Borrow rows for rendering and move owned data across
+worker channels where possible.
 
 Run the web checks from `web/`:
 

@@ -23,12 +23,27 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
 dirs = "6"
 libc = "0.2"
-ratatui-image = "11"
+# ffmpeg supplies RGB frames. ratatui-image already enables PNG for terminal output.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "chafa-dyn"] }
 image = { version = "0.25.10", default-features = false }
 base64-simd = "0.8.0"
 
 [dev-dependencies]
 vt100 = "0.16"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+allow_attributes_without_reason = "deny"
+dbg_macro = "deny"
+large_types_passed_by_value = "deny"
+needless_collect = "deny"
+redundant_clone = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
 
 [profile.release]
 strip = true
