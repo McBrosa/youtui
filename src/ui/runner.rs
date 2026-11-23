@@ -227,24 +227,28 @@ pub fn run_app(
             let terminal_size = terminal.size()?;
             sync_video(&mut app, (terminal_size.width, terminal_size.height));
             let native_video_active = app.video_view && app.native_kitty_video_active();
-            if entering_native
-                || (pixel_video_visible && !app.video_view)
-                || (native_video_visible && !native_video_active)
-            {
-                // Reset the full-screen viewport and its diff buffer. clear() would
-                // query the hidden cursor and stall terminals that don't answer.
-                terminal.resize(terminal_size.into())?;
-            }
-            crate::ui::terminal::resync_cursor(terminal)?;
-            terminal.draw(|frame| render_ui(frame, &app))?;
+            crate::ui::terminal::draw_synchronized(terminal, |terminal| {
+                if entering_native
+                    || (pixel_video_visible && !app.video_view)
+                    || (native_video_visible && !native_video_active)
+                {
+                    // Resizing the full-screen viewport also resets Ratatui's diff buffer.
+                    terminal.resize(terminal_size.into())?;
+                }
+                if native_video_active {
+                    crate::ui::terminal::resync_cursor(terminal)?;
+                }
+                terminal.draw(|frame| render_ui(frame, &app))?;
 
-            let kitty_output = app
-                .player_manager
-                .as_mut()
-                .map_or_else(Vec::new, PlayerManager::take_kitty_output);
-            if native_video_active && !kitty_output.is_empty() {
-                crate::ui::terminal::write_raw(terminal, &kitty_output)?;
-            }
+                let kitty_output = app
+                    .player_manager
+                    .as_mut()
+                    .map_or_else(Vec::new, PlayerManager::take_kitty_output);
+                if native_video_active && !kitty_output.is_empty() {
+                    crate::ui::terminal::write_raw(terminal, &kitty_output)?;
+                }
+                Ok(())
+            })?;
             native_video_visible = native_video_active;
             pixel_video_visible = app.video_view
                 && matches!(

@@ -1,6 +1,6 @@
 [package]
 name = "youtui"
-version = "2.2.2"
+version = "2.2.3"
 edition = "2024"
 rust-version = "1.90"
 description = "A fast terminal interface for searching, queueing, and playing YouTube videos"

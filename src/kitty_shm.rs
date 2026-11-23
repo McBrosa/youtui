@@ -13,14 +13,9 @@ use ratatui::layout::Rect;
 
 use crate::video::Frame;
 
-/// The single image id every frame is transmitted under: kitty replaces the
-/// image data atomically when an existing id is retransmitted, and every
-/// placement referencing it updates. One id means the placeholder cells
-/// never change between frames (no per-frame repaint, no delete gap — the
-/// flicker sources), and no delete escape is ever needed mid-stream.
-/// Value is arbitrary but fixed; `ratatui-image` uses random ids, so a
-/// collision with a concurrent crate-path image is effectively impossible.
-const IMAGE_ID: u32 = 0x00a0_a001;
+// Alternate between two images: terminals may delete the prior image and all
+// its placements as soon as the first packet reuses that image's ID.
+const IMAGE_IDS: [u32; 2] = [0x00a0_a001, 0x00a0_a002];
 
 /// Pure function: should the shm transport be used? Kitty protocol only, and
 /// only when the terminal is on this machine (shm cannot cross an SSH
@@ -32,6 +27,8 @@ pub fn shm_supported(kitty: bool, ssh: bool, tmux: bool) -> bool {
 /// Kitty frame transport with explicit terminal-cell placement.
 pub struct KittyTransport {
     use_shm: bool,
+    /// Only a rendered upload advances the slot; queued frames may be replaced.
+    displayed_slot: Cell<usize>,
     placement: Cell<(u16, u16)>,
     /// Frame counter; selects the shm name slot.
     seq: u64,
@@ -45,6 +42,7 @@ impl KittyTransport {
     pub fn new(use_shm: bool) -> Self {
         Self {
             use_shm,
+            displayed_slot: Cell::new(1),
             placement: Cell::new((0, 0)),
             seq: 0,
             pending: Cell::new(None),
@@ -65,11 +63,13 @@ impl KittyTransport {
         if cols == 0 || rows == 0 || frame.width == 0 || frame.height_px == 0 {
             return Ok(());
         }
-        self.seq += 1;
+        let seq = self.seq + 1;
+        let image_id = IMAGE_IDS[1 - self.displayed_slot.get()];
         let escapes = if self.use_shm {
-            let name = shm_name(self.seq);
+            let name = shm_name(seq);
             shm_write(&name, &frame.rgb)?;
             transmit_escape(
+                image_id,
                 &name,
                 u32::from(frame.width),
                 u32::from(frame.height_px),
@@ -77,8 +77,9 @@ impl KittyTransport {
                 rows,
             )
         } else {
-            transmit_direct(frame, cols, rows)
+            transmit_direct(image_id, frame, cols, rows)
         };
+        self.seq = seq;
         self.pending.set(Some(escapes));
         self.placement.set((cols, rows));
         Ok(())
@@ -97,26 +98,23 @@ impl KittyTransport {
         if area.width == 0 || area.height == 0 || self.seq == 0 {
             return;
         }
-        let [id_extra, id_r, id_g, id_b] = IMAGE_ID.to_be_bytes();
+        let mut pending = self.pending.take();
+        if pending.is_some() {
+            self.displayed_slot.set(1 - self.displayed_slot.get());
+        }
+        let image_id = IMAGE_IDS[self.displayed_slot.get()];
+        let [id_extra, id_r, id_g, id_b] = image_id.to_be_bytes();
         let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
 
         let width = usize::from(area.width);
         let row_tail: String = std::iter::repeat_n('\u{10EEEE}', width - 1).collect();
-        // Restore the saved cursor, then step to the pane's bottom-right so
-        // the real terminal cursor matches Ratatui's position after it skips
-        // the placeholder-covered cells. Moving only to the row end leaves
-        // subsequent diffs vertically desynchronized.
-        let right = area.width - 1;
-        let down = area.height - 1;
-        let restore_cursor = format!("\x1b[u\x1b[{right}C\x1b[{down}B");
 
-        let mut pending = self.pending.take();
         if self.placement.replace((area.width, area.height)) != (area.width, area.height) {
             // A paused frame still needs to fill the pane after a window resize.
             let mut escapes = pending.take().unwrap_or_default();
             write!(
                 escapes,
-                "\x1b_Gq=2,i={IMAGE_ID},a=p,U=1,c={},r={};\x1b\\",
+                "\x1b_Gq=2,i={image_id},a=p,U=1,c={},r={};\x1b\\",
                 area.width, area.height,
             )
             .expect("internal error: writing to a String cannot fail");
@@ -132,12 +130,14 @@ impl KittyTransport {
             // the rest of the row inherits its diacritics.
             write!(
                 symbol,
-                "\x1b[s{id_color}\u{10EEEE}{}{}{}",
+                "\x1b7{id_color}\u{10EEEE}{}{}{}",
                 DIACRITICS[y as usize], DIACRITICS[0], DIACRITICS[id_extra as usize],
             )
             .expect("internal error: writing to a String cannot fail");
             symbol.push_str(&row_tail);
-            symbol.push_str(&restore_cursor);
+            // Crossterm emitted a single cell. Restore its color and cursor, then
+            // advance one column so an adjacent changed cell lands in place.
+            symbol.push_str("\x1b8\x1b[C");
 
             // The whole row lives in the first cell's symbol; the remaining
             // cells are skipped so the diff never overwrites the row.
@@ -166,16 +166,16 @@ fn shm_name(seq: u64) -> String {
 /// (without `c`/`r` kitty places the image at native pixel size instead of
 /// scaling it to the placeholder grid). `q=2` suppresses all terminal
 /// responses — this program must never read stdin.
-fn transmit_escape(shm_name: &str, w: u32, h: u32, cols: u16, rows: u16) -> String {
+fn transmit_escape(image_id: u32, shm_name: &str, w: u32, h: u32, cols: u16, rows: u16) -> String {
     let name_b64 = base64_simd::STANDARD.encode_to_string(shm_name.as_bytes());
     format!(
-        "\x1b_Gq=2,i={IMAGE_ID},a=T,U=1,f=24,t=s,s={w},v={h},c={cols},r={rows};{name_b64}\x1b\\"
+        "\x1b_Gq=2,i={image_id},a=T,U=1,f=24,t=s,s={w},v={h},c={cols},r={rows};{name_b64}\x1b\\"
     )
 }
 
 /// Send RGB24 at decode resolution and let the terminal scale to the pane.
 /// Explicit c/r also avoids native-pixel sizing differences on HiDPI terminals.
-fn transmit_direct(frame: &Frame, cols: u16, rows: u16) -> String {
+fn transmit_direct(image_id: u32, frame: &Frame, cols: u16, rows: u16) -> String {
     const CHUNK_BYTES: usize = 3072; // At most 4096 base64 bytes per packet.
     let mut chunks = frame.rgb.chunks(CHUNK_BYTES).peekable();
     let mut escape = String::new();
@@ -184,7 +184,7 @@ fn transmit_direct(frame: &Frame, cols: u16, rows: u16) -> String {
         if first {
             write!(
                 escape,
-                "\x1b_Gq=2,i={IMAGE_ID},a=T,U=1,f=24,t=d,s={},v={},c={cols},r={rows},",
+                "\x1b_Gq=2,i={image_id},a=T,U=1,f=24,t=d,s={},v={},c={cols},r={rows},",
                 frame.width, frame.height_px,
             )
             .expect("internal error: writing to a String cannot fail");
@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn transmit_escape_matches_kitty_protocol_shape() {
-        let escape = transmit_escape("/yt1234.0", 640, 360, 120, 30);
+        let escape = transmit_escape(IMAGE_IDS[0], "/yt1234.0", 640, 360, 120, 30);
         assert_eq!(
             escape,
             "\x1b_Gq=2,i=10526721,a=T,U=1,f=24,t=s,s=640,v=360,c=120,r=30;L3l0MTIzNC4w\x1b\\"
@@ -632,6 +632,61 @@ mod tests {
     }
 
     #[test]
+    fn replacing_a_chunked_frame_keeps_the_visible_image_until_upload_finishes() {
+        let area = Rect::new(3, 1, 4, 2);
+        let frame = Frame {
+            width: 128,
+            height_px: 16,
+            rgb: vec![30; 128 * 16 * 3],
+        };
+        let mut transport = KittyTransport::new(false);
+        let mut displayed = None;
+        let mut ids = std::collections::HashSet::new();
+
+        for queued in [1, 2, 1, 3] {
+            for _ in 0..queued {
+                transport
+                    .push_frame(&frame, area.width, area.height)
+                    .unwrap();
+            }
+            let mut buffer = Buffer::empty(area);
+            transport.render(area, &mut buffer);
+            let first = buffer.cell((3, 1)).unwrap().symbol();
+            let (upload, rows) = first.split_once("m=0;").unwrap();
+            let id: u32 = upload
+                .split_once(",i=")
+                .unwrap()
+                .1
+                .split(',')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            // Ghostty 1.4 drops the prior image as soon as its first m=1 packet arrives.
+            assert_ne!(
+                Some(id),
+                displayed,
+                "first packet deletes the visible frame"
+            );
+            assert!(upload.contains("m=1;"));
+            let [_, r, g, b] = id.to_be_bytes();
+            let color = format!("\x1b[38;2;{r};{g};{b}m");
+            assert!(
+                rows.contains(&color),
+                "placeholder swap must follow the final chunk"
+            );
+            assert!(buffer.cell((3, 2)).unwrap().symbol().contains(&color));
+            let mut idle = Buffer::empty(area);
+            transport.render(area, &mut idle);
+            assert!(idle.cell((3, 1)).unwrap().symbol().contains(&color));
+            assert!(!idle.cell((3, 1)).unwrap().symbol().contains("a=T"));
+            displayed = Some(id);
+            ids.insert(id);
+        }
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
     fn direct_transfer_chunks_preserve_all_rgb_data() {
         for bytes in [3072, 3075, 6144] {
             let frame = Frame {
@@ -639,7 +694,7 @@ mod tests {
                 height_px: 1,
                 rgb: vec![91; bytes],
             };
-            let escape = transmit_direct(&frame, 100, 30);
+            let escape = transmit_direct(IMAGE_IDS[0], &frame, 100, 30);
             let packets: Vec<_> = escape.split("\x1b\\").filter(|s| !s.is_empty()).collect();
             let mut decoded = Vec::new();
             for (index, packet) in packets.iter().enumerate() {
@@ -748,6 +803,31 @@ mod tests {
     }
 
     #[test]
+    fn each_placeholder_row_leaves_the_cursor_at_the_next_ratatui_cell() {
+        use ratatui::backend::{Backend, CrosstermBackend};
+
+        let screen = Rect::new(0, 0, 5, 3);
+        let pane = Rect::new(2, 1, 1, 2);
+        let mut transport = KittyTransport::new(false);
+        transport.seq = 1;
+        transport.placement.set((pane.width, pane.height));
+        let previous = Buffer::empty(screen);
+        let mut buffer = previous.clone();
+        transport.render(pane, &mut buffer);
+        buffer.cell_mut((3, 1)).unwrap().set_symbol("X");
+        buffer.cell_mut((3, 2)).unwrap().set_symbol("Y");
+
+        let mut output = Vec::new();
+        CrosstermBackend::new(&mut output)
+            .draw(previous.diff(&buffer).into_iter())
+            .unwrap();
+        let mut terminal = vt100::Parser::new(screen.height, screen.width, 0);
+        terminal.process(&output);
+        assert_eq!(terminal.screen().cell(1, 3).unwrap().contents(), "X");
+        assert_eq!(terminal.screen().cell(2, 3).unwrap().contents(), "Y");
+    }
+
+    #[test]
     fn render_paints_placeholders_with_pending_escapes_in_first_row() {
         let mut transport = KittyTransport::new(true);
         transport.seq = 1;
@@ -760,10 +840,10 @@ mod tests {
         let first = buf.cell((0, 0)).unwrap().symbol();
         assert!(first.starts_with("ESCAPES"));
         assert!(first.contains('\u{10EEEE}'));
-        assert!(first.ends_with("\x1b[u\x1b[3C\x1b[1B"));
+        assert!(first.ends_with("\x1b8\x1b[C"));
         let second_row = buf.cell((0, 1)).unwrap().symbol();
         assert!(!second_row.contains("ESCAPES"));
         assert!(second_row.contains('\u{10EEEE}'));
-        assert!(second_row.ends_with("\x1b[u\x1b[3C\x1b[1B"));
+        assert!(second_row.ends_with("\x1b8\x1b[C"));
     }
 }

@@ -3,8 +3,11 @@ use std::io::{self, Write};
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, MoveTo},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    execute, queue,
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
@@ -33,11 +36,25 @@ pub fn init_terminal() -> Result<Tui> {
     }
 }
 
+/// Let the terminal present the new frame after all graphics and text writes finish.
+pub fn draw_synchronized(
+    terminal: &mut Tui,
+    draw: impl FnOnce(&mut Tui) -> Result<()>,
+) -> Result<()> {
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let drawn = draw(terminal);
+    // Close the update even if drawing failed, so the terminal can repaint.
+    let end = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    drawn?;
+    end?;
+    Ok(())
+}
+
 /// mpv's Kitty output repositions the real terminal cursor for each frame.
 /// Ratatui normally assumes nobody else touched it, so force a known origin
 /// before every TUI diff while that output is active.
 pub fn resync_cursor(terminal: &mut Tui) -> Result<()> {
-    execute!(terminal.backend_mut(), MoveTo(0, 0), Hide)?;
+    queue!(terminal.backend_mut(), MoveTo(0, 0), Hide)?;
     Ok(())
 }
 
@@ -46,7 +63,6 @@ pub fn resync_cursor(terminal: &mut Tui) -> Result<()> {
 /// here so its cursor and Kitty escapes cannot interleave with a TUI diff.
 pub fn write_raw(terminal: &mut Tui, bytes: &[u8]) -> Result<()> {
     terminal.backend_mut().write_all(bytes)?;
-    terminal.backend_mut().flush()?;
     Ok(())
 }
 

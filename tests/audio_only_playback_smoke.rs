@@ -246,6 +246,18 @@ fn check_playback(audio_only: bool) {
     assert!(status.success(), "youtui exited with {status}");
     youtui.finish_reader();
 
+    if !audio_only {
+        let output = youtui.transcript();
+        let (before, after) = output.split_once("fixture extraction failure").unwrap();
+        let (_, frame_prefix) = before
+            .rsplit_once("\x1b[?2026h")
+            .expect("video redraw must begin a synchronized update");
+        let (frame_suffix, _) = after
+            .split_once("\x1b[?2026l")
+            .expect("video redraw must commit its update");
+        assert!(!frame_prefix.contains("\x1b[?2026l") && !frame_suffix.contains("\x1b[?2026h"));
+    }
+
     let report = server
         .join()
         .expect("fake mpv server panicked")
